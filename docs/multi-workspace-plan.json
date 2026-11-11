@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "plan_id": "multi-workspace-v2",
+  "workspaces": {
+    "coordinator": "C:\\Users\\trist\\Documents\\agent_coordinator"
+  },
+  "epics": [
+    {
+      "code": "MW",
+      "title": "Robust multi-workspace experience",
+      "description": "# Multi workspace buildout\n\nRelay should answer two distinct questions: what needs attention across all my workspaces, and what is happening inside this workspace? A workspace is the existing persisted project/board. A task's filesystem workspace becomes an **execution directory** in user-facing copy; it is not another navigation scope. Existing project API identifiers and URLs remain compatible.\n\n## Audit and decisions\n\n| Current surface or setting | Owner and destination | Change |\n| --- | --- | --- |\n| Project dropdown, generic Workspace breadcrumb | Workspace identity | Use Workspace consistently and show its actual name. Provide All workspaces as an explicit destination. |\n| Task board, Epics, Queue & blockers | Selected workspace / Work | Preserve task actions and local queue; never aggregate task mutations. |\n| Agents and worker registrations | Selected workspace / Agents | Label their scope. The same worker ID in different workspaces represents separate registrations. |\n| Workflow tab | Workspace settings / Workflow | Consolidate routes, concurrency, retry delay, independent review and automatic advancement in one settings destination. Legacy workflow navigation redirects here. |\n| Project name and data directory | Workspace settings / General | Editable name, read-only storage location, scoped save feedback. Validate trimmed names and duplicates. |\n| Pause coordination | Selected workspace | Put workspace pause and resume in Queue & blockers and explain that active attempts continue. Host maintenance belongs in Global settings. |\n| Backups and export | Workspace settings / Data | Explicitly identify the affected workspace. Never imply a single-board backup covers the host. |\n| Archived tasks inside Settings | Selected workspace / Archive | Move to a work destination with restore and preserved history. |\n| Insights | Workspace / Metrics | Keep local results and usage; add equivalent aggregate visibility under All workspaces. |\n| Activity | Selected workspace / Activity | Retain durable local history. Global overview provides workspace drill-down rather than mixing task identities. |\n| Host drain | Global settings / Maintenance | Expose maintenance state and control with explicit all-workspace impact. Existing runtime-only lifecycle remains; restart clears maintenance. |\n| Version, host data root | Global settings / Server | Read-only diagnostics. Explain workspace backup boundaries. |\n| Theme | Global settings / Appearance | Browser preference, shared across workspaces; label that it applies only to this browser. Keep quick theme toggle. |\n| Timeout, attempt/sendback/token budgets, task assignments, approval | Task editor/detail | Keep task-owned execution policy. Agent capacity, executable, environment and timeout remain agent-owned. |\n\n## Navigation and interaction contract\n\nAll workspaces and Global settings use dedicated navigation. The workspace chooser lists workspace identities only. Desktop uses a sidebar and mobile uses a separate Navigation panel. Work groups Task board, Epics, Queue & blockers and Archive. Agents has its own entry. Reporting & history groups Metrics and Activity. Workspace settings contains General, Workflow and Data.\n\nUse `?scope=global&page=overview` and `?scope=global&page=global-settings` for global views, and `?project=<id>&page=<page>` for workspace views. Explicit URLs win over remembered state; validate remembered page values and keep workspace preferences per workspace. Back/forward and reload retain scope. Selecting a workspace preserves a meaningful local destination, clears task/dialog/filter state, and never reuses another workspace's fetched data. An unknown workspace displays a recovery link to All workspaces instead of silently showing the default board. Headings render explanatory scope copy rather than discarding it.\n\nAll workspaces shows aggregate work/attempt/usage metrics and a row/card per workspace with name, pause/maintenance state, task totals, attention, running attempts, configured capacity and a direct board link. Empty, unavailable, loading, disconnected and partial usage states must be explicit. Cross-workspace sums are server summaries, not downloads of every task artifact/log.\n\n## Data and API contract\n\n- Add `GET /api/overview`: `{ scope: \"global\", generated_at, metrics, workspaces, server }`. Each workspace includes existing project identity, `metrics`, `paused`, `concurrency` and health/dispatch context. `server` exposes `draining`, `build_id`, `version`, and `data_dir`. No token, task bodies or artifacts in aggregates.\n- Add `GET /api/projects/{id}/metrics` using the same metric definitions as the aggregate endpoint. Metrics: nonarchived non-epic `tasks`, `completed`, `attention` (blocked/needs_input/failed), `running_attempts`, all-history `attempts`, `failed_attempts`, `sendbacks`, `duration_ms`, nullable `input_tokens`, `output_tokens`, `cost_usd`, and separate coverage counters `input_token_attempts`, `output_token_attempts`, `cost_attempts`. Unknown values stay null; mixed availability displays coverage, not a misleading complete total. Sum absolute counts before computing any rates. Worker registrations are not globally deduplicated people.\n- `GET /api/global/settings` returns the server diagnostics/maintenance object. `PATCH /api/global/settings` accepts only boolean `draining`; invalid/unknown fields fail. Keep existing `/api/admin/drain` for upgrade compatibility.\n- Workspace settings PATCH becomes a validated partial update, optionally guarded by `expected_revision` (snapshot revision). Preserve full-settings clients. Workspace name trim/length/duplicate validation applies to rename and create. Only the explicitly addressed workspace changes; stale guarded saves fail with 409.\n- Continue host guards and cross-project execution-directory locking. Global maintenance blocks new admissions everywhere including newly created workspaces; workspace pause only affects that workspace. Do not invent a host concurrency setting without a scheduler implementation.\n\n## Execution plan and ownership\n\n1. **MW-IA â€” Scope audit and architecture** (3 points): establish this inventory, URLs, APIs, metric semantics and acceptance matrix; attach to the Coordinator board before implementation.\n2. **MW-API â€” Global summaries and settings boundaries** (5 points, depends on MW-IA): backend agent owns Rust API/model/host changes and regression tests. Deliver aggregate/local metrics, host settings, atomic scoped partial saves, name validation and isolation coverage.\n3. **MW-UI â€” Scope-first navigation and settings** (8 points, depends on MW-IA): frontend agent owns web app/style and frontend tests. Deliver global overview/settings, local destinations, settings consolidation, Archive, safe switching/deep links, scope/coverage copy and empty/error states against the fixed API contract.\n4. **MW-QA â€” Integration and user journey verification** (5 points, depends on MW-API and MW-UI): independent reviewer audits combined code, exercises two-workspace scenarios, and reports actionable defects. Root resolves integration defects, builds embedded assets/server, and verifies the running result.\n\nUse task dependencies for sequencing and leave normal scheduler dispatch in place. Complete independent desktop and mobile prototype walkthroughs and obtain renewed user acceptance before changing production navigation.\n\n## Acceptance matrix\n\n1. Two workspaces with distinct tasks, usage and settings produce exact per-workspace and global counts. Archived tasks/epics do not inflate work totals; unavailable and partially reported usage are honest; empty workspaces have valid summaries.\n2. Changing name, workflow or pause in A leaves B untouched. A stale settings form cannot overwrite a newer guarded save; partial updates preserve unrelated fields. Duplicate/blank/oversized names fail consistently.\n3. Global maintenance affects every workspace and resumes without changing their pause preferences. Mutations without the session token fail. Legacy project endpoints/default board and restart persistence still work.\n4. A user can reach global metrics/settings and workspace metrics/settings directly; breadcrumbs show the real workspace. Reload/back/forward, mobile navigation, unknown IDs and invalid stored pages are safe.\n5. Workflow has one canonical settings home; archive is under work; all existing task, agent, backup/export, activity and restore capabilities remain reachable. Editing a form is not erased by polling.\n6. Run Rust formatting and the full locked test suite, frontend tests/build and browser smoke checks at desktop/mobile sizes. Upgrade the local server only after checks, preserving all boards through the existing backup/drain workflow.\n\n## Boundaries\n\nThis buildout does not add destructive workspace deletion, cross-workspace task moves, global agent inheritance, shared workflow defaults, authentication/teams, or worktree provisioning. These need separate product contracts; the current local single-user host and isolated board storage remain intact.\n",
+      "workspace": "coordinator"
+    }
+  ],
+  "tasks": [
+    {
+      "code": "MW-IA",
+      "title": "Define workspace information architecture",
+      "description": "Inventory settings and journeys, deliver a linked desktop and mobile prototype, and document independent walkthrough findings and revisions.",
+      "workspace": "coordinator",
+      "points": 3,
+      "task_type": "research",
+      "priority": 1,
+      "parent": "MW",
+      "deps": [],
+      "acceptance": [
+        "Complete the sitemap, ownership matrix and compatible API/URL contracts in docs/MULTI_WORKSPACE_PLAN.md.",
+        "Walk through scoped navigation and mutations independently on desktop and mobile and obtain renewed user acceptance."
+      ],
+      "constraints": "Follow docs/MULTI_WORKSPACE_PLAN.md. Use task dependencies for sequencing and leave normal scheduler dispatch in place."
+    },
+    {
+      "code": "MW-API",
+      "title": "Add global summaries and scoped settings APIs",
+      "description": "Implement backend contract in docs/MULTI_WORKSPACE_PLAN.md; own src and Rust regression tests.",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "feature",
+      "priority": 1,
+      "parent": "MW",
+      "deps": [
+        "MW-IA"
+      ],
+      "acceptance": [
+        "Global/local metrics match exact two-workspace fixtures with null and partial usage.",
+        "Partial settings and rename validation preserve isolation; stale guarded writes fail.",
+        "Global maintenance and legacy endpoints remain correct."
+      ],
+      "constraints": "Follow docs/MULTI_WORKSPACE_PLAN.md. Use task dependencies for sequencing and leave normal scheduler dispatch in place."
+    },
+    {
+      "code": "MW-UI",
+      "title": "Build scope-first navigation and settings",
+      "description": "Implement frontend contract in docs/MULTI_WORKSPACE_PLAN.md; own web and frontend code. Consolidate Workflow and move Archive.",
+      "workspace": "coordinator",
+      "points": 8,
+      "task_type": "feature",
+      "priority": 1,
+      "parent": "MW",
+      "deps": [
+        "MW-IA"
+      ],
+      "acceptance": [
+        "Global and workspace metrics/settings are accessible with scope labels.",
+        "URL, reload, back/forward, mobile and invalid workspace recovery work.",
+        "Settings polling preserves forms and existing actions remain accessible."
+      ],
+      "constraints": "Follow docs/MULTI_WORKSPACE_PLAN.md. Use task dependencies for sequencing and leave normal scheduler dispatch in place."
+    },
+    {
+      "code": "MW-QA",
+      "title": "Verify and release multi-workspace experience",
+      "description": "Independent integration review followed by fixes, full test/build checks, browser QA and safe local upgrade.",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "operations",
+      "priority": 1,
+      "parent": "MW",
+      "deps": [
+        "MW-API",
+        "MW-UI"
+      ],
+      "acceptance": [
+        "Rust formatting and full tests pass; frontend tests/build pass.",
+        "Desktop/mobile two-workspace journeys pass and all defects are resolved.",
+        "Running server preserves board data and exposes verified changes."
+      ],
+      "constraints": "Follow docs/MULTI_WORKSPACE_PLAN.md. Use task dependencies for sequencing and leave normal scheduler dispatch in place."
+    }
+  ]
+}

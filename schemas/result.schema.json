@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "summary", "reason", "send_back_to", "artifacts"],
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "enum": ["complete", "send_back", "failed", "blocked", "needs_input"]
+    },
+    "summary": { "type": "string" },
+    "reason": { "type": "string" },
+    "send_back_to": {
+      "type": ["string", "null"],
+      "enum": ["planning", "implementation", "review", null]
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "content", "media_type"],
+        "properties": {
+          "name": { "type": "string" },
+          "content": { "type": "string" },
+          "media_type": { "type": "string" }
+        }
+      }
+    }
+  }
+}

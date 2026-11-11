@@ -1,0 +1,314 @@
+{
+  "schema_version": 1,
+  "plan_id": "coordinator-liveness-closeout-v1",
+  "workspaces": {
+    "coordinator": "C:\\Users\\trist\\Documents\\agent_coordinator"
+  },
+  "epics": [
+    {
+      "code": "LIVE",
+      "title": "Deterministic coordination that keeps admitted work progressing",
+      "description": "Source audit: engine::action_as records pause/resume as human with no trusted actor provenance; API bootstrap exposes a shared local mutation token and guard does not distinguish worker from operator, so adding a client-provided actor label alone is insufficient. engine::reconcile returns for workspace pause/auto_advance=false, and task-paused states have no release owner or deadline. Runner::start_scheduler updates heartbeat/health after each tick, while api::snapshot calls coordinator mode running solely when workspace is unpaused. dispatch_status collapses diverse pending states into blocked. Plan import validates task graph correctness but not executable stage coverage or a durable run intention. Presence reports do not register automatic receivers. eligible_for conflates unavailable routes/capacity/review/workspace/budget prerequisites as string reasons. Store::mutate wraps the full reconcile/dispatch/claim tick in one transaction; a task-specific reconciliation error can roll back unrelated progress (risk to reproduce, not an observed incident). Current supervisor recovery is capped at one repair; recurrence and repair exhaustion deliberately return to blocked with no future executor, and tests/blocker_recovery.rs explicitly asserts no claim after recurrence. This is an owned label, not a durable liveness guarantee. The chess incident showed permissions/network limitations mistaken for terminal workflow blockage; paused animation tasks demonstrated agent-created holds that survive forever. The user reports a third stop; its distinct cause is unverified and must be reconstructed from retained events/backups rather than invented.\n\nDeliver server-enforced pause authority, durable run intent, typed blocking reasons, continuous supervised recovery and progress watchdogs. A green heartbeat, a task labeled coordinator-owned, or a prompt instructing an agent to continue is not proof of progress. Safety invariants remain mandatory.",
+      "workspace": "coordinator"
+    },
+    {
+      "code": "CLOSE",
+      "title": "Planned cleanup and coherent development closeout",
+      "description": "Make every implementation plan finish with owned-resource cleanup and an audit of instructions, comments and documentation, with updates where necessary. Combine planner contract changes with deterministic plan/epic completion enforcement. Include this epic\u2019s own final closeout.",
+      "workspace": "coordinator"
+    }
+  ],
+  "tasks": [
+    {
+      "code": "LIVE-01",
+      "parent": "LIVE",
+      "title": "Reproduce stalled-work incidents and define progress invariants",
+      "workspace": "coordinator",
+      "points": 3,
+      "task_type": "research",
+      "priority": 1,
+      "deps": [],
+      "description": "Source audit: engine::action_as records pause/resume as human with no trusted actor provenance; API bootstrap exposes a shared local mutation token and guard does not distinguish worker from operator, so adding a client-provided actor label alone is insufficient. engine::reconcile returns for workspace pause/auto_advance=false, and task-paused states have no release owner or deadline. Runner::start_scheduler updates heartbeat/health after each tick, while api::snapshot calls coordinator mode running solely when workspace is unpaused. dispatch_status collapses diverse pending states into blocked. Plan import validates task graph correctness but not executable stage coverage or a durable run intention. Presence reports do not register automatic receivers. eligible_for conflates unavailable routes/capacity/review/workspace/budget prerequisites as string reasons. Store::mutate wraps the full reconcile/dispatch/claim tick in one transaction; a task-specific reconciliation error can roll back unrelated progress (risk to reproduce, not an observed incident). Current supervisor recovery is capped at one repair; recurrence and repair exhaustion deliberately return to blocked with no future executor, and tests/blocker_recovery.rs explicitly asserts no claim after recurrence. This is an owned label, not a durable liveness guarantee. The chess incident showed permissions/network limitations mistaken for terminal workflow blockage; paused animation tasks demonstrated agent-created holds that survive forever. The user reports a third stop; its distinct cause is unverified and must be reconstructed from retained events/backups rather than invented. Produce a transition matrix for every nonterminal state: owner, cause, release trigger, next scheduled action and observable progress. Separate legitimate user holds from accidental stalls. Map every finding to remediation tests and tasks.",
+      "acceptance": [
+        "Reproduce chess-style worker block and agent-created permanent task pause with deterministic fixtures.",
+        "Enumerate task/workspace pause, auto-advance off, maintenance, dependency/parent waits, missing worker/route, capacity, permissions, retries, budgets, lost leases, recovery recurrence and scheduler errors.",
+        "Define active-work invariant: admitted work has a runnable action, concrete prerequisite with owner, or scheduled machine recovery; explicit user stops are exempt."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "LIVE-02",
+      "parent": "LIVE",
+      "title": "Enforce trusted pause authority and expiring operational holds",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "feature",
+      "priority": 1,
+      "deps": [
+        "LIVE-01"
+      ],
+      "description": "Replace ambiguous pause booleans with durable intent/provenance and typed holds where needed. Separate user stop from machine scheduling reservations. Worker-origin calls cannot manufacture user-authorized indefinite holds. Design a trusted authority mechanism appropriate to the local same-account trust boundary; document what cannot be isolated from a fully privileged local process. Migrate legacy ambiguous pauses explicitly, without blanket auto-resume.",
+      "acceptance": [
+        "Worker credentials cannot invoke operator-only pause or impersonate operator through request fields.",
+        "Machine holds carry owner, reason, release condition/deadline and deterministic expiry/reconciliation across restart.",
+        "Explicit user stop stays stopped; worker crashes or abandoned reservations do not strand admitted work."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "LIVE-03",
+      "parent": "LIVE",
+      "title": "Make plan admission produce runnable work with durable execution intent",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "feature",
+      "priority": 1,
+      "deps": [
+        "LIVE-01"
+      ],
+      "description": "Add atomic admit-and-run semantics and a machine-readable preflight. Validate required stages, independent review availability, execution directories and usable worker registration. No pause/import/resume choreography. Distinguish queued prerequisites from rejected/unexecutable plans; persist remediation ownership for unavailable prerequisites.",
+      "acceptance": [
+        "Import is idempotent and admits ready leaves without any chat follow-up or UI click.",
+        "Crashes between import and dispatch do not lose run intent.",
+        "Missing stage coverage creates actionable machine remediation state, not misleading running status; no fabricated presence-only executors."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "LIVE-04",
+      "parent": "LIVE",
+      "title": "Implement durable progress watchdog and structured blocker classification",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "feature",
+      "priority": 1,
+      "deps": [
+        "LIVE-02",
+        "LIVE-03"
+      ],
+      "description": "Implement server-owned liveness reconciliation with typed reason codes, progress timestamps, next_check_at/next_action_at, incident ownership and idempotent transitions. Measure progress separately from scheduler heartbeat. Classify intentional hold, healthy waiting, active execution, automatic recovery and stalled work. Use monotonic elapsed timing where applicable and durable restart-safe deadlines.",
+      "acceptance": [
+        "Fake-clock tests detect admitted work with no progress/action within a declared threshold.",
+        "Legitimate dependency waits link to a tracked upstream action; chains identify the actual root blocker.",
+        "Watchdog autonomously releases expired machine holds or dispatches repair; alerts alone do not satisfy acceptance."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "LIVE-05",
+      "parent": "LIVE",
+      "title": "Replace exhausted repair dead ends with supervised recovery state machine",
+      "workspace": "coordinator",
+      "points": 8,
+      "task_type": "feature",
+      "priority": 1,
+      "deps": [
+        "LIVE-04"
+      ],
+      "description": "Replace one-repair-then-blocked behavior with explicit machine-owned incident lifecycle, finite strategies, capability-aware worker selection, bounded backoff and persistent retry triggers. Reuse incident identity and preserve failed evidence. Avoid unbounded tight retries, recursive task creation, budget resets, false completion and unsafe permission expansion. When capability is genuinely unavailable, retain an executable supervisor loop that rechecks concrete capability/configuration changes instead of returning a user action item. Define outcome for finite strategy exhaustion honestly.",
+      "acceptance": [
+        "Original blocked, worker needs_input, failed attempts, recurring failure after reviewed repair and repair failure all retain next machine action or a concrete monitored prerequisite.",
+        "Independent repair review precedes original retry; recurrence does not terminate the supervisor loop silently.",
+        "Budgets and approval/fence constraints remain enforced; tests demonstrate bounded resource use during persistent failure and automatic recovery when its prerequisite returns."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "LIVE-06",
+      "parent": "LIVE",
+      "title": "Preflight runtime capabilities and isolate task-specific scheduler errors",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "feature",
+      "priority": 1,
+      "deps": [
+        "LIVE-03"
+      ],
+      "description": "Check configured execution capability against stage requirements before dispatch; distinguish validation-only jobs from filesystem-writing work. Classify command/path/network/tool unavailability with evidence and select only already-authorized alternatives. Isolate per-task reconciliation failures so other eligible work proceeds; make scheduler failure persistence durable.",
+      "acceptance": [
+        "Unavailable executable, missing directory and denied operation fixtures route to owned remediation without broadening sandbox permissions.",
+        "One malformed/poisoned task cannot roll back all unrelated runnable work.",
+        "Capacity and workspace fencing remain atomic under competing workers and multiple workspaces."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "LIVE-07",
+      "parent": "LIVE",
+      "title": "Expose real progress and recovery ownership in global and workspace views",
+      "workspace": "coordinator",
+      "points": 3,
+      "task_type": "feature",
+      "priority": 1,
+      "deps": [
+        "LIVE-04",
+        "LIVE-05",
+        "LIVE-06"
+      ],
+      "description": "Use shared deterministic scheduler state in global overview, workspace queue and task detail. Show current blocker source, machine owner, next action/time, last actual progress and dependency drilldown. Replace running-when-merely-unpaused labeling; global aggregates must surface stranded scopes without requiring the user to monitor them.",
+      "acceptance": [
+        "Heartbeat-only activity never appears as productive work.",
+        "Intentional user hold, queued dependency, expired machine hold, live run and repair are visually distinct.",
+        "UI reads server state and never makes coordination decisions or requires a user click to recover agent-caused failures."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "LIVE-08",
+      "parent": "LIVE",
+      "title": "Prove unattended progress with fault injection and restart soak tests",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "feature",
+      "priority": 1,
+      "deps": [
+        "LIVE-02",
+        "LIVE-03",
+        "LIVE-04",
+        "LIVE-05",
+        "LIVE-06",
+        "LIVE-07"
+      ],
+      "description": "Build state-machine/property tests plus real scheduler integration runs without browser/chat clients. Inject worker exits, repeated blocked results, absent/reappearing worker, ambiguous pauses, stale assignments, task errors, restart during handoff and persistent environment failure. Test more than the happy-path single repair.",
+      "acceptance": [
+        "Every admitted task in fixtures reaches completion or a verifiable intentional stop/concrete supervised prerequisite, never an ownerless terminal blocked state.",
+        "Recoverable faults resolve autonomously after prerequisite restoration, including after process restart.",
+        "No duplicate execution, false completion, fence violation, recursive repair growth or silent budget reset; bounded retry rate measured."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "LIVE-09",
+      "parent": "LIVE",
+      "title": "Release liveness changes and close out development artifacts",
+      "workspace": "coordinator",
+      "points": 3,
+      "task_type": "operations",
+      "priority": 1,
+      "deps": [
+        "LIVE-08"
+      ],
+      "description": "Run full checks, back up and upgrade through existing safe procedure without interrupting live work; verify actual scheduler admissions afterward. Stop only task-owned test servers, clean owned temporary data, retain evidence and audit instructions/comments/docs against final behavior.",
+      "acceptance": [
+        "Live readiness check proves dispatch and handoff, not merely an enabled setting.",
+        "No abandoned QA processes or owned temporary files; retained diagnostic artifacts have an explicit purpose/location.",
+        "README, planner/worker protocol, API/status text and relevant comments agree with shipped behavior; final evidence attached."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "CLOSE-01",
+      "parent": "CLOSE",
+      "title": "Specify planner-required cleanup and coherence closeout tasks",
+      "workspace": "coordinator",
+      "points": 3,
+      "task_type": "documentation",
+      "priority": 2,
+      "deps": [],
+      "description": "Update the project planner contract and actual planning handoffs to require explicit closing tasks after implementation/integration. Define ownership, dependencies and evidence for cleanup and an instructions/comments/documentation audit. Identify current prompt entry points so guidance is actually consumed. This instruction change complements the deterministic gate below, rather than substituting for it.",
+      "acceptance": [
+        "Each new plan contains dependency-linked cleanup and coherence checks before epic completion.",
+        "Task scope identifies owned files/processes/resources, what must remain and acceptance evidence.",
+        "Published planner examples and runtime handoffs agree."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "CLOSE-02",
+      "parent": "CLOSE",
+      "title": "Track owned development resources and implement safe cleanup",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "feature",
+      "priority": 2,
+      "deps": [
+        "CLOSE-01"
+      ],
+      "description": "Define durable task/run ownership for temporary files, QA databases, generated fixtures, test servers/child processes, ports, temporary worktrees and experimental configuration. Clean only resources positively identified as disposable and task-owned; preserve user data, source changes, deliverables, backups required by retention and execution evidence. Support idempotent retry and crash recovery.",
+      "acceptance": [
+        "Cleanup repeated twice is safe; unknown/shared resources are preserved.",
+        "Only owned test processes stop; live servers and other workspaces remain intact.",
+        "Cleanup report records removed and retained resources with reasons; failed cleanup remains agent-owned work."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "CLOSE-03",
+      "parent": "CLOSE",
+      "title": "Audit and reconcile instructions comments and documentation",
+      "workspace": "coordinator",
+      "points": 3,
+      "task_type": "feature",
+      "priority": 2,
+      "deps": [
+        "CLOSE-01"
+      ],
+      "description": "Implement a closeout audit that traces changed behavior to README/API docs, planner/worker instructions, repository guidance, UI help, examples and relevant code comments. Update obsolete claims and remove contradictory development notes; verify commands, paths, links and examples rather than rewriting unrelated content.",
+      "acceptance": [
+        "Changed behavior has accurate documentation and explanatory comments where necessary.",
+        "Instructions do not contradict current API/state-machine contracts; executable examples are checked.",
+        "Report reviewed surfaces, concrete fixes and evidence; no-op audits explain why existing text is still correct."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "CLOSE-04",
+      "parent": "CLOSE",
+      "title": "Enforce closeout completion through the plan and epic lifecycle",
+      "workspace": "coordinator",
+      "points": 5,
+      "task_type": "feature",
+      "priority": 2,
+      "deps": [
+        "CLOSE-01"
+      ],
+      "description": "Add explicit closeout metadata and deterministic graph validation/generation so cleanup and coherence tasks cannot be omitted and epics cannot close before required closeout evidence. Handle existing plans/migration without invalidating completed unrelated work. Prevent recursively generating cleanup for cleanup tasks and cycles with parent completion.",
+      "acceptance": [
+        "Missing required closeout tasks are generated idempotently or rejected at preview with precise correction.",
+        "Only completed reviewed closing tasks release final epic completion.",
+        "Legacy completed work stays preserved; changed scopes reopen the affected closeout requirements safely."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "CLOSE-05",
+      "parent": "CLOSE",
+      "title": "Test closeout safety ordering and interrupted cleanup recovery",
+      "workspace": "coordinator",
+      "points": 3,
+      "task_type": "operations",
+      "priority": 2,
+      "deps": [
+        "CLOSE-02",
+        "CLOSE-03",
+        "CLOSE-04"
+      ],
+      "description": "Exercise realistic temporary servers/files alongside protected user data, failed cleanup, crash/restart and changed requirements. Verify dependency ordering and evidence requirements end-to-end.",
+      "acceptance": [
+        "Cleanup cannot remove another task/workspace resources or unowned files.",
+        "Partial cleanup resumes idempotently; failed closeout cannot silently mark epic done.",
+        "Plans cannot bypass closeout or create recursive closeout graphs."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    },
+    {
+      "code": "CLOSE-06",
+      "parent": "CLOSE",
+      "title": "Perform this epic\u2019s own cleanup and documentation closeout",
+      "workspace": "coordinator",
+      "points": 2,
+      "task_type": "operations",
+      "priority": 2,
+      "deps": [
+        "CLOSE-05"
+      ],
+      "description": "Use the implemented closeout process on this epic: dispose of owned test resources, reconcile planner/runtime instructions, comments, docs and examples, run acceptance checks and record retained evidence.",
+      "acceptance": [
+        "No owned development leftovers without an explicit retention reason.",
+        "Instruction/documentation consistency audit completed with necessary updates.",
+        "Final tests and independent review evidence recorded before epic completion."
+      ],
+      "constraints": "Implement deterministic coordination policy, not prompt-only fixes. Preserve user-authorized stops, approval gates, access controls, live-worker fencing, recorded budgets and unrelated workspace data. Do not pause this project or other tasks as a coordination shortcut. Use dependencies and scheduler reservations. Treat repository files as existing user work; no blanket cleanup or reset. Return evidence for independent review. Initial checkout has untracked source: lack of a git commit is not itself failed acceptance."
+    }
+  ]
+}

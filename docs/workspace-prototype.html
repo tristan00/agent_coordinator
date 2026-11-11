@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relay workspace prototype</title>
+<style>
+* { box-sizing: border-box }
+:root { font: 16px/1.5 "Segoe UI", sans-serif; color-scheme: light; --bg: #f5f7fb; --panel: white; --ink: #15233a; --muted: #4b5c72; --line: #c6d1df; --accent: #194791; --active: #dfebff }
+:root[data-theme=dark] { color-scheme: dark; --bg: #111a29; --panel: #1a273a; --ink: #f1f5ff; --muted: #bfcee4; --line: #50627b; --accent: #b4d0ff; --active: #293f64 }
+body { margin: 0; background: var(--bg); color: var(--ink); display: grid; grid-template-columns: 252px minmax(0,1fr); grid-template-rows: auto 1fr; min-height: 100vh }
+a { color: var(--accent) }
+button, summary, input, select { font: inherit }
+button, summary, input, select { min-height: 44px; padding: .45rem .7rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink) }
+button, summary { cursor: pointer }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px }
+header { grid-column: 1/-1; display: flex; align-items: center; gap: .7rem; flex-wrap: wrap; padding: .7rem 1.2rem; border-bottom: 1px solid var(--line); background: var(--panel) }
+header strong { font-size: 1.35rem }
+header small { color: var(--muted) }
+header button { margin-left: auto }
+aside { background: var(--panel); padding: 1rem; border-right: 1px solid var(--line) }
+nav a, #picker a, #picker [aria-current] { display: block; padding: .55rem .65rem; border-radius: 5px; text-decoration: none; overflow-wrap: anywhere }
+[aria-current] { background: var(--active); font-weight: 650 }
+nav p { color: var(--muted); margin: .9rem 0 .15rem; padding-left: .65rem; font-size: .88rem }
+nav section a { padding-left: 1.1rem }
+#picker { margin: .7rem 0; overflow-wrap: anywhere }
+main { width: min(100%, 70rem); padding: clamp(1rem, 4vw, 3rem); overflow-wrap: anywhere }
+h1 { margin: .25rem 0 .65rem; line-height: 1.2 }
+h2 { font-size: 1.13rem; margin: 0 0 .6rem }
+.muted { color: var(--muted) }
+.card, article { border: 1px solid var(--line); border-radius: 9px; background: var(--panel); padding: 1rem; margin: .8rem 0 }
+.grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%, 220px),1fr)); gap: .75rem }
+.grid .card { margin: 0 }
+.tabs { display: flex; flex-wrap: wrap; gap: .5rem; margin: .8rem 0 }
+.tabs a { border-radius: 5px; padding: .65rem }
+form { display: grid; gap: .7rem; justify-items: start }
+label { display: grid; gap: .2rem; max-width: 100% }
+input { max-width: 100% }
+.crumb { color: var(--muted); margin: 0 }
+#notice:empty, #mobile-nav { display: none }
+#notice { background: var(--active); padding: .65rem; border-radius: 6px }
+@media (max-width: 760px) {
+  body { display: block }
+  #mobile-nav { display: inline-block; margin-left: 0 }
+  aside { padding: .4rem 1rem; border-right: 0; border-bottom: 1px solid var(--line) }
+  #navigation[hidden] { display: none }
+}
+@media (min-width: 761px) { #navigation[hidden] { display: block } }
+</style>
+<header>
+  <button id="mobile-nav" type="button" aria-expanded="false" aria-controls="navigation">Navigation</button>
+  <strong>Relay</strong><small>Prototype · sample data</small>
+  <button id="theme" type="button">Theme</button>
+</header>
+<aside>
+  <details id="picker"><summary>Choose workspace</summary><div id="identities"></div></details>
+  <div id="navigation" hidden><nav aria-label="Relay navigation" id="destinations"></nav></div>
+</aside>
+<main id="main"><p class="crumb" id="crumb"></p><h1 tabindex="-1" id="heading"></h1><p id="notice" role="status"></p><div id="view"></div></main>
+<script>
+"use strict";
+const seed = {
+  atlas: { name: "Atlas", paused: false, capacity: 3, worker: "Implementation", attempts: 4, reported: 2, tokens: 1800, tasks: [
+    { id: "atlas-epic", name: "Launch partner reporting", type: "Epic", status: "In progress" },
+    { id: "atlas-export", name: "Export partner reports", type: "Task", status: "Blocked", parent: "atlas-epic", recovery: "atlas-recovery" },
+    { id: "atlas-recovery", name: "Repair export credentials", type: "Task", status: "Running", parent: "atlas-epic" },
+    { id: "atlas-archive", name: "Retire legacy export job", type: "Task", status: "Completed", archived: true }
+  ] },
+  birch: { name: "Birch", paused: true, capacity: 1, worker: "Review", attempts: 2, reported: 0, tokens: 0, tasks: [
+    { id: "birch-epic", name: "Refresh onboarding", type: "Epic", status: "In progress" },
+    { id: "birch-guide", name: "Review the welcome guide", type: "Task", status: "Ready", parent: "birch-epic" }
+  ] }
+};
+const $ = id => document.getElementById(id);
+const esc = value => String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const state = JSON.parse(sessionStorage.getItem("relay-fixture") || "null") || { workspaces: seed, maintenance: false };
+const query = new URLSearchParams(location.search);
+const project = query.get("project");
+const global = query.get("scope") === "global" || !project;
+const ws = global ? null : Object.hasOwn(state.workspaces, project) ? state.workspaces[project] : null;
+const titles = { board: "Task board", epics: "Epics", queue: "Queue & blockers", archive: "Archive", agents: "Agents", metrics: "Metrics", activity: "Activity", settings: "Workspace settings", overview: "All workspaces", "global-settings": "Global settings" };
+const localPages = ["board", "epics", "queue", "archive", "agents", "metrics", "activity", "settings"];
+const sections = { general: "General", workflow: "Workflow", data: "Data" };
+const detailTabs = { overview: "Overview", artifacts: "Artifacts", attempts: "Attempts", history: "History" };
+const requested = query.get("page");
+const page = global ? (requested === "global-settings" ? requested : "overview") :
+  requested === "workflow" ? "settings" : requested === "insights" ? "metrics" :
+  localPages.includes(requested) ? requested : "board";
+const section = requested === "workflow" ? "workflow" :
+  Object.hasOwn(sections, query.get("section")) ? query.get("section") : "general";
+const task = ws?.tasks.find(item => item.id === query.get("task"));
+const fromOverview = query.get("from") === "overview";
+const tab = Object.hasOwn(detailTabs, query.get("tab")) ? query.get("tab") : "overview";
+const parents = (query.get("trail") || "").split(",").filter(id => ws?.tasks.some(item => item.id === id));
+const name = ws ? esc(ws.name) : "";
+const disconnected = query.get("connection") === "offline";
+const persist = () => sessionStorage.setItem("relay-fixture", JSON.stringify(state));
+const route = (destination, id = project, extra = {}) => "?" + new URLSearchParams(
+  { ...(id ? { project: id } : { scope: "global" }), page: destination === "metrics" ? "insights" : destination, ...extra });
+const link = (href, label, active = false, id = "") =>
+  '<a href="' + esc(href) + '"' + (active ? ' aria-current="page"' : '') +
+  (id ? ' id="' + esc(id) + '"' : '') + '>' + esc(label) + '</a>';
+const globalLink = (destination, label = titles[destination]) => link(route(destination, null), label, global && page === destination);
+const localLink = destination => link(route(destination), titles[destination], page === destination && !task);
+const origin = () => ({
+  ...(fromOverview ? { from: "overview" } : {}),
+  ...(query.get("q") ? { q: query.get("q") } : {}),
+  ...(page === "agents" && query.has("profile") ? { profile: "worker" } : {})
+});
+const trail = id => ({ ...origin(), task: id, ...(task ? { trail: [...parents, task.id].join(",") } : {}) });
+const taskLink = item => link(route(page, project, trail(item.id)), item.name, false, "item-" + item.id);
+const card = (title, content) => '<section class="card"><h2>' + esc(title) + '</h2>' + content + '</section>';
+const button = (action, title) => '<button data-action="' + action + '" type="button"' + (disconnected ? ' disabled' : '') + '>' + esc(title) + '</button>';
+const metric = (title, value) => card(title, '<strong>' + esc(value) + '</strong>');
+const status = workspace => state.maintenance ? "Host maintenance" : workspace.paused ? "Dispatch paused" : "Dispatch open";
+const counts = workspace => {
+  const work = workspace.tasks.filter(item => item.type === "Task" && !item.archived);
+  return { tasks: work.length, attention: work.filter(item => item.status === "Blocked").length,
+    running: work.filter(item => item.status === "Running").length, completed: work.filter(item => item.status === "Completed").length };
+};
+const all = Object.entries(state.workspaces);
+function metrics(workspaces) {
+  const sum = select => workspaces.reduce((total, workspace) => total + select(workspace), 0);
+  const attempts = sum(workspace => workspace.attempts);
+  const reported = sum(workspace => workspace.reported);
+  const tokens = sum(workspace => workspace.tokens);
+  return '<div class="grid">' + metric("Tasks", sum(workspace => counts(workspace).tasks)) +
+    metric("Completed", sum(workspace => counts(workspace).completed)) +
+    metric("Needs attention", sum(workspace => counts(workspace).attention)) +
+    metric("Running attempts", sum(workspace => counts(workspace).running)) +
+    metric("Historical attempts", attempts) + metric("Reported input tokens", reported ?
+      tokens.toLocaleString("en-US") + " · " + reported + " of " + attempts + " attempts" :
+      attempts ? "Unavailable · 0 of " + attempts + " attempts" : "No attempts yet") +
+    metric("Output tokens and cost", attempts ? "Unavailable in this fixture" : "No attempts yet") + '</div>';
+}
+function taskList(items) {
+  return items.length ? items.map(item => '<article data-search="' + esc(item.name.toLowerCase()) + '">' +
+    taskLink(item) + ' <span class="muted">· ' + esc(item.status) + '</span></article>').join("") : '<p>No matching tasks.</p>';
+}
+function taskDetail() {
+  const previous = ws.tasks.find(item => item.id === parents.at(-1));
+  const back = previous ? route(page, project, { ...origin(), task: previous.id, trail: parents.slice(0, -1).join(","), focus: "item-" + task.id }) :
+    route(page, project, { ...origin(), focus: "item-" + task.id });
+  const tabs = Object.entries(detailTabs).map(([key, label]) => link(route(page, project,
+    { ...origin(), task: task.id, trail: parents.join(","), tab: key }), label, tab === key)).join("");
+  const related = ws.tasks.find(item => item.id === task.recovery);
+  const original = ws.tasks.find(item => item.recovery === task.id);
+  const children = ws.tasks.filter(item => item.parent === task.id);
+  const content = {
+    overview: '<p>' + esc(task.type) + ' · ' + esc(task.status) + '</p>' +
+      (related ? card("Coordinator recovery", '<p>Awaiting repair · ' + taskLink(related) + '</p>') : '') +
+      (original ? card("Coordinator recovery", '<p>Repair in progress for ' + taskLink(original) + '</p>') : '') +
+      (children.length ? card("Child tasks", taskList(children)) : '') +
+      (task.type === "Task" ? card("Execution settings", '<p>Execution directory · <code>fixtures/' + esc(project) + '/' + esc(task.id) + '</code></p>') : '') +
+      (task.archived ? button("restore", "Restore in " + ws.name) : task.status === "Completed" ? button("archive", "Archive in " + ws.name) : ''),
+    artifacts: '<p>No sample artifacts for this task.</p>',
+    attempts: task.type === "Epic" ? '<p>Open a child task to inspect its attempts.</p>' :
+      task.status === "Ready" ? '<p>No attempts yet.</p>' : card("Latest attempt", '<dl><dt>Stage</dt><dd>Implementation</dd><dt>Result</dt><dd>' +
+        esc(task.status === "Blocked" ? "Failed · export credential expired" : task.status) +
+        '</dd><dt>Workspace</dt><dd>' + name + '</dd></dl>'),
+    history: '<p>Task created in ' + name + '.</p>' + (task.id === "atlas-archive" ? '<p>Completed and archived.</p>' : '') +
+      (task.event ? '<p>' + esc(task.event) + '</p>' : '')
+  };
+  return link(back, "Back to " + (previous?.name || titles[page])) + '<nav class="tabs" aria-label="Task detail">' + tabs + '</nav>' + content[tab];
+}
+function overview() {
+  return '<p>Compare work and dispatch status across workspaces.</p>' +
+    (state.maintenance ? '<p>Host maintenance is active. ' + globalLink("global-settings", "View Maintenance") + '</p>' : '') +
+    metrics(all.map(([, workspace]) => workspace)) + '<h2 style="margin-top:1.5rem">Workspaces</h2><div class="grid">' +
+    all.map(([id, workspace]) => {
+      const tally = counts(workspace);
+      return '<article><h2>' + link(route("board", id), workspace.name) + '</h2><p>' + esc(status(workspace)) +
+        '</p><p>' + tally.tasks + ' tasks · ' + tally.running + ' running · capacity ' + workspace.capacity +
+        '</p><p>' + link(route("queue", id, { from: "overview" }), tally.attention + ' need attention') + ' · ' +
+        link(route("metrics", id, { from: "overview" }), "Metrics") + '</p></article>';
+    }).join("") + '</div>' + card("New workspace",
+      '<form id="workspace-form"><label>Workspace name<input name="name" required maxlength="100"></label><button>Create workspace</button><span id="form-error" role="alert"></span></form>');
+}
+function settings() {
+  const tabs = Object.entries(sections).map(([key, label]) => link(route("settings", project, { section: key }), label, section === key)).join("");
+  const content = {
+    general: '<form id="workspace-form"><label>Workspace name<input name="name" required maxlength="100" value="' + name +
+      '"></label><button>Save name in ' + name + '</button><span id="form-error" role="alert"></span></form><p>Workspace storage · <code>fixtures/boards/' + esc(project) + '</code></p>',
+    workflow: '<form id="workflow-form"><label>Concurrent launches<input type="number" min="1" name="capacity" required value="' +
+      ws.capacity + '"></label><label>Implementation stage route<select name="worker"><option>Implementation</option><option>Review</option></select></label><button>Save workflow in ' + name + '</button></form>',
+    data: '<p>Back up or export ' + name + ' board data. Files in task execution directories are stored separately.</p>' +
+      button("backup", "Download " + ws.name + " backup") + ' ' + button("export", "Export " + ws.name + " JSON")
+  };
+  return '<nav class="tabs" aria-label="Workspace settings sections">' + tabs + '</nav>' + card(sections[section], content[section]);
+}
+function render() {
+  $("picker").querySelector("summary").textContent = ws ? "Workspace: " + ws.name : "Choose workspace";
+  $("identities").innerHTML = all.map(([id, workspace]) => ws && id === project ?
+    '<span aria-current="true">' + esc(workspace.name) + '</span>' :
+    link(route(ws && page !== "settings" ? page : "board", id), workspace.name)).join("") || '<p>No workspaces yet.</p>';
+  $("destinations").innerHTML = globalLink("overview") + globalLink("global-settings") + (ws ?
+    '<p>' + name + '</p><section><p>Work</p>' + ["board", "epics", "queue", "archive"].map(localLink).join("") +
+    '</section>' + localLink("agents") + '<section><p>Reporting &amp; history</p>' +
+    ["metrics", "activity"].map(localLink).join("") + '</section>' + localLink("settings") : '');
+  $("crumb").textContent = global ? "Global / " + titles[page] : ws ?
+    ws.name + " / " + titles[page] + (page === "settings" ? " / " + sections[section] : "") : "Workspace";
+  $("heading").textContent = !global && !ws ? "Workspace unavailable" : disconnected ? "Connection interrupted" :
+    query.has("task") && !task ? "Task unavailable" : task?.name || titles[page];
+  document.title = $("heading").textContent + " · Relay";
+  const search = '<label>Search ' + (page === "queue" ? "queue" : "tasks") + '<input id="search" type="search" value="' + esc(query.get("q") || "") + '"></label>';
+  const views = {
+    overview,
+    "global-settings": () => card("Maintenance", '<p>Host-wide · ' + (state.maintenance ? 'On' : 'Off') +
+      '. Applies to every workspace, including new ones. Active attempts continue. Workspace pause preferences are retained. Restart clears maintenance.</p>' +
+      button("maintenance", state.maintenance ? "End host maintenance" : "Start host maintenance")) +
+      card("Appearance", '<p>Applies to this browser.</p>' + button("theme", "Switch theme")) +
+      card("Server", '<p>Version · prototype<br>Data root · <code>fixtures/boards</code></p><p>Workspace backups cover one board.</p>'),
+    board: () => '<p>' + esc(status(ws)) + ' · ' + localLink("queue") + '</p>' + search +
+      taskList(ws.tasks.filter(item => item.type === "Task" && !item.archived)),
+    epics: () => taskList(ws.tasks.filter(item => item.type === "Epic")),
+    queue: () => card("Dispatch status", '<p>' + name + ' · ' + (ws.paused ? 'Workspace dispatch paused' : 'Workspace dispatch open') +
+      '. Active attempts continue when dispatch is paused.</p>' + button("dispatch", (ws.paused ? "Resume" : "Pause") + " dispatch in " + ws.name) +
+      (state.maintenance ? '<p>Host maintenance is active. ' + globalLink("global-settings", "View Maintenance") + '</p>' : '')) +
+      search + taskList(ws.tasks.filter(item => !item.archived && ["Blocked", "Running", "Ready"].includes(item.status))),
+    archive: () => taskList(ws.tasks.filter(item => item.archived)),
+    agents: () => card("Worker registration", '<p><strong>relay-worker-01</strong> · ' + name + ' · ' + esc(ws.worker) + '</p>' +
+      (ws.tasks.find(item => item.status === "Running") ? '<p>Running · assigned to ' + taskLink(ws.tasks.find(item => item.status === "Running")) + '</p>' : '<p>Idle · no active assignment</p>')) +
+      card("Agent profiles", '<p>' + esc(ws.worker) + ' · Capacity ' + (ws.agentCapacity || 1) + '</p>' +
+      link(route("agents", project, { profile: "worker" }), "Configure profile")) +
+      (query.has("profile") ? card("Agent profile in " + ws.name, '<form id="profile-form"><label>Agent capacity<input name="capacity" required type="number" min="1" value="' +
+        (ws.agentCapacity || 1) + '"></label><button>Save profile in ' + name + '</button></form>') : ''),
+    metrics: () => metrics([ws]),
+    activity: () => '<p>Recent task activity in ' + name + '.</p>' + ws.tasks.filter(item => item.type === "Task").map((item, index) =>
+      '<article><p>Nov 10, 14:' + (39 - index) + ' · ' + (item.status === "Ready" ? 'Planner' : 'Coordinator') + '</p><p>' +
+      esc(item.event || item.status) + ' · ' + taskLink(item) + '</p></article>').join(""),
+    settings
+  };
+  $("view").innerHTML = !global && !ws ? '<p>This workspace could not be found. ' + globalLink("overview") + '</p>' :
+    disconnected ? '<p>Workspace data could not load.</p>' + link(route(page, global ? null : project), "Retry") :
+    query.has("task") && !task ? '<p>This task could not be found in ' + name + '.</p>' + localLink(page) :
+    task ? taskDetail() : (fromOverview && ws ? '<p>' + globalLink("overview", "Back to All workspaces") + '</p>' : '') + views[page]();
+  filterTasks();
+  const workerSelect = document.querySelector("#workflow-form select");
+  if (workerSelect) workerSelect.value = ws.implementationRoute || ws.worker;
+}
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem("relay-fixture-theme", next);
+}
+document.documentElement.dataset.theme = localStorage.getItem("relay-fixture-theme") || "light";
+$("theme").addEventListener("click", toggleTheme);
+const picker = $("picker");
+const navigation = $("navigation");
+const mobile = $("mobile-nav");
+function setNavigation(open) {
+  navigation.hidden = !open;
+  mobile.setAttribute("aria-expanded", String(open));
+}
+mobile.addEventListener("click", () => {
+  picker.open = false;
+  setNavigation(navigation.hidden);
+  if (!navigation.hidden) navigation.querySelector("a")?.focus();
+});
+picker.addEventListener("toggle", () => {
+  if (picker.open) setNavigation(false);
+});
+document.addEventListener("keydown", event => {
+  if (event.key !== "Escape") return;
+  if (picker.open) {
+    picker.open = false;
+    picker.querySelector("summary").focus();
+  } else if (!navigation.hidden) {
+    setNavigation(false);
+    mobile.focus();
+  }
+});
+function announce(message) {
+  persist();
+  render();
+  $("notice").textContent = message;
+  $("heading").focus();
+}
+$("view").addEventListener("click", event => {
+  const action = event.target.dataset.action;
+  if (action === "theme") toggleTheme();
+  if (action === "dispatch" && confirm((ws.paused ? "Resume" : "Pause") + " dispatch in " + ws.name + "?")) {
+    ws.paused = !ws.paused;
+    announce(ws.name + " dispatch " + (ws.paused ? "paused." : "resumed."));
+  }
+  if (action === "maintenance" && confirm("Change maintenance for every workspace on this host?")) {
+    state.maintenance = !state.maintenance;
+    announce("Host maintenance " + (state.maintenance ? "started." : "ended."));
+  }
+  if (["restore", "archive"].includes(action) && confirm((action === "restore" ? "Restore" : "Archive") + " “" + task.name + "” in " + ws.name + "?")) {
+    task.archived = action === "archive";
+    task.event = task.archived ? "Archived again." : "Restored.";
+    announce(task.event);
+  }
+  if (action === "backup" || action === "export") {
+    const payload = action === "backup" ? { format: "relay-prototype-backup", project, workspace: ws } :
+      { project, name: ws.name, tasks: ws.tasks };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+    const download = document.createElement("a");
+    download.href = url;
+    download.download = project + "-" + action + "-fixture.json";
+    download.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+});
+let dirty = false;
+function filterTasks() {
+  if (!$("search")) return;
+  const filter = (query.get("q") || "").toLowerCase();
+  for (const row of document.querySelectorAll("[data-search]")) {
+    row.hidden = !row.dataset.search.includes(filter);
+    const taskAnchor = row.querySelector("a");
+    const id = taskAnchor.id.slice("item-".length);
+    taskAnchor.href = route(page, project, trail(id));
+  }
+}
+window.addEventListener("beforeunload", event => {
+  if (dirty) event.preventDefault();
+});
+$("view").addEventListener("input", event => {
+  if (event.target.form) dirty = true;
+  if (event.target.id === "search") {
+    if (event.target.value) query.set("q", event.target.value);
+    else query.delete("q");
+    history.replaceState(null, "", route(page, project, origin()));
+    filterTasks();
+  }
+});
+$("view").addEventListener("submit", event => {
+  event.preventDefault();
+  const fields = new FormData(event.target);
+  if (event.target.id === "workspace-form") {
+    const next = fields.get("name").trim();
+    if (!next || all.some(([id, other]) => id !== project && other.name.toLowerCase() === next.toLowerCase())) {
+      $("form-error").textContent = "Enter a unique workspace name.";
+      return;
+    }
+    dirty = false;
+    if (ws) {
+      ws.name = next;
+      persist();
+      sessionStorage.setItem("relay-fixture-notice", "Saved workspace name to " + next + ".");
+      location.reload();
+    } else {
+      const id = "fixture-" + Date.now();
+      state.workspaces[id] = { name: next, capacity: 1, attempts: 0, reported: 0, tokens: 0, paused: false, worker: "Implementation", tasks: [] };
+      persist();
+      location.href = route("board", id);
+    }
+  } else if (event.target.id === "workflow-form") {
+    ws.capacity = Number(fields.get("capacity"));
+    ws.implementationRoute = fields.get("worker");
+    dirty = false;
+    announce("Workflow saved in " + ws.name + ".");
+  } else {
+    ws.agentCapacity = Number(fields.get("capacity"));
+    dirty = false;
+    announce("Agent profile saved in " + ws.name + ".");
+  }
+});
+render();
+$("notice").textContent = sessionStorage.getItem("relay-fixture-notice") || "";
+sessionStorage.removeItem("relay-fixture-notice");
+($(query.get("focus")) || $("heading")).focus({ preventScroll: true });
+</script>
+</html>
