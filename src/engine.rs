@@ -1,2073 +1,1044 @@
-use crate::{model::*, store::*};
+use crate::history::{self, Actor, Artifact, AttemptEvidence, Attributes, Event, Lane, Need, Size};
+use crate::{Result, evidence, lock, metrics, now, process, read, require, write};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
-
-pub fn event(
-    s: &mut Snapshot,
-    task: Option<&str>,
-    kind: &str,
-    actor: &str,
-    message: impl Into<String>,
-    data: Value,
-) {
-    s.events.push(Event {
-        id: id(),
-        task_id: task.map(str::to_string),
-        kind: kind.into(),
-        actor: actor.into(),
-        message: message.into(),
-        at: now(),
-        data,
-    });
+use std::collections::HashSet;
+use std::fs;
+use std::mem::{MaybeUninit, size_of};
+use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use windows_sys::Win32::Storage::FileSystem::{FILE_ID_INFO, FILE_STANDARD_INFO, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx};
+pub fn id() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}-{}", now(), std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed))
 }
-fn task_index(s: &Snapshot, id: &str) -> AppResult<usize> {
-    s.tasks
-        .iter()
-        .position(|t| t.id == id)
-        .ok_or_else(|| AppError(404, "Task not found".into()))
-}
-fn text(v: &Value, field: &str, default: &str) -> String {
-    v[field].as_str().unwrap_or(default).trim().to_string()
-}
-fn number(v: &Value, field: &str, default: u64) -> u64 {
-    v[field].as_u64().unwrap_or(default)
-}
-fn strings(v: &Value, field: &str) -> AppResult<Vec<String>> {
-    if v[field].is_null() {
-        return Ok(vec![]);
-    }
-    serde_json::from_value(v[field].clone()).map_err(Into::into)
-}
-fn check_revision(task: &Task, v: &Value) -> AppResult<()> {
-    if v["revision"].as_u64() != Some(task.revision) {
-        return Err(conflict("This task changed. Refresh and try again."));
-    }
-    Ok(())
-}
-pub(crate) fn touch(t: &mut Task) {
-    t.revision = t.revision.saturating_add(1);
-    t.updated_at = now();
-}
-pub(crate) fn validate_task(s: &Snapshot, t: &Task) -> AppResult<()> {
-    if t.title.is_empty() {
-        return Err(bad("Title is required"));
-    }
-    if !["epic", "task", "subtask"].contains(&t.kind.as_str()) {
-        return Err(bad("Invalid hierarchy type"));
-    }
-    if t.human_approval && (t.kind == "epic" || !t.assignments.is_empty()) {
-        return Err(bad(
-            "Human approval gates cannot be epics or have agent assignments",
-        ));
-    }
-    if ![
-        "feature",
-        "bug",
-        "research",
-        "refactor",
-        "documentation",
-        "operations",
-    ]
-    .contains(&t.task_type.as_str())
-    {
-        return Err(bad("Invalid task type"));
-    }
-    if !(1..=4).contains(&t.priority) || ![1, 2, 3, 5, 8, 13].contains(&t.complexity) {
-        return Err(bad("Invalid priority or complexity"));
-    }
-    if let Some(parent) = &t.parent_id {
-        let p = &s.tasks[task_index(s, parent)?];
-        let expected = if t.kind == "subtask" {
-            "task"
-        } else if t.kind == "task" {
-            "epic"
-        } else {
-            "none"
-        };
-        let existing_parent = s
-            .tasks
-            .iter()
-            .any(|previous| previous.id == t.id && previous.parent_id.as_ref() == Some(parent));
-        if p.kind != expected || (!existing_parent && (p.archived || p.stage == "done")) {
-            return Err(bad(
-                "Parent must be an active epic for a task, or an active task for a subtask",
-            ));
-        }
-    } else if t.kind == "subtask" {
-        return Err(bad("Subtasks need a parent task"));
-    }
-    validate_dependencies(s, t)?;
-    for (stage, agent) in &t.assignments {
-        validate_assignment(s, stage, agent)?;
-    }
-    if !t.workspace.is_empty() && !std::path::Path::new(&t.workspace).is_dir() {
-        return Err(bad("Workspace directory does not exist on this machine"));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_dependencies(s: &Snapshot, t: &Task) -> AppResult<()> {
-    for d in &t.dependencies {
-        task_index(s, d)?;
-        let mut stack = vec![d.clone()];
-        let mut visited = HashSet::new();
-        while let Some(next) = stack.pop() {
-            if next == t.id {
-                return Err(bad("Dependencies cannot form a cycle"));
-            }
-            if visited.insert(next.clone()) {
-                if let Some(other) = s.tasks.iter().find(|x| x.id == next) {
-                    stack.extend(other.dependencies.clone());
-                }
-                stack.extend(
-                    s.tasks
-                        .iter()
-                        .filter(|child| child.parent_id.as_ref() == Some(&next))
-                        .map(|child| child.id.clone()),
-                );
-                if t.parent_id.as_ref() == Some(&next) {
-                    stack.push(t.id.clone());
-                }
-            }
-        }
-        if t.parent_id.as_ref() == Some(d)
-            || s.tasks
-                .iter()
-                .any(|x| x.id == *d && x.parent_id.as_ref() == Some(&t.id))
-        {
-            return Err(bad(
-                "Use hierarchy for parent/child work; dependencies must be separate",
-            ));
-        }
-    }
-    Ok(())
-}
-fn validate_assignment(s: &Snapshot, stage: &str, agent: &str) -> AppResult<()> {
-    if !EXECUTABLE_STAGES.contains(&stage) {
-        return Err(bad("Only executable stages can have agents"));
-    }
-    let a = s
-        .agents
-        .iter()
-        .find(|a| a.id == agent)
-        .ok_or_else(|| bad("Assigned agent does not exist"))?;
-    if !a.stages.iter().any(|x| x == stage) {
-        return Err(bad("Agent does not support this stage"));
-    }
-    Ok(())
-}
-pub(crate) fn task_from_input(key: String, v: &Value) -> AppResult<Task> {
-    let points = number(&v, "complexity", 3);
-    if points > 13
-        || number(&v, "priority", 2) > 4
-        || number(&v, "max_attempts", 0) > u32::MAX as u64
-        || number(&v, "max_sendbacks", 0) > u32::MAX as u64
-    {
-        return Err(bad("Task numbers are out of range"));
-    }
-    let confidence = text(&v, "estimate_confidence", "medium");
-    if !["low", "medium", "high"].contains(&confidence.as_str()) {
-        return Err(bad("Invalid estimate confidence"));
-    }
-    Ok(Task {
-        id: id(),
-        key,
-        title: text(&v, "title", ""),
-        description: text(&v, "description", ""),
-        acceptance: text(&v, "acceptance", ""),
-        constraints: text(&v, "constraints", ""),
-        kind: text(&v, "kind", "task"),
-        task_type: text(&v, "task_type", "feature"),
-        parent_id: v["parent_id"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        dependencies: strings(&v, "dependencies")?,
-        tags: strings(&v, "tags")?,
-        priority: number(&v, "priority", 2) as u8,
-        complexity: points as u8,
-        estimates: vec![Estimate {
-            points: points as u8,
-            confidence,
-            reason: text(&v, "estimate_reason", "Initial estimate"),
-            at: now(),
-        }],
-        stage: "backlog".into(),
-        status: "ready".into(),
-        revision: 1,
-        visit: 0,
-        sendbacks: 0,
-        max_attempts: number(&v, "max_attempts", 0) as u32,
-        max_sendbacks: number(&v, "max_sendbacks", 0) as u32,
-        timeout_seconds: number(&v, "timeout_seconds", 0),
-        token_budget: v["token_budget"].as_u64(),
-        assignments: if v["assignments"].is_null() {
-            BTreeMap::new()
-        } else {
-            serde_json::from_value(v["assignments"].clone())?
-        },
-        workspace: text(&v, "workspace", ""),
-        current_attempt: None,
-        blocked_reason: String::new(),
-        created_at: now(),
-        updated_at: now(),
-        archived: false,
-        human_approval: v["human_approval"].as_bool().unwrap_or(false),
-        approval: None,
-        imported: None,
-        recovery_of: None,
-        planner_id: v["planner_id"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned),
-    })
-}
-pub fn create_task(s: &mut Snapshot, v: Value) -> AppResult<Task> {
-    let next_key = s
-        .tasks
-        .iter()
-        .filter_map(|t| {
-            t.key
-                .strip_prefix("RL-")
-                .and_then(|n| n.parse::<u64>().ok())
-        })
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| bad("Persisted task key cannot be incremented; repair the invalid key before creating another task"))?;
-    let t = task_from_input(format!("RL-{next_key:03}"), &v)?;
-    validate_task(s, &t)?;
-    s.tasks.push(t.clone());
-    event(
-        s,
-        Some(&t.id),
-        "created",
-        "human",
-        format!("Created {} · {}", t.key, t.title),
-        json!({"complexity":t.complexity}),
-    );
-    Ok(t)
-}
-pub fn update_task(s: &mut Snapshot, id: &str, v: Value) -> AppResult<Task> {
-    let i = task_index(s, id)?;
-    check_revision(&s.tasks[i], &v)?;
-    if s.tasks[i].status == "running" {
-        return Err(conflict(
-            "Pause this task before editing its execution inputs",
-        ));
-    }
-    if s.tasks[i].stage == "done" {
-        return Err(conflict(
-            "Send completed work back before changing its requirements",
-        ));
-    }
-    let mut data = serde_json::to_value(&s.tasks[i])?;
-    let allowed = [
-        "title",
-        "description",
-        "acceptance",
-        "constraints",
-        "task_type",
-        "parent_id",
-        "dependencies",
-        "tags",
-        "priority",
-        "complexity",
-        "max_attempts",
-        "max_sendbacks",
-        "timeout_seconds",
-        "token_budget",
-        "assignments",
-        "planner_id",
-        "workspace",
-    ];
-    for field in allowed {
-        if let Some(value) = v.get(field) {
-            data[field] = value.clone();
-        }
-    }
-    let mut t: Task = serde_json::from_value(data)?;
-    validate_task(s, &t)?;
-    if t.complexity != s.tasks[i].complexity {
-        t.estimates.push(Estimate {
-            points: t.complexity,
-            confidence: text(&v, "estimate_confidence", "medium"),
-            reason: text(&v, "estimate_reason", "Estimate revised"),
-            at: now(),
-        });
-    }
-    let inputs_changed = t.description != s.tasks[i].description
-        || t.acceptance != s.tasks[i].acceptance
-        || t.constraints != s.tasks[i].constraints
-        || t.workspace != s.tasks[i].workspace
-        || t.dependencies != s.tasks[i].dependencies
-        || t.parent_id != s.tasks[i].parent_id;
-    if inputs_changed && t.stage != "backlog" {
-        for a in &mut s.artifacts {
-            if a.task_id == t.id {
-                a.stale = true;
-            }
-        }
-        t.stage = "planning".into();
-        t.status = "ready".into();
-        t.visit = t.visit.saturating_add(1);
-        t.current_attempt = None;
-        t.blocked_reason.clear();
-    }
-    touch(&mut t);
-    s.tasks[i] = t.clone();
-    if inputs_changed {
-        invalidate_dependents(s, id);
-    }
-    event(
-        s,
-        Some(id),
-        "edited",
-        "human",
-        if inputs_changed {
-            "Updated inputs; downstream work needs revalidation"
-        } else {
-            "Updated task"
-        },
-        json!({"revision":t.revision}),
-    );
-    Ok(t)
-}
-pub fn save_agent(s: &mut Snapshot, id_value: Option<&str>, v: Value) -> AppResult<Agent> {
-    let old = id_value
-        .and_then(|id| s.agents.iter().find(|a| a.id == id))
-        .cloned();
-    if id_value.is_some() && old.is_none() {
-        return Err(AppError(404, "Agent not found".into()));
-    }
-    let agent = Agent {
-        id: old.as_ref().map(|a| a.id.clone()).unwrap_or_else(id),
-        name: text(&v, "name", ""),
-        adapter: text(&v, "adapter", "cli"),
-        model: text(&v, "model", ""),
-        stages: normalize_stages(strings(&v, "stages")?),
-        instructions: text(&v, "instructions", ""),
-        command: text(&v, "command", ""),
-        args: strings(&v, "args")?,
-        unset_env: strings(&v, "unset_env")?,
-        endpoint: text(&v, "endpoint", "http://127.0.0.1:11434"),
-        enabled: v["enabled"].as_bool().unwrap_or(true),
-        capacity: number(&v, "capacity", 1) as usize,
-        timeout_seconds: number(&v, "timeout_seconds", 0),
-        created_at: old
-            .as_ref()
-            .map(|a| a.created_at.clone())
-            .unwrap_or_else(now),
-        worker: old.as_ref().and_then(|a| a.worker.clone()),
-        presence: old.and_then(|a| a.presence),
-    };
-    if agent.name.is_empty() {
-        return Err(bad("Agent needs a name"));
-    }
-    if !["cli", "ollama", "demo"].contains(&agent.adapter.as_str()) {
-        return Err(bad("Unknown adapter"));
-    }
-    if agent.adapter == "cli" && agent.command.is_empty() {
-        return Err(bad("Command agents require an executable"));
-    }
-    if agent
-        .unset_env
-        .iter()
-        .any(|name| name.is_empty() || name.contains(['=', '\0']))
-    {
-        return Err(bad("Invalid environment variable names"));
-    }
-    if agent.adapter == "ollama" {
-        let url = reqwest::Url::parse(&agent.endpoint).map_err(|_| bad("Invalid Ollama URL"))?;
-        if !["127.0.0.1", "localhost", "[::1]"].contains(&url.host_str().unwrap_or(""))
-            || url.scheme() != "http"
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(bad("Ollama must use a local HTTP endpoint"));
-        }
-        if agent.model.is_empty() {
-            return Err(bad("Ollama agents require a model name"));
-        }
-    }
-    if agent.stages.is_empty()
-        || agent
-            .stages
-            .iter()
-            .any(|st| !EXECUTABLE_STAGES.contains(&st.as_str()))
-    {
-        return Err(bad("Select valid stages for this agent"));
-    }
-    if agent.capacity == 0 {
-        return Err(bad("Capacity must be positive"));
-    }
-    if let Some(i) = s.agents.iter().position(|a| a.id == agent.id) {
-        s.agents[i] = agent.clone();
-    } else {
-        s.agents.push(agent.clone());
-    }
-    event(
-        s,
-        None,
-        "agent_saved",
-        "human",
-        format!("Configured agent {}", agent.name),
-        json!({"agent_id":agent.id}),
-    );
-    Ok(agent)
-}
-pub fn save_settings(s: &mut Snapshot, v: Value) -> AppResult<Settings> {
-    let patch = v
-        .as_object()
-        .ok_or_else(|| bad("Settings must be an object"))?;
-    let mut merged = serde_json::to_value(&s.settings)?;
-    for (key, value) in patch {
-        if key == "expected_revision" {
-            let revision = value
-                .as_u64()
-                .ok_or_else(|| bad("expected_revision must be an integer"))?;
-            if revision != s.revision {
-                return Err(conflict(
-                    "Workspace settings changed. Reload before saving.",
-                ));
-            }
-        } else if merged.get(key).is_some() {
-            merged[key] = value.clone();
-        } else {
-            return Err(bad(format!("Unknown workspace setting: {key}")));
-        }
-    }
-    let mut settings: Settings = serde_json::from_value(merged)?;
-    settings.project_name = workspace_name(&settings.project_name)?;
-    normalize_routes(&mut settings.stage_agents);
-    if settings.concurrency == 0 {
-        return Err(bad("Concurrency must be positive"));
-    }
-    for (stage, agent) in &settings.stage_agents {
-        validate_assignment(s, stage, agent)?;
-    }
-    s.settings = settings.clone();
-    event(
-        s,
-        None,
-        "settings",
-        "human",
-        "Updated coordinator settings",
-        json!({"paused":settings.paused}),
-    );
-    Ok(settings)
-}
-pub(crate) fn workspace_name(name: &str) -> AppResult<String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(bad("Workspace name must contain 1–100 characters"));
-    }
-    Ok(name.to_owned())
-}
-pub fn dependency_reason(s: &Snapshot, t: &Task) -> Option<String> {
-    let unmet: Vec<_> = t
-        .dependencies
-        .iter()
-        .filter_map(|id| s.tasks.iter().find(|d| d.id == *id))
-        .filter(|d| d.stage != "done" || d.status != "completed")
-        .map(|d| d.key.clone())
-        .collect();
-    if !unmet.is_empty() {
-        return Some(format!("Waiting for {}", unmet.join(", ")));
-    }
-    None
-}
-fn completion_gate(s: &Snapshot, t: &Task) -> AppResult<()> {
-    if let Some(reason) = dependency_reason(s, t) {
-        return Err(conflict(reason));
-    }
-    let children: Vec<_> = s
-        .tasks
-        .iter()
-        .filter(|x| x.parent_id.as_ref() == Some(&t.id) && !x.archived && x.status != "cancelled")
-        .collect();
-    if children.iter().any(|c| c.status != "completed") {
-        return Err(conflict("Complete the child tasks first"));
-    }
-    if t.kind != "epic" && t.acceptance.trim().is_empty() {
-        return Err(bad("Set acceptance criteria before completing work"));
-    }
-    Ok(())
-}
-fn stop_attempt(s: &mut Snapshot, task_index: usize, reason: &str) {
-    if let Some(aid) = s.tasks[task_index].current_attempt.take() {
-        if let Some(a) = s
-            .attempts
-            .iter_mut()
-            .find(|a| a.id == aid && a.status == "running")
-        {
-            a.status = "cancelling".into();
-            a.error = reason.into();
-        }
+pub fn next_stage(status: &str) -> Option<&'static str> {
+    match status {
+        "accepted" => Some("done"),
+        "rejected" => Some("implementation"),
+        "completed" => Some("review"),
+        "blocked" => Some("replan"),
+        _ => None,
     }
 }
-pub(crate) fn invalidate_dependents(s: &mut Snapshot, source: &str) {
-    let mut pending = vec![source.to_string()];
-    let mut visited = HashSet::from([source.to_string()]);
-    while let Some(changed) = pending.pop() {
-        let parent = s
-            .tasks
-            .iter()
-            .find(|t| t.id == changed)
-            .and_then(|t| t.parent_id.clone());
-        let targets: Vec<usize> = s
-            .tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| {
-                !t.archived && (t.dependencies.contains(&changed) || parent.as_ref() == Some(&t.id))
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for i in targets {
-            let tid = s.tasks[i].id.clone();
-            if !visited.insert(tid.clone()) {
-                continue;
-            }
-            pending.push(tid.clone());
-            if s.tasks[i].stage == "backlog" || s.tasks[i].status == "cancelled" {
-                continue;
-            }
-            stop_attempt(s, i, "Upstream work changed");
-            for artifact in &mut s.artifacts {
-                if artifact.task_id == tid {
-                    artifact.stale = true;
-                }
-            }
-            let t = &mut s.tasks[i];
-            t.stage = if t.kind == "epic" || t.human_approval {
-                "backlog"
-            } else {
-                "planning"
-            }
-            .into();
-            t.status = "ready".into();
-            t.approval = None;
-            t.visit = t.visit.saturating_add(1);
-            t.blocked_reason.clear();
-            touch(t);
-            event(
-                s,
-                Some(&tid),
-                "invalidated",
-                "coordinator",
-                "Upstream work changed; prior approvals need revalidation",
-                json!({"source_task":changed}),
-            );
-        }
-    }
-}
-pub fn elapsed(start: &str) -> u64 {
-    chrono::DateTime::parse_from_rfc3339(start)
-        .map(|t| {
-            (chrono::Utc::now() - t.with_timezone(&chrono::Utc))
-                .num_milliseconds()
-                .max(0) as u64
-        })
-        .unwrap_or(0)
-}
-fn move_stage(
-    s: &mut Snapshot,
-    i: usize,
-    destination: &str,
-    actor: &str,
-    reason: &str,
-) -> AppResult<()> {
-    let destination = canonical_stage(destination);
-    let current = stage_index(&s.tasks[i].stage).ok_or_else(|| bad("Unknown current stage"))?;
-    let target = stage_index(destination).ok_or_else(|| bad("Unknown destination"))?;
-    if target == current {
-        return Err(bad("Task is already in that stage"));
-    }
-    let backwards = target < current;
-    if backwards {
-        if reason.trim().is_empty() {
-            return Err(bad("Sendbacks require a reason"));
-        }
-        if target == 0 {
-            return Err(bad("Send work back to an executable stage"));
-        }
-        if s.tasks[i].max_sendbacks > 0 && s.tasks[i].sendbacks >= s.tasks[i].max_sendbacks {
-            return Err(conflict(
-                "Sendback limit reached. Increase the limit to continue.",
-            ));
-        }
-        s.tasks[i].sendbacks = s.tasks[i].sendbacks.saturating_add(1);
-        let task_id = s.tasks[i].id.clone();
-        for a in &mut s.artifacts {
-            if a.task_id == task_id && stage_index(&a.stage).unwrap_or(0) >= target {
-                a.stale = true;
-            }
-        }
-    } else if target != current + 1 {
-        return Err(bad("Stages must be completed in order"));
-    }
-    if target == STAGES.len() - 1 {
-        completion_gate(s, &s.tasks[i])?;
-    }
-    stop_attempt(s, i, "Task moved to another stage");
-    let t = &mut s.tasks[i];
-    let from = t.stage.clone();
-    t.stage = destination.into();
-    t.status = if target == STAGES.len() - 1 {
-        "completed"
-    } else {
-        "ready"
-    }
-    .into();
-    t.visit = t.visit.saturating_add(1);
-    t.blocked_reason.clear();
-    touch(t);
-    let task_id = t.id.clone();
-    event(
-        s,
-        Some(&task_id),
-        if backwards { "sendback" } else { "transition" },
-        actor,
-        format!(
-            "{} → {}{}",
-            from,
-            destination,
-            if reason.is_empty() {
-                String::new()
-            } else {
-                format!(": {reason}")
-            }
-        ),
-        json!({"from":from,"to":destination,"reason":reason}),
-    );
-    if backwards {
-        invalidate_dependents(s, &task_id);
-    }
-    Ok(())
-}
-pub fn action(s: &mut Snapshot, task_id: &str, v: Value) -> AppResult<Task> {
-    action_as(s, task_id, v, false)
-}
-
-pub(crate) fn action_as(
-    s: &mut Snapshot,
-    task_id: &str,
-    v: Value,
-    approval_authorized: bool,
-) -> AppResult<Task> {
-    let i = task_index(s, task_id)?;
-    check_revision(&s.tasks[i], &v)?;
-    let act = text(&v, "action", "");
-    let reason = text(&v, "reason", "");
-    if matches!(act.as_str(), "approve" | "reopen_approval") && !approval_authorized {
-        return Err(AppError(
-            403,
-            "An operator approval code is required".into(),
-        ));
-    }
-    if s.tasks[i].human_approval
-        && ![
-            "approve",
-            "reopen_approval",
-            "comment",
-            "archive",
-            "restore",
-        ]
-        .contains(&act.as_str())
-    {
-        return Err(conflict(
-            "This task requires an explicit human approval action",
-        ));
-    }
-    if s.tasks[i].archived && !["restore", "comment"].contains(&act.as_str()) {
-        return Err(conflict("Restore this task before changing it"));
-    }
-    if s.tasks[i].stage == "done"
-        && ["pause", "cancel", "resume", "retry", "start"].contains(&act.as_str())
-    {
-        return Err(conflict("Send completed work back to reopen it"));
-    }
-    match act.as_str() {
-        "approve" => {
-            if !s.tasks[i].human_approval || s.tasks[i].stage != "backlog" {
-                return Err(conflict(
-                    "Only a pending human approval gate can be approved",
-                ));
-            }
-            if reason.is_empty() {
-                return Err(bad("Record the explicit human approval evidence"));
-            }
-            completion_gate(s, &s.tasks[i])?;
-            let approved_at = now();
-            s.tasks[i].approval = Some(Approval {
-                reason: reason.clone(),
-                at: approved_at.clone(),
-            });
-            s.tasks[i].stage = "done".into();
-            s.tasks[i].status = "completed".into();
-            touch(&mut s.tasks[i]);
-            event(
-                s,
-                Some(task_id),
-                "approved",
-                "human",
-                reason,
-                json!({"approved_at": approved_at, "revision": s.tasks[i].revision}),
-            );
-        }
-        "reopen_approval" => {
-            if !s.tasks[i].human_approval || s.tasks[i].approval.is_none() {
-                return Err(conflict("Only an approved human gate can be reopened"));
-            }
-            if reason.is_empty() {
-                return Err(bad("Record why approval must be obtained again"));
-            }
-            s.tasks[i].approval = None;
-            s.tasks[i].stage = "backlog".into();
-            s.tasks[i].status = "ready".into();
-            touch(&mut s.tasks[i]);
-            invalidate_dependents(s, task_id);
-            event(
-                s,
-                Some(task_id),
-                "approval_reopened",
-                "human",
-                reason,
-                json!({}),
-            );
-        }
-        "start" => {
-            if s.tasks[i].kind == "epic" {
-                return Err(bad("Epics group work. Run their tasks and subtasks."));
-            }
-            if s.tasks[i].stage != "backlog" {
-                return Err(bad("Task has already started"));
-            }
-            if s.tasks[i].acceptance.is_empty() {
-                return Err(bad("Add acceptance criteria before starting"));
-            }
-            move_stage(s, i, "planning", "human", &reason)?;
-        }
-        "send_back" => {
-            let destination = text(&v, "stage", "");
-            if stage_index(&destination) >= stage_index(&s.tasks[i].stage) {
-                return Err(bad("Sendback destination must be earlier"));
-            }
-            move_stage(s, i, &destination, "human", &reason)?;
-        }
-        "complete_stage" => {
-            if reason.is_empty() {
-                return Err(bad("Describe the completion evidence"));
-            }
-            if s.tasks[i].status == "running"
-                || s.tasks[i].status == "cancelled"
-                || s.tasks[i].archived
-            {
-                return Err(conflict("Stop active work or restore the task first"));
-            }
-            if let Some(r) = dependency_reason(s, &s.tasks[i]) {
-                return Err(conflict(r));
-            }
-            if s.tasks[i].kind == "epic" {
-                completion_gate(s, &s.tasks[i])?;
-                s.tasks[i].stage = "done".into();
-                s.tasks[i].status = "completed".into();
-                touch(&mut s.tasks[i]);
-                event(s, Some(task_id), "completed", "human", reason, json!({}));
-            } else {
-                let stage = s.tasks[i].stage.clone();
-                let idx = stage_index(&stage).ok_or_else(|| {
-                    bad("Task has an unknown persisted stage; recover its stage before completion")
-                })?;
-                if !(1..STAGES.len() - 1).contains(&idx) {
-                    return Err(bad("Start the task before completing a stage"));
-                }
-                s.artifacts.push(Artifact {
-                    id: id(),
-                    task_id: task_id.into(),
-                    attempt_id: None,
-                    stage,
-                    visit: s.tasks[i].visit,
-                    name: "Human completion evidence".into(),
-                    content: reason.clone(),
-                    media_type: "text/markdown".into(),
-                    stale: false,
-                    created_at: now(),
-                });
-                move_stage(s, i, STAGES[idx + 1], "human", &reason)?;
-            }
-        }
-        "pause" | "cancel" | "archive" => {
-            let was_running = s.tasks[i].status == "running";
-            stop_attempt(s, i, &format!("Task {act} requested"));
-            if act == "archive" {
-                s.tasks[i].archived = true;
-                if was_running {
-                    s.tasks[i].status = "paused".into();
-                }
-            } else {
-                s.tasks[i].status = if act == "pause" {
-                    "paused"
-                } else {
-                    "cancelled"
-                }
-                .into();
-            }
-            touch(&mut s.tasks[i]);
-            event(
-                s,
-                Some(task_id),
-                &act,
-                "human",
-                format!("Task {act}: {reason}"),
-                json!({}),
-            );
-        }
-        "restore" => {
-            s.tasks[i].archived = false;
-            touch(&mut s.tasks[i]);
-            event(
-                s,
-                Some(task_id),
-                "restored",
-                "human",
-                "Restored archived task",
-                json!({}),
-            );
-        }
-        "resume" | "retry" => {
-            if s.tasks[i].status == "running" || s.tasks[i].stage == "done" {
-                return Err(conflict("Task cannot be resumed in its current state"));
-            }
-            let used = s
-                .attempts
-                .iter()
-                .filter(|a| a.task_id == task_id && a.visit == s.tasks[i].visit)
-                .count();
-            if s.tasks[i].max_attempts > 0 && used >= s.tasks[i].max_attempts as usize {
-                return Err(conflict(
-                    "Attempt limit reached. Increase the limit to continue.",
-                ));
-            }
-            s.tasks[i].status = "ready".into();
-            s.tasks[i].archived = false;
-            s.tasks[i].blocked_reason.clear();
-            touch(&mut s.tasks[i]);
-            event(
-                s,
-                Some(task_id),
-                &act,
-                "human",
-                format!("Task queued. {reason}"),
-                json!({}),
-            );
-        }
-        "comment" => {
-            if reason.is_empty() {
-                return Err(bad("Comment is empty"));
-            }
-            event(s, Some(task_id), "comment", "human", reason, json!({}));
-        }
-        _ => return Err(bad("Unknown action")),
-    }
-    Ok(s.tasks[i].clone())
-}
-
-pub fn eligible_agent(s: &Snapshot, t: &Task) -> Result<Agent, String> {
-    eligible_for(s, t, None)
-}
-
-/// Execution readiness is distinct from the scheduler's enabled setting.
-/// Presence-only reports do not establish a dispatch path.
-pub fn dispatch_status(s: &Snapshot) -> Value {
-    let automatic_workers = s
-        .agents
-        .iter()
-        .filter(|a| crate::workers::connected(a))
-        .count();
-    let assigned = s
-        .agents
-        .iter()
-        .filter(|a| a.worker.as_ref().is_some_and(|w| w.assignment.is_some()))
-        .count();
-    let active = s
-        .attempts
-        .iter()
-        .filter(|a| ["running", "cancelling"].contains(&a.status.as_str()))
-        .count();
-    let pending: Vec<_> = s
-        .tasks
-        .iter()
-        .filter(|t| {
-            !t.archived
-                && t.kind != "epic"
-                && !["completed", "cancelled"].contains(&t.status.as_str())
-        })
-        .collect();
-    let mut eligible = 0;
-    let mut launchable = 0;
-    for t in &pending {
-        if t.status != "ready"
-            || t.human_approval
-            || t.acceptance.trim().is_empty()
-            || dependency_reason(s, t).is_some()
-        {
-            continue;
-        }
-        let mut next = (*t).clone();
-        if next.stage == "backlog" {
-            if !s.settings.auto_advance {
-                continue;
-            }
-            next.stage = "planning".into();
-        }
-        match eligible_agent(s, &next) {
-            Ok(_) => {
-                eligible += 1;
-                launchable += 1;
-            }
-            Err(reason) if reason.starts_with("No eligible agent") => {
-                eligible += 1;
-                if s.agents.iter().any(|a| {
-                    crate::workers::connected(a) && eligible_for(s, &next, Some(&a.id)).is_ok()
-                }) {
-                    launchable += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    let mode = if s.settings.paused {
-        "paused"
-    } else if active > 0 {
-        "running"
-    } else if assigned > 0 {
-        "assigned"
-    } else if launchable > 0 {
-        "dispatching"
-    } else if eligible > 0 {
-        "waiting_for_workers"
-    } else if pending.is_empty() {
-        "idle"
-    } else {
-        "blocked"
-    };
-    json!({"mode":mode,"pending":pending.len(),"eligible":eligible,"launchable":launchable,"active_attempts":active,"assigned":assigned,"automatic_workers":automatic_workers})
-}
-
-pub(crate) fn eligible_for(
-    s: &Snapshot,
-    t: &Task,
-    external_agent: Option<&str>,
-) -> Result<Agent, String> {
-    if t.acceptance.trim().is_empty() {
-        return Err("Add acceptance criteria".into());
-    }
-    if t.human_approval {
-        return Err("This task requires explicit human approval".into());
-    }
-    if let Some(reason) = dependency_reason(s, t) {
-        return Err(reason);
-    }
-    if t.kind == "epic" {
-        return Err("Epics are completed through their child tasks".into());
-    }
-    if s.tasks.iter().any(|child| {
-        child.parent_id.as_ref() == Some(&t.id)
-            && !child.archived
-            && child.status != "cancelled"
-            && child.status != "completed"
-    }) {
-        return Err("Waiting for child tasks to complete".into());
-    }
-    if crate::workers::reserved(s, t) {
-        return Err("Assigned to a worker; awaiting pickup".into());
-    }
-    if s.attempts.iter().any(|a| {
-        a.task_id == t.id && ["running", "cancelling", "lost"].contains(&a.status.as_str())
-    }) {
-        return Err("Previous task execution must confirm it has stopped".into());
-    }
-    let assigned = t.assignments.get(&t.stage).or_else(|| {
-        if t.recovery_of.is_some() {
-            None
-        } else {
-            s.settings.stage_agents.get(&t.stage)
-        }
-    });
-    let assigned = if t.recovery_of.is_some() {
-        assigned.filter(|id| {
-            s.agents
-                .iter()
-                .any(|agent| &agent.id == *id && agent.enabled && agent.stages.contains(&t.stage))
-        })
-    } else {
-        assigned
-    };
-    let implementer = s
-        .attempts
-        .iter()
-        .rev()
-        .find(|a| a.task_id == t.id && a.stage == "implementation" && a.status == "completed")
-        .map(|a| a.agent_id.as_str());
-    let used_tokens: u64 = s
-        .attempts
-        .iter()
-        .filter(|a| a.task_id == t.id)
-        .map(|a| {
-            a.usage
-                .input_tokens
-                .unwrap_or(0)
-                .saturating_add(a.usage.output_tokens.unwrap_or(0))
-        })
-        .fold(0u64, u64::saturating_add);
-    if t.token_budget
-        .is_some_and(|limit| limit > 0 && used_tokens >= limit)
-    {
-        return Err("Reported token budget exhausted".into());
-    }
-    if t.max_attempts > 0
-        && s.attempts
-            .iter()
-            .filter(|a| a.task_id == t.id && a.visit == t.visit)
-            .count()
-            >= t.max_attempts as usize
-    {
-        return Err("Attempt limit reached".into());
-    }
-    if !t.workspace.is_empty() {
-        let canonical = std::fs::canonicalize(&t.workspace)
-            .map_err(|_| "Workspace no longer exists".to_string())?;
-        if s.occupied_workspaces
-            .iter()
-            .any(|p| p.starts_with(&canonical) || canonical.starts_with(p))
-        {
-            return Err("Another project is using this workspace".into());
-        }
-        if s.attempts.iter().any(|a| {
-            ["running", "cancelling", "lost"].contains(&a.status.as_str())
-                && a.input["task"]["workspace"].as_str().is_some_and(|w| {
-                    !w.is_empty()
-                        && std::fs::canonicalize(w)
-                            .ok()
-                            .is_some_and(|p| p.starts_with(&canonical) || canonical.starts_with(&p))
-                })
-        }) {
-            return Err("Another agent is using this workspace".into());
-        }
-    }
-    s.agents
-        .iter()
-        .find(|a| {
-            a.enabled
-                && if let Some(id) = external_agent {
-                    a.id == id && a.adapter == "external"
-                } else {
-                    a.adapter != "external"
-                }
-                && (!(a.adapter == "demo"
-                    || (a.adapter == "cli"
-                        && a.args.first().is_some_and(|arg| arg == "example-agent")))
-                    || t.tags.iter().any(|tag| tag == "demo"))
-                && assigned.is_none_or(|id| id == &a.id)
-                && a.stages.contains(&t.stage)
-                && !(s.settings.independent_review
-                    && t.stage == "review"
-                    && implementer == Some(a.id.as_str()))
-                && s.attempts
-                    .iter()
-                    .filter(|run| {
-                        run.agent_id == a.id
-                            && ["running", "cancelling", "lost"].contains(&run.status.as_str())
-                    })
-                    .count()
-                    < a.capacity
-        })
-        .cloned()
-        .ok_or_else(|| {
-            "No eligible agent is available. Check stage routing, capacity, and independent review."
-                .into()
-        })
-}
-pub fn claim(s: &mut Snapshot, requested: Option<&str>) -> AppResult<Option<(Attempt, Agent)>> {
-    claim_for(s, requested, None)
-}
-pub fn claim_for(
-    s: &mut Snapshot,
-    requested: Option<&str>,
-    external_agent: Option<&str>,
-) -> AppResult<Option<(Attempt, Agent)>> {
-    if requested.is_none() && s.settings.paused {
-        return Ok(None);
-    }
-    if external_agent.is_none()
-        && s.attempts
-            .iter()
-            .filter(|a| {
-                a.external.is_none() && ["running", "cancelling"].contains(&a.status.as_str())
-            })
-            .count()
-            >= s.settings.concurrency
-    {
-        return if requested.is_some() {
-            Err(conflict("All execution slots are busy"))
-        } else {
-            Ok(None)
-        };
-    }
-    let mut candidates: Vec<usize> = s
-        .tasks
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            !t.archived
-                && t.status == "ready"
-                && t.stage != "backlog"
-                && t.stage != "done"
-                && requested.is_none_or(|id| id == t.id)
-        })
-        .map(|(i, _)| i)
-        .collect();
-    candidates.sort_by_key(|i| (s.tasks[*i].priority, s.tasks[*i].created_at.clone()));
-    for i in candidates {
-        let t = s.tasks[i].clone();
-        let agent = match eligible_for(s, &t, external_agent) {
-            Ok(a) => a,
-            Err(reason) => {
-                if requested.is_some() {
-                    return Err(conflict(reason));
-                }
-                continue;
-            }
-        };
-        let artifacts: Vec<_> = s
-            .artifacts
-            .iter()
-            .filter(|a| a.task_id == t.id && !a.stale)
-            .cloned()
-            .collect();
-        let feedback: Vec<_> = s
-            .events
-            .iter()
-            .rev()
-            .filter(|e| e.task_id.as_ref() == Some(&t.id))
-            .take(20)
-            .cloned()
-            .collect();
-        let dependencies: Vec<_> = s
-            .tasks
-            .iter()
-            .filter(|d| t.dependencies.contains(&d.id))
-            .cloned()
-            .collect();
-        let dependency_artifacts: Vec<_> = s
-            .artifacts
-            .iter()
-            .filter(|a| t.dependencies.contains(&a.task_id) && !a.stale)
-            .cloned()
-            .collect();
-        let children: Vec<_> = s
-            .tasks
-            .iter()
-            .filter(|child| child.parent_id.as_ref() == Some(&t.id) && !child.archived)
-            .collect();
-        let child_artifacts: Vec<_> = s
-            .artifacts
-            .iter()
-            .filter(|a| !a.stale && children.iter().any(|child| child.id == a.task_id))
-            .collect();
-        let parent = t
-            .parent_id
-            .as_ref()
-            .and_then(|id| s.tasks.iter().find(|p| p.id == *id));
-        let recovery_context = t.recovery_of.as_ref().map(|incident| json!({
-            "owner":"coordinator", "incident":incident,
-            "instructions":recovery_instructions(&t.stage),
-            "original_task":s.tasks.iter().find(|task| task.id == incident.task_id),
-            "blocked_attempt":s.attempts.iter().find(|attempt| attempt.id == incident.attempt_id),
-            "previous_repair_attempts":s.attempts.iter().filter(|attempt| attempt.task_id == t.id).map(|attempt| json!({
-                "id":attempt.id,"stage":attempt.stage,"status":attempt.status,
-                "summary":attempt.summary,"error":attempt.error,"output":attempt.output,
-            })).collect::<Vec<_>>(),
-        }));
-        let input = json!({"protocol_version":1,"recovery_context":recovery_context,"task":t,"stage":t.stage,"instructions":agent.instructions,"artifacts":artifacts,"feedback":feedback,"dependencies":dependencies,"dependency_artifacts":dependency_artifacts,"parent":parent,"children":children,"child_artifacts":child_artifacts,
-          "result_contract":{"estimate":{"points":3,"confidence":"low | medium | high","reason":"Optional: planning agents may revise complexity with reasoning"},"outcome":"complete | send_back | blocked | needs_input | failed","summary":"Required summary","send_back_to":"Earlier stage, for send_back","reason":"Required for sendbacks or blocking","artifacts":[{"name":"plan.md","content":"Deliverable or evidence","media_type":"text/markdown"}],"usage":{"input_tokens":null,"output_tokens":null,"cost_usd":null,"source":"unavailable"}}});
-        let attempt = Attempt {
-            id: id(),
-            task_id: t.id.clone(),
-            stage: t.stage.clone(),
-            visit: t.visit,
-            number: u32::try_from(
-                s.attempts
-                    .iter()
-                    .filter(|a| a.task_id == t.id && a.visit == t.visit)
-                    .count(),
-            )
-            .unwrap_or(u32::MAX)
-            .saturating_add(1),
-            agent_id: agent.id.clone(),
-            agent_name: agent.name.clone(),
-            adapter: agent.adapter.clone(),
-            model: agent.model.clone(),
-            status: "running".into(),
-            started_at: now(),
-            finished_at: None,
-            duration_ms: None,
-            summary: String::new(),
-            error: String::new(),
-            usage: Usage::default(),
-            input,
-            output: None,
-            log: String::new(),
-            external: None,
-        };
-        s.tasks[i].current_attempt = Some(attempt.id.clone());
-        s.tasks[i].status = "running".into();
-        s.tasks[i].blocked_reason.clear();
-        touch(&mut s.tasks[i]);
-        s.attempts.push(attempt.clone());
-        event(
-            s,
-            Some(&t.id),
-            "attempt_started",
-            &agent.name,
-            format!("Started {} · attempt {}", t.stage, attempt.number),
-            json!({"attempt_id":attempt.id,"model":agent.model}),
-        );
-        return Ok(Some((attempt, agent)));
-    }
-    if requested.is_some() {
-        return Err(conflict("Task must be ready in an executable stage"));
-    }
-    Ok(None)
-}
-pub fn validate_result(result: &AgentResult) -> AppResult<()> {
-    if let Some(e) = &result.estimate {
-        if ![1, 2, 3, 5, 8, 13].contains(&e.points)
-            || !["low", "medium", "high"].contains(&e.confidence.as_str())
-            || e.reason.trim().is_empty()
-        {
-            return Err(bad(
-                "Estimate requires valid points, confidence, and reasoning",
-            ));
-        }
-    }
-    if !["complete", "send_back", "blocked", "needs_input", "failed"]
-        .contains(&result.outcome.as_str())
-    {
-        return Err(bad("Invalid agent outcome"));
-    }
-    if result.summary.trim().is_empty() {
-        return Err(bad("Agent result requires a summary"));
-    }
-    if result.outcome == "complete" && result.artifacts.is_empty() {
-        return Err(bad(
-            "Stage completion requires an artifact containing the deliverable or validation evidence",
-        ));
-    }
-    if result
-        .artifacts
-        .iter()
-        .any(|a| a.name.trim().is_empty() || a.content.trim().is_empty())
-    {
-        return Err(bad("Artifacts require a name and content"));
-    }
-    if result.outcome != "complete" && result.reason.trim().is_empty() {
-        return Err(bad("Non-completion outcomes require a reason"));
-    }
-    if result
-        .usage
-        .cost_usd
-        .is_some_and(|v| v < 0.0 || !v.is_finite())
-    {
-        return Err(bad("Invalid cost"));
-    }
-    if !["reported", "estimated", "unavailable"].contains(&result.usage.source.as_str()) {
-        return Err(bad("Invalid usage source"));
-    }
-    Ok(())
-}
-pub fn finish(
-    s: &mut Snapshot,
-    attempt_id: &str,
-    result: AgentResult,
-    log: String,
-) -> AppResult<()> {
-    validate_result(&result)?;
-    let ai = s
-        .attempts
-        .iter()
-        .position(|a| a.id == attempt_id)
-        .ok_or_else(|| AppError(404, "Attempt not found".into()))?;
-    if s.attempts[ai].external.is_some()
-        && ["cancelling", "lost"].contains(&s.attempts[ai].status.as_str())
-    {
-        return Err(conflict(
-            "Execution no longer accepts results; confirm the worker stopped before releasing ownership",
-        ));
-    }
-    if s.attempts[ai].status == "cancelling" {
-        return fail(s, attempt_id, "Execution cancelled", &log);
-    }
-    if s.attempts[ai].status != "running" {
-        return Ok(());
-    } // Duplicate or late results have no effect.
-    let ti = task_index(s, &s.attempts[ai].task_id)?;
-    if s.tasks[ti].human_approval {
-        return Err(conflict(
-            "Agent results cannot complete human approval gates",
-        ));
-    }
-    if result.model.as_deref() == Some("deterministic-demo")
-        && !s.tasks[ti].tags.iter().any(|tag| tag == "demo")
-    {
-        return Err(conflict("Demo results are only valid on tasks tagged demo"));
-    }
-    if s.tasks[ti].current_attempt.as_deref() != Some(attempt_id)
-        || s.tasks[ti].visit != s.attempts[ai].visit
-    {
-        return Err(conflict("Attempt no longer owns this stage"));
-    }
-    let task_id = s.tasks[ti].id.clone();
-    let actor = s.attempts[ai].agent_name.clone();
-    if result.outcome == "send_back" {
-        let target = result
-            .send_back_to
-            .as_deref()
-            .ok_or_else(|| bad("Sendback requires a destination"))?;
-        if stage_index(target).is_none() || stage_index(target) >= stage_index(&s.tasks[ti].stage) {
-            return Err(bad("Sendback must target an earlier stage"));
-        }
-        if s.tasks[ti].max_sendbacks > 0 && s.tasks[ti].sendbacks >= s.tasks[ti].max_sendbacks {
-            return Err(conflict("Sendback limit exhausted"));
-        }
-    }
-    if result.outcome == "complete" && s.tasks[ti].stage == "review" {
-        completion_gate(s, &s.tasks[ti])?;
-    }
-    if result.outcome == "complete" && s.tasks[ti].stage == "planning" {
-        if let Some(e) = &result.estimate {
-            s.tasks[ti].complexity = e.points;
-            s.tasks[ti].estimates.push(Estimate {
-                points: e.points,
-                confidence: e.confidence.clone(),
-                reason: e.reason.clone(),
-                at: now(),
-            });
-            event(
-                s,
-                Some(&task_id),
-                "estimated",
-                &actor,
-                format!(
-                    "Estimated {} points ({} confidence): {}",
-                    e.points, e.confidence, e.reason
-                ),
-                json!({"points":e.points,"attempt_id":attempt_id}),
-            );
-        }
-    }
-    let a = &mut s.attempts[ai];
-    a.status = if result.outcome == "complete" {
-        "completed"
-    } else {
-        &result.outcome
-    }
-    .into();
-    a.finished_at = Some(now());
-    a.duration_ms = Some(elapsed(&a.started_at));
-    a.summary = result.summary.clone();
-    a.usage = result.usage.clone();
-    a.log = log;
-    a.output = Some(serde_json::to_value(&result)?);
-    if let Some(model) = &result.model {
-        a.model = model.clone();
-    }
-    crate::external::reconcile_presence(s);
-    s.tasks[ti].current_attempt = None;
-    for ar in &result.artifacts {
-        s.artifacts.push(Artifact {
-            id: id(),
-            task_id: task_id.clone(),
-            attempt_id: Some(attempt_id.into()),
-            stage: s.tasks[ti].stage.clone(),
-            visit: s.tasks[ti].visit,
-            name: ar.name.clone(),
-            content: ar.content.clone(),
-            media_type: ar.media_type.clone(),
-            stale: false,
-            created_at: now(),
-        });
-    }
-    event(
-        s,
-        Some(&task_id),
-        "attempt_finished",
-        &actor,
-        &result.summary,
-        json!({"attempt_id":attempt_id,"outcome":result.outcome,"usage":result.usage}),
-    );
-    match result.outcome.as_str() {
-        "complete" => {
-            let next = stage_index(&s.tasks[ti].stage).ok_or_else(|| bad("Task has an unknown persisted stage; recover its stage before accepting completion"))? + 1;
-            let destination = STAGES.get(next).ok_or_else(|| bad("Task has no next executable stage; recover its stage before accepting completion"))?;
-            move_stage(s, ti, destination, &actor, &result.summary)?;
-        }
-        "send_back" => {
-            move_stage(
-                s,
-                ti,
-                result.send_back_to.as_deref().unwrap(),
-                &actor,
-                &result.reason,
-            )?;
-        }
-        status => {
-            s.tasks[ti].status = status.into();
-            s.tasks[ti].blocked_reason = result.reason.clone();
-            touch(&mut s.tasks[ti]);
-        }
-    }
-    if ["blocked", "needs_input", "failed"].contains(&result.outcome.as_str()) {
-        crate::callbacks::notify(s, ti, attempt_id, &result.reason);
-    }
-    Ok(())
-}
-pub fn fail(s: &mut Snapshot, attempt_id: &str, error: &str, log: &str) -> AppResult<()> {
-    let ai = s
-        .attempts
-        .iter()
-        .position(|a| a.id == attempt_id)
-        .ok_or_else(|| AppError(404, "Attempt missing".into()))?;
-    if s.attempts[ai].status == "cancelling" {
-        let a = &mut s.attempts[ai];
-        a.status = "cancelled".into();
-        a.finished_at = Some(now());
-        a.duration_ms = Some(elapsed(&a.started_at));
-        crate::external::reconcile_presence(s);
-        return Ok(());
-    }
-    if s.attempts[ai].status != "running" {
-        return Ok(());
-    }
-    let task_id = s.attempts[ai].task_id.clone();
-    let ti = task_index(s, &task_id)?;
-    let a = &mut s.attempts[ai];
-    a.status = "failed".into();
-    a.error = error.into();
-    a.log = log.into();
-    a.finished_at = Some(now());
-    a.duration_ms = Some(elapsed(&a.started_at));
-    crate::external::reconcile_presence(s);
-    if s.tasks[ti].current_attempt.as_deref() == Some(attempt_id) {
-        s.tasks[ti].current_attempt = None;
-        s.tasks[ti].status = "failed".into();
-        s.tasks[ti].blocked_reason = error.into();
-        touch(&mut s.tasks[ti]);
-    }
-    event(
-        s,
-        Some(&task_id),
-        "attempt_failed",
-        "runner",
-        error,
-        json!({"attempt_id":attempt_id}),
-    );
-    crate::callbacks::notify(s, ti, attempt_id, error);
-    Ok(())
-}
-pub fn recover(s: &mut Snapshot) -> AppResult<usize> {
-    let ids: Vec<_> = s
-        .attempts
-        .iter()
-        .filter(|a| a.external.is_none() && ["running", "cancelling"].contains(&a.status.as_str()))
-        .map(|a| a.id.clone())
-        .collect();
-    for id in &ids {
-        fail(
-            s,
-            id,
-            "Coordinator restarted during execution. Reconcile partial work before continuing.",
-            "",
-        )?;
-    }
-    Ok(ids.len())
-}
-
-pub fn migrate_workflow(s: &mut Snapshot) -> AppResult<()> {
-    normalize_routes(&mut s.settings.stage_agents);
-    for a in &mut s.agents {
-        a.stages = normalize_stages(std::mem::take(&mut a.stages));
-    }
-    for i in 0..s.tasks.len() {
-        normalize_routes(&mut s.tasks[i].assignments);
-        if s.tasks[i].stage == "verification" {
-            s.tasks[i].stage = "review".into();
-            touch(&mut s.tasks[i]);
-            let tid = s.tasks[i].id.clone();
-            event(
-                s,
-                Some(&tid),
-                "workflow_migrated",
-                "coordinator",
-                "Verification consolidated into Review; existing run ownership and history retained",
-                json!({"workflow_version":2}),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Guidance belongs to the role that can act on it. Planning is not required
-/// to execute a repair or prove that an operation it cannot run has succeeded.
-pub fn recovery_instructions(stage: &str) -> &'static str {
+pub fn worker_statuses(stage: &str) -> &'static [&'static str] {
     match stage {
-        "planning" => {
-            "Investigate the available failure evidence and produce an actionable repair plan. Planning may complete with that plan even if execution or verification requires the implementation agent. Identify the operation, likely cause, and a changed approach. Do not demand a successful repair before handing the plan to implementation."
-        }
-        "implementation" => {
-            "Investigate the root cause, perform the repair using available authorized capabilities, and run relevant checks when possible. Use the original failure and prior repair attempts to choose a changed approach. Report what changed and what remains uncertain. Do not merely repeat a failed operation or claim that the original task is complete."
-        }
-        "review" => {
-            "Evaluate the repair and its available evidence against the original failure. Report concrete remaining problems and send them to implementation. Do not require planning to perform implementation work or introduce unrelated acceptance requirements."
-        }
-        _ => "Investigate and resolve the incident through the next actionable step.",
+        "review" => &["accepted", "rejected", "blocked"],
+        "replan" => &["replanned", "held"],
+        _ => &["completed", "blocked"],
     }
 }
-
-fn recovery_stage_available(s: &Snapshot, task: &Task, stage: &str) -> bool {
-    s.agents.iter().any(|a| {
-        a.enabled
-            && a.stages.iter().any(|v| v == stage)
-            && (!(a.adapter == "demo"
-                || (a.adapter == "cli" && a.args.first().is_some_and(|v| v == "example-agent")))
-                || task.tags.iter().any(|tag| tag == "demo"))
-    })
+fn normalized(text: &str) -> String {
+    text.trim_matches('\u{feff}').split_whitespace().collect::<Vec<_>>().join(" ")
 }
-
-fn route_recovery(s: &mut Snapshot, i: usize, stage: &str, previous_agent: Option<&str>) {
-    let task = s.tasks[i].clone();
-    let implementer = s
-        .attempts
-        .iter()
-        .rev()
-        .find(|a| a.task_id == task.id && a.stage == "implementation" && a.status == "completed")
-        .map(|a| a.agent_id.as_str());
-    let mut candidates: Vec<_> = s
-        .agents
-        .iter()
-        .filter(|a| {
-            a.enabled
-                && a.stages.iter().any(|v| v == stage)
-                && (!(a.adapter == "demo"
-                    || (a.adapter == "cli"
-                        && a.args.first().is_some_and(|v| v == "example-agent")))
-                    || task.tags.iter().any(|tag| tag == "demo"))
-                && !(s.settings.independent_review
-                    && stage == "review"
-                    && implementer == Some(a.id.as_str()))
-        })
-        .collect();
-    // Prefer another capable profile after failure. If only one exists, keep
-    // working with it and pass all earlier incident attempts in the handoff.
-    candidates.sort_by_key(|a| (previous_agent == Some(a.id.as_str()), a.adapter == "ollama"));
-    if let Some(agent) = candidates.first().filter(|a| a.adapter != "external") {
-        s.tasks[i]
-            .assignments
-            .insert(stage.into(), agent.id.clone());
-    } else {
-        s.tasks[i].assignments.remove(stage);
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Attempt {
+    pub id: String,
+    #[serde(default)]
+    pub revision: u64,
+    pub stage: String,
+    pub started: u64,
+    pub ended: Option<u64>,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub evidence: AttemptEvidence,
+}
+impl Attempt {
+    pub fn status(&self) -> Option<&str> {
+        self.result.as_ref()?["status"].as_str()
     }
 }
-
-fn schedule_supervisor_repair(
-    s: &mut Snapshot,
-    i: usize,
-    attempt_id: &str,
-    reason: &str,
-    trigger: &str,
-) -> AppResult<()> {
-    let task = s.tasks[i].clone();
-    if let Some(ri) = s
-        .tasks
-        .iter()
-        .position(|t| t.recovery_of.as_ref().is_some_and(|r| r.task_id == task.id))
-    {
-        let incident = s.tasks[ri].recovery_of.as_ref().unwrap().clone();
-        if incident.attempt_id == attempt_id || !incident.resumed {
-            return Ok(());
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
+    #[serde(default)]
+    pub revision: u64,
+    pub title: String,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refinements: Vec<String>,
+    pub cwd: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub attributes: Attributes,
+    #[serde(default)]
+    pub history: Vec<Event>,
+    #[serde(default)]
+    pub recorded_wait: Option<String>,
+    pub acceptance: Vec<String>,
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub after: Vec<String>,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub related: Vec<String>,
+    #[serde(default)]
+    pub writable: Vec<PathBuf>,
+    #[serde(default, rename = "audit", skip_serializing)]
+    legacy_audit: bool,
+    #[serde(default, rename = "evidenceRequirements", skip_serializing)]
+    legacy_evidence: Value,
+    pub stage: String,
+    pub stopped: bool,
+    #[serde(default)]
+    pub blocked: bool,
+    pub attempts: Vec<Attempt>,
+    pub active: Option<String>,
+    pub feedback: Vec<String>,
+    pub failure: String,
+    #[serde(rename = "retryAt")]
+    pub retry_at: u64,
+}
+impl Task {
+    pub fn definition_words(&self) -> usize {
+        [&self.title, &self.outcome].into_iter().chain(&self.acceptance).map(|text| history::words(text)).sum()
+    }
+    pub fn container(&self) -> bool {
+        self.acceptance.is_empty()
+    }
+    pub fn read_only(&self) -> bool {
+        self.attributes.lane == Lane::Audit
+    }
+    fn workdir(&self) -> &Path {
+        self.workspace.as_deref().unwrap_or(Path::new(&self.cwd))
+    }
+    fn reset_work(&mut self) {
+        self.revision += 1;
+        self.stage = "implementation".into();
+        self.blocked = false;
+        self.retry_at = 0;
+        self.failure.clear();
+        self.feedback.clear();
+    }
+    pub fn status(&self) -> &'static str {
+        match self.stage.as_str() {
+            "done" => "Done",
+            "review" => "Review",
+            _ if self.active.is_some() || !self.attempts.is_empty() || self.stage == "replan" => "In progress",
+            _ => "To do",
         }
-        // A recurrence reuses its incident and history. It does not exhaust an
-        // invisible one-shot recovery allowance or spawn a recursive task tree.
-        if s.tasks[ri].archived || matches!(s.tasks[ri].status.as_str(), "paused" | "cancelled") {
-            return Ok(());
+    }
+    fn signature(&self) -> Value {
+        let mut dependencies = self.dependencies.clone();
+        dependencies.sort();
+        json!([
+            normalized(&self.title),
+            normalized(&self.outcome),
+            self.acceptance.iter().map(|c| normalized(c)).collect::<Vec<_>>(),
+            dependencies,
+            self.model,
+            self.effort,
+            self.cwd,
+            self.attributes.lane,
+            self.attributes.needs,
+            self.attributes.artifact
+        ])
+    }
+    fn snapshot(&self) -> Value {
+        json!({"title":self.title,"outcome":self.outcome,"acceptance":self.acceptance,"cwd":self.cwd,"workspaceId":self.workspace,"key":self.key,
+            "dependencies":self.dependencies,"after":self.after,"parent":self.parent,"conflicts":self.conflicts,"related":self.related,
+            "writable":self.writable,"model":self.model,"effort":self.effort,"attributes":self.attributes,"definitionWords":self.definition_words()})
+    }
+    pub fn record(&mut self, kind: &str, actor: Actor, source: &str, evidence: Value) {
+        self.history.push(Event::new(self, kind, actor, source, evidence));
+    }
+    fn record_phase(&mut self, from: &str, actor: Actor, source: &str) {
+        if from != self.stage {
+            let stage = self.stage.clone();
+            self.record("phase_changed", actor, source, json!({"from":from,"to":stage}));
         }
-        s.tasks[ri].recovery_of = Some(RecoveryIncident {
-            task_id: task.id.clone(),
-            attempt_id: attempt_id.into(),
-            stage: task.stage.clone(),
-            resumed: false,
-        });
-        let stage = if recovery_stage_available(s, &s.tasks[ri], "planning")
-            || !recovery_stage_available(s, &s.tasks[ri], "implementation")
-        {
-            "planning"
-        } else {
-            "implementation"
-        };
-        s.tasks[ri].stage = stage.into();
-        s.tasks[ri].status = "ready".into();
-        s.tasks[ri].visit = s.tasks[ri].visit.saturating_add(1);
-        s.tasks[ri].blocked_reason.clear();
-        for a in &mut s.artifacts {
-            if a.task_id == s.tasks[ri].id {
-                a.stale = true;
+    }
+    fn strikes(&self) -> usize {
+        let mut failures = vec![0; self.acceptance.len()];
+        for attempt in self.attempts.iter().filter(|a| a.revision == self.revision && a.status() == Some("rejected")) {
+            for (index, outcome) in attempt.result.as_ref().unwrap()["criteria"].as_array().into_iter().flatten().enumerate() {
+                if outcome == "failed" && index < failures.len() {
+                    failures[index] += 1;
+                }
             }
         }
-        route_recovery(s, ri, stage, None);
-        touch(&mut s.tasks[ri]);
-        let repair_id = s.tasks[ri].id.clone();
-        s.tasks[i].status = "blocked".into();
-        s.tasks[i].blocked_reason = format!(
-            "Recovery {} is investigating the recurring incident: {reason}",
-            s.tasks[ri].key
-        );
-        touch(&mut s.tasks[i]);
-        event(
-            s,
-            Some(&task.id),
-            "supervisor_recovery_reopened",
-            "coordinator",
-            "Recurring failure reopened its recovery task",
-            json!({"recovery_task_id":repair_id,"attempt_id":attempt_id,"reason":reason}),
-        );
-        return Ok(());
+        failures.into_iter().max().unwrap_or(0)
     }
-    let workspace = if task.workspace.is_empty() || std::path::Path::new(&task.workspace).is_dir() {
-        task.workspace.clone()
-    } else {
-        String::new()
-    };
-    let mut repair = create_task(
-        s,
-        json!({
-            "title":format!("Recovery for {}",task.key),
-            "description":format!("Investigate and repair the incident from {} ({}) at stage {}. Attempt: {}. Original execution directory: {}.\n\nFailure: {}\n\nPlanning: {}\n\nImplementation: {}\n\nReview: {}",task.key,task.id,task.stage,attempt_id,task.workspace,reason,recovery_instructions("planning"),recovery_instructions("implementation"),recovery_instructions("review")),
-            "acceptance":"Address the original failure through an actionable plan, implementation, and review. Record what changed and any remaining uncertainty. The original task resumes its own workflow afterward.",
-            "constraints":task.constraints, "planner_id":task.planner_id,
-            "task_type":"operations","priority":1,"complexity":3,"workspace":workspace,
-            "max_attempts":0,"max_sendbacks":0,"timeout_seconds":0,
-            "tags":if task.tags.iter().any(|tag| tag == "demo") {vec!["coordinator-recovery","demo"]} else {vec!["coordinator-recovery"]}
-        }),
-    )?;
-    repair.recovery_of = Some(RecoveryIncident {
-        task_id: task.id.clone(),
-        attempt_id: attempt_id.into(),
-        stage: task.stage.clone(),
-        resumed: false,
-    });
-    let ri = task_index(s, &repair.id)?;
-    s.tasks[ri] = repair.clone();
-    let stage = if recovery_stage_available(s, &repair, "planning")
-        || !recovery_stage_available(s, &repair, "implementation")
-    {
-        "planning"
-    } else {
-        "implementation"
-    };
-    s.tasks[ri].stage = stage.into();
-    s.tasks[ri].visit = 1;
-    route_recovery(s, ri, stage, None);
-    touch(&mut s.tasks[ri]);
-    s.tasks[i].dependencies.push(repair.id.clone());
-    s.tasks[i].status = "blocked".into();
-    s.tasks[i].blocked_reason = format!("Recovery {} is investigating: {reason}", repair.key);
-    touch(&mut s.tasks[i]);
-    event(
-        s,
-        Some(&task.id),
-        "supervisor_recovery_created",
-        "coordinator",
-        format!("Incident investigation assigned to {}", repair.key),
-        json!({"owner":"coordinator","recovery_task_id":repair.id,"attempt_id":attempt_id,"reason":reason,"trigger":trigger}),
-    );
-    Ok(())
-}
-
-fn reconcile_supervisor_repairs(s: &mut Snapshot) -> AppResult<()> {
-    let completed: Vec<_> = s
-        .tasks
-        .iter()
-        .filter(|t| !t.archived && t.stage == "done" && t.status == "completed")
-        .filter_map(|t| {
-            t.recovery_of
-                .as_ref()
-                .filter(|r| !r.resumed)
-                .map(|r| (t.id.clone(), r.clone()))
-        })
-        .collect();
-    for (repair_id, incident) in completed {
-        let Some(i) = s.tasks.iter().position(|t| t.id == incident.task_id) else {
-            continue;
-        };
-        let task = s.tasks[i].clone();
-        if task.archived
-            || task.human_approval
-            || task.status != "blocked"
-            || task.current_attempt.is_some()
-        {
-            continue;
-        }
-        // A deliberately configured spending budget remains operator policy.
-        // Defaults have no budget; the recovery itself has no inherited cap.
-        let used = s
-            .attempts
-            .iter()
-            .filter(|a| a.task_id == task.id)
-            .fold(0u64, |n, a| {
-                n.saturating_add(a.usage.input_tokens.unwrap_or(0))
-                    .saturating_add(a.usage.output_tokens.unwrap_or(0))
-            });
-        if task
-            .token_budget
-            .is_some_and(|limit| limit > 0 && used >= limit)
-        {
-            crate::callbacks::notify(
-                s,
-                i,
-                &format!("budget:{}:{}", task.visit, incident.attempt_id),
-                "An explicitly configured token budget prevents the original task from resuming; planner action is needed to revise that budget.",
-            );
-            continue;
-        }
-        let ri = task_index(s, &repair_id)?;
-        s.tasks[ri].recovery_of.as_mut().unwrap().resumed = true;
-        touch(&mut s.tasks[ri]);
-        s.tasks[i].stage = incident.stage;
-        s.tasks[i].visit = s.tasks[i].visit.saturating_add(1);
-        s.tasks[i].status = "ready".into();
-        s.tasks[i].blocked_reason.clear();
-        touch(&mut s.tasks[i]);
-        event(
-            s,
-            Some(&task.id),
-            "supervisor_recovery_completed",
-            "coordinator",
-            "Recovery finished; original task is queued to continue",
-            json!({"recovery_task_id":repair_id,"blocked_attempt_id":incident.attempt_id,"visit":s.tasks[i].visit}),
-        );
-    }
-    Ok(())
-}
-
-fn recover_worker_blocker(s: &mut Snapshot, i: usize) -> AppResult<()> {
-    let task = s.tasks[i].clone();
-    if !matches!(task.status.as_str(), "blocked" | "needs_input" | "failed")
-        || task.current_attempt.is_some()
-    {
-        return Ok(());
-    }
-    let Some(last) = s
-        .attempts
-        .iter()
-        .rev()
-        .find(|a| a.task_id == task.id && a.visit == task.visit)
-        .filter(|a| {
-            matches!(a.status.as_str(), "blocked" | "needs_input" | "failed")
-                || (task.status == "failed" && a.status == "cancelled")
-        })
-        .cloned()
-    else {
-        return Ok(());
-    };
-    let reason = last
-        .output
-        .as_ref()
-        .and_then(|v| v["reason"].as_str())
-        .filter(|v| !v.is_empty())
-        .unwrap_or(if last.error.is_empty() {
-            &task.blocked_reason
-        } else {
-            &last.error
-        })
-        .to_owned();
-    crate::callbacks::notify(s, i, &last.id, &reason);
-    if stage_index(&task.stage).is_none() {
-        s.tasks[i].stage = if EXECUTABLE_STAGES.contains(&last.stage.as_str()) {
-            last.stage.clone()
-        } else {
-            "planning".into()
-        };
-        touch(&mut s.tasks[i]);
-        event(
-            s,
-            Some(&task.id),
-            "stage_recovered",
-            "coordinator",
-            "Recovered invalid stage from the durable attempt",
-            json!({"previous_stage":task.stage,"stage":s.tasks[i].stage}),
-        );
-    }
-    let task = s.tasks[i].clone();
-    if task.recovery_of.is_none() {
-        return schedule_supervisor_repair(s, i, &last.id, &reason, "worker failure");
-    }
-    // A failed investigation stays actionable. Pace retries without imposing a
-    // maximum count or exponential hours-long disappearance from the queue.
-    if last
-        .finished_at
-        .as_ref()
-        .is_some_and(|at| elapsed(at) < s.settings.retry_delay_seconds.saturating_mul(1000))
-    {
-        return Ok(());
-    }
-    let preferred = match task.stage.as_str() {
-        "planning" => "implementation",
-        "implementation" => "planning",
-        "review" => "implementation",
-        _ => "planning",
-    };
-    let target = if recovery_stage_available(s, &task, preferred) {
-        preferred
-    } else {
-        task.stage.as_str()
-    };
-    s.tasks[i].stage = target.into();
-    s.tasks[i].status = "ready".into();
-    s.tasks[i].visit = s.tasks[i].visit.saturating_add(1);
-    s.tasks[i].blocked_reason.clear();
-    // Old repair tasks created by previous versions must not retain the very
-    // ceilings which stranded them. Explicit original-task budgets stay intact.
-    s.tasks[i].max_attempts = 0;
-    s.tasks[i].max_sendbacks = 0;
-    s.tasks[i].timeout_seconds = 0;
-    s.tasks[i].token_budget = None;
-    route_recovery(s, i, target, Some(&last.agent_id));
-    touch(&mut s.tasks[i]);
-    event(
-        s,
-        Some(&task.id),
-        "recovery_continued",
-        "coordinator",
-        format!(
-            "Recovery continues in {target} after {}: {reason}",
-            task.stage
-        ),
-        json!({"attempt_id":last.id,"from_stage":task.stage,"to_stage":target,"reason":reason,"instructions":recovery_instructions(target)}),
-    );
-    Ok(())
-}
-
-// Waiting for capacity or a locked execution directory is normal queueing.
-// A missing route, in contrast, needs the originating planner's attention.
-fn notify_unavailable_routes(s: &mut Snapshot) {
-    for i in 0..s.tasks.len() {
-        let t = s.tasks[i].clone();
-        if t.archived
-            || t.human_approval
-            || t.status != "ready"
-            || !EXECUTABLE_STAGES.contains(&t.stage.as_str())
-            || dependency_reason(s, &t).is_some()
-        {
-            continue;
-        }
-        let route = t.assignments.get(&t.stage).or_else(|| {
-            if t.recovery_of.is_none() {
-                s.settings.stage_agents.get(&t.stage)
-            } else {
-                None
-            }
-        });
-        let implementer = s
-            .attempts
+    fn failed_replans(&self) -> usize {
+        let resumed = self.history.iter().rev().find(|e| e.kind == "resumed").map_or(0, |e| e.at);
+        self.attempts
             .iter()
             .rev()
-            .find(|a| a.task_id == t.id && a.stage == "implementation" && a.status == "completed")
-            .map(|a| a.agent_id.as_str());
-        let available = s.agents.iter().any(|a| {
-            a.enabled
-                && a.stages.contains(&t.stage)
-                && route.is_none_or(|id| id == &a.id)
-                && !(s.settings.independent_review
-                    && t.stage == "review"
-                    && implementer == Some(a.id.as_str()))
-                && (!(a.adapter == "demo"
-                    || (a.adapter == "cli"
-                        && a.args.first().is_some_and(|v| v == "example-agent")))
-                    || t.tags.iter().any(|tag| tag == "demo"))
-        });
-        if !available {
-            crate::callbacks::notify(
-                s,
-                i,
-                &format!("routing:{}:{}", t.stage, t.visit),
-                "No enabled agent supports the current route. Connect or configure a capable agent so this queued task can continue.",
-            );
-        }
+            .take_while(|a| a.stage == "replan" && a.started >= resumed && a.result.as_ref().is_none_or(|r| r["status"] != "replanned" || r["planError"].is_string()))
+            .filter(|a| a.result.is_some())
+            .count()
     }
 }
-
-/// Each task reconciles independently: a malformed task cannot roll back
-/// unrelated admissions and strand an entire board.
-pub fn reconcile(s: &mut Snapshot) -> AppResult<()> {
-    crate::external::expire_leases(s)?;
-    crate::external::reconcile_presence(s);
-    crate::workers::expire_assignments(s);
-    for _ in 0..s.tasks.len() {
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(value: D) -> std::result::Result<Option<Option<T>>, D::Error> {
+    Ok(Some(Option::deserialize(value)?))
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Input {
+    key: Option<String>,
+    title: Option<String>,
+    outcome: Option<String>,
+    cwd: Option<String>,
+    acceptance: Option<Vec<String>>,
+    dependencies: Option<Vec<String>>,
+    after: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    parent: Option<Option<String>>,
+    conflicts: Option<Vec<String>>,
+    related: Option<Vec<String>>,
+    supersedes: Option<Vec<String>>,
+    writable: Option<Vec<PathBuf>>,
+    #[serde(default, deserialize_with = "nullable")]
+    model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    effort: Option<Option<String>>,
+    attributes: Option<Value>,
+}
+impl Input {
+    fn parse(mut value: Value) -> Result<Self> {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("actor");
+            object.remove("reason");
+        }
+        if let Some(attributes) = value.get("attributes").and_then(Value::as_object) {
+            let unknown: Vec<_> = attributes.keys().filter(|k| !Attributes::FIELDS.contains(&k.as_str())).collect();
+            require(unknown.is_empty(), "Unknown attribute; use lane, needs, priority, size, artifact or deploy")?;
+        }
+        serde_json::from_value(value).map_err(|e| format!("{e}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, writable, attributes").into())
+    }
+    fn apply(self, task: &mut Task) -> Result<()> {
+        let text = |s: String| s.trim().to_owned();
+        if let Some(v) = self.title {
+            task.title = text(v);
+        }
+        if let Some(v) = self.outcome {
+            task.outcome = text(v);
+        }
+        if let Some(v) = self.acceptance {
+            task.acceptance = v.into_iter().map(text).collect();
+        }
+        if let Some(v) = self.cwd {
+            task.cwd = v;
+            task.workspace = Some(workspace(Path::new(&task.cwd))?);
+        }
+        for (field, value) in [(&mut task.dependencies, self.dependencies), (&mut task.after, self.after), (&mut task.conflicts, self.conflicts), (&mut task.related, self.related)] {
+            if let Some(mut value) = value {
+                value.dedup();
+                *field = value;
+            }
+        }
+        if let Some(v) = self.parent {
+            task.parent = v;
+        }
+        if let Some(v) = self.model {
+            task.model = v.filter(|m| !m.trim().is_empty());
+        }
+        if let Some(v) = self.effort {
+            task.effort = v;
+        }
+        if let Some(v) = self.attributes {
+            task.attributes = serde_json::from_value(v)?;
+            task.attributes.needs.sort();
+            task.attributes.needs.dedup();
+        }
+        if let Some(paths) = self.writable {
+            task.writable = writable_paths(task.workdir(), paths)?;
+        }
+        Ok(())
+    }
+}
+fn validate_workdir(path: &Path) -> Result<()> {
+    require(path.is_absolute() && path.is_dir(), "cwd must be an existing absolute directory")
+}
+pub(crate) fn workspace(path: &Path) -> Result<PathBuf> {
+    validate_workdir(path)?;
+    Ok(path.canonicalize()?)
+}
+fn writable_paths(base: &Path, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    for path in paths {
+        require(!(path.as_os_str().is_empty() || path.components().any(|part| part == Component::ParentDir)), "Writable paths must be absolute or workspace relative, without '..'")?;
+        let path = resolve_scope_path(&base.join(path))?;
+        if !resolved.contains(&path) {
+            resolved.push(path);
+        }
+    }
+    Ok(resolved)
+}
+pub(crate) fn resolve_scope_path(path: &Path) -> Result<PathBuf> {
+    for ancestor in path.ancestors() {
+        match ancestor.canonicalize() {
+            Ok(existing) if ancestor == path => return Ok(existing),
+            Ok(existing) => return Ok(existing.join(path.strip_prefix(ancestor)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && ancestor.symlink_metadata().is_err() => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("Missing writable path root".into())
+}
+pub(crate) fn covers(root: &Path, path: &Path) -> bool {
+    let normalized = |part: Component<'_>| part.as_os_str().to_string_lossy().trim_end_matches(['.', ' ']).to_lowercase();
+    let mut parts = path.components().map(normalized);
+    root.components().map(normalized).all(|root| parts.next() == Some(root))
+}
+pub fn linked_file(path: &Path) -> bool {
+    unsafe fn info<T>(file: &fs::File, class: i32) -> Option<T> {
+        let mut info = MaybeUninit::<T>::uninit();
+        let success = unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), class, info.as_mut_ptr().cast(), size_of::<T>() as u32) };
+        (success != 0).then(|| unsafe { info.assume_init() })
+    }
+    let Ok(file) = fs::OpenOptions::new().access_mode(0).open(path) else { return false };
+    unsafe { info::<FILE_STANDARD_INFO>(&file, FileStandardInfo) }.is_some_and(|i| i.NumberOfLinks >= 2) && unsafe { info::<FILE_ID_INFO>(&file, FileIdInfo) }.is_some()
+}
+fn default_capabilities() -> Vec<Need> {
+    vec![Need::Network]
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub implementation: Vec<String>,
+    pub review: Vec<String>,
+    #[serde(default)]
+    pub replan: Vec<String>,
+    #[serde(default = "default_capabilities")]
+    pub capabilities: Vec<Need>,
+    #[serde(default)]
+    pub notify: Vec<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct State {
+    #[serde(default, rename = "schemaVersion")]
+    schema_version: Option<u32>,
+    pub paused: bool,
+    #[serde(default)]
+    pub controls: Vec<Value>,
+    #[serde(default)]
+    pub hold_until: u64,
+    pub tasks: Vec<Task>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived: Vec<Task>,
+    pub config: Config,
+}
+impl State {
+    pub fn index(&self, id: &str) -> Result<usize> {
+        self.tasks.iter().position(|task| task.id == id).ok_or_else(|| format!("Task not found: {id}").into())
+    }
+    fn get(&self, id: &str) -> Option<&Task> {
+        self.tasks.iter().find(|task| task.id == id)
+    }
+    pub fn children<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a Task> {
+        self.tasks.iter().filter(move |task| task.parent.as_deref() == Some(id))
+    }
+    fn ancestors<'a>(&'a self, task: &'a Task) -> Vec<&'a Task> {
+        let mut chain = Vec::new();
+        let mut parent = task.parent.as_deref().and_then(|id| self.get(id));
+        while let Some(next) = parent.filter(|next| !chain.iter().any(|seen: &&Task| seen.id == next.id)) {
+            chain.push(next);
+            parent = next.parent.as_deref().and_then(|id| self.get(id));
+        }
+        chain
+    }
+    pub fn check_definition(&self, task: &Task) -> Result<()> {
+        require(!(task.title.is_empty() || task.outcome.is_empty() || task.cwd.trim().is_empty()), "Title, outcome and cwd are required")?;
+        require(history::words(&task.title) <= history::MAX_TITLE_WORDS, "Title exceeds 12 words")?;
+        require(task.acceptance.len() <= history::MAX_CRITERIA, "At most 3 acceptance criteria; split the work into child tasks under a container")?;
+        require(!task.acceptance.iter().any(|c| c.is_empty()), "Acceptance criteria must not be blank")?;
+        require(task.definition_words() <= history::MAX_WORDS, "Definition exceeds 120 words; split the work into child tasks under a container")?;
+        require(![&task.title, &task.outcome].into_iter().chain(&task.acceptance).any(|t| history::coordination_prose(t)), "Task ids, digests and AGENTS.md belong in relations and worker protocol, not task prose")?;
+        require(!(task.attributes.size == Size::Large && !task.container()), "Large work must be a container with child tasks")?;
+        require(!(task.container() && task.attributes.artifact != Artifact::None), "Containers produce no artifact; children do")?;
+        task.attributes.validate()?;
+        task.effort.as_deref().map(history::effort).transpose()?;
+        let missing: Vec<_> = task.attributes.needs.iter().filter(|need| !self.config.capabilities.contains(need)).collect();
+        require(missing.is_empty(), format!("No worker provides {}; choose a verification the workers can run", serde_json::to_string(&missing)?))?;
+        validate_workdir(task.workdir())
+    }
+    fn check_relations(&self, task: &Task) -> Result<()> {
+        let related = task.dependencies.iter().chain(&task.after).chain(&task.conflicts).chain(&task.related).chain(&task.parent);
+        for id in related {
+            require(id != &task.id, "A task cannot relate to itself")?;
+            self.get(id).ok_or(format!("Related task not found: {id}"))?;
+        }
+        if let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id)) {
+            require(parent.container(), "Parent must be a container (no acceptance criteria)")?;
+            require(parent.stage != "done" || task.stage == "done", "Cannot add work under a completed container")?;
+        }
+        let lineage: HashSet<&str> = self.ancestors(task).iter().map(|t| t.id.as_str()).collect();
+        require(!lineage.contains(task.id.as_str()), "Parent cycle")?;
+        require(!task.dependencies.iter().chain(&task.after).any(|id| lineage.contains(id.as_str())), "A child cannot wait on its own container")?;
+        let mut pending: Vec<&String> = task.dependencies.iter().chain(&task.after).collect();
+        let mut seen = HashSet::new();
+        while let Some(id) = pending.pop() {
+            require(id != &task.id, "Dependency or ordering cycle")?;
+            if seen.insert(id)
+                && let Some(other) = self.get(id)
+            {
+                pending.extend(other.dependencies.iter().chain(&other.after));
+            }
+        }
+        Ok(())
+    }
+    fn waiting_reason(&self, task: &Task) -> Option<String> {
+        if !self.queued(task) {
+            return None;
+        }
+        if self.hold_until > now() {
+            return Some(format!("Usage limit; dispatch resumes at {}", self.hold_until));
+        }
+        if task.container() {
+            return Some(if self.children(&task.id).next().is_some() { "Waiting for child tasks" } else { "Container has no child tasks" }.into());
+        }
+        let inherited = self.ancestors(task).into_iter().flat_map(|a| a.dependencies.iter().chain(&a.after));
+        for id in task.dependencies.iter().chain(inherited) {
+            if let Some(other) = self.get(id).filter(|other| other.stage != "done") {
+                return Some(format!("Waiting for result from {}", other.title));
+            }
+        }
+        if let Some(other) = task.after.iter().filter_map(|id| self.get(id)).find(|o| o.active.is_some() || (o.stage != "done" && !o.stopped && !o.blocked)) {
+            return Some(format!("Waiting for {} to settle", other.title));
+        }
+        for other in self.tasks.iter().filter(|o| o.active.is_some() && o.id != task.id) {
+            if task.conflicts.contains(&other.id) || other.conflicts.contains(&task.id) {
+                return Some(format!("Conflicts with running {}", other.title));
+            }
+            if !task.read_only()
+                && !other.read_only()
+                && let Some(path) = task.writable.iter().find(|path| other.writable.iter().any(|held| covers(path, held) || covers(held, path)))
+            {
+                return Some(format!("Waiting for writable scope {} held by {}", path.display(), other.title));
+            }
+        }
+        (now() < task.retry_at).then(|| format!("Retry scheduled at {}", task.retry_at))
+    }
+    fn queued(&self, task: &Task) -> bool {
+        !self.paused && task.active.is_none() && !task.stopped && !task.blocked && task.stage != "done"
+    }
+    fn dependents(&self, id: &str) -> Vec<usize> {
+        let mut found: Vec<usize> = Vec::new();
+        let mut pending = vec![id.to_owned()];
+        while let Some(id) = pending.pop() {
+            for (index, task) in self.tasks.iter().enumerate() {
+                if task.dependencies.contains(&id) && !found.contains(&index) {
+                    found.push(index);
+                    pending.push(task.id.clone());
+                }
+            }
+        }
+        found
+    }
+    fn insert(&mut self, value: Value, actor: Actor, parent_override: Option<String>) -> Result<String> {
+        let input = Input::parse(value)?;
+        let key = input.key.as_ref().map(|key| key.trim().to_owned());
+        require(!key.as_ref().is_some_and(String::is_empty), "Task key must not be blank")?;
+        let cwd = input.cwd.clone().ok_or("cwd is required")?;
+        let directory = workspace(Path::new(&cwd))?;
+        if let Some(key) = &key
+            && let Some(index) = self.tasks.iter().position(|task| task.key.as_ref() == Some(key) && task.workspace.as_ref() == Some(&directory))
+        {
+            let id = self.tasks[index].id.clone();
+            self.revise(index, input, actor, "keyed_create")?;
+            return Ok(id);
+        }
+        let supersedes = input.supersedes.clone().unwrap_or_default();
+        let mut task: Task = serde_json::from_value(
+            json!({"id":id(),"title":"","outcome":"","cwd":cwd,"acceptance":[],"dependencies":[],"stage":"implementation","stopped":false,"attempts":[],"active":null,"feedback":[],"failure":"","retryAt":0,"key":key,"workspace":directory}),
+        )?;
+        input.apply(&mut task)?;
+        if parent_override.is_some() {
+            task.parent = parent_override;
+        }
+        self.check_definition(&task)?;
+        self.check_relations(&task)?;
+        let id = task.id.clone();
+        for old in &supersedes {
+            let index = self.index(old)?;
+            require(self.tasks[index].active.is_none() && self.children(old).next().is_none(), "Superseded tasks must be idle and have no children")?;
+            for other in &mut self.tasks {
+                for list in [&mut other.dependencies, &mut other.after] {
+                    for entry in list.iter_mut().filter(|entry| *entry == old) {
+                        *entry = id.clone();
+                    }
+                }
+            }
+            let mut retired = self.tasks.remove(index);
+            retired.record("superseded", actor, "create", json!({"by":id}));
+            self.archived.push(retired);
+        }
+        let mut snapshot = task.snapshot();
+        snapshot["supersedes"] = json!(supersedes);
+        task.record("created", actor, "create", snapshot);
+        self.tasks.push(task);
+        Ok(id)
+    }
+    fn revise(&mut self, index: usize, input: Input, actor: Actor, source: &str) -> Result<()> {
+        require(input.supersedes.is_none(), "supersedes applies only when creating a task")?;
+        let previous = self.tasks[index].clone();
+        let mut task = previous.clone();
+        input.apply(&mut task)?;
+        if task.snapshot() == previous.snapshot() {
+            return Ok(());
+        }
+        require(previous.active.is_none(), "Stop the task and wait for its worker to exit before editing")?;
+        self.check_definition(&task)?;
+        self.check_relations(&task)?;
+        let corrective = task.signature() != previous.signature() || (previous.stage == "replan" && !task.refinements.is_empty());
+        if corrective {
+            task.refinements.clear();
+            for dependent in self.dependents(&task.id) {
+                let other = &mut self.tasks[dependent];
+                require(other.active.is_none(), format!("Stop dependent task \"{}\" before changing its prerequisite", other.title))?;
+                if other.stage != "implementation" || other.attempts.iter().any(|a| a.revision == other.revision) {
+                    let from = other.stage.clone();
+                    other.reset_work();
+                    other.record("reopened", actor, source, json!({"causedBy":task.id}));
+                    other.record_phase(&from, actor, source);
+                }
+            }
+            task.reset_work();
+        }
+        task.record(if corrective { "revised" } else { "updated" }, actor, source, task.snapshot());
+        task.record_phase(&previous.stage, actor, source);
+        self.tasks[index] = task;
+        Ok(())
+    }
+    fn settle_containers(&mut self) -> bool {
         let mut changed = false;
-        for i in 0..s.tasks.len() {
-            let t = &s.tasks[i];
-            if t.archived
-                || t.kind != "epic"
-                || !matches!(t.status.as_str(), "ready" | "running")
-                || t.human_approval
-            {
+        for index in 0..self.tasks.len() {
+            let task = &self.tasks[index];
+            if !task.container() || task.active.is_some() {
                 continue;
             }
-            let children: Vec<_> = s
-                .tasks
-                .iter()
-                .filter(|c| c.parent_id.as_ref() == Some(&t.id) && !c.archived)
-                .collect();
-            if children.is_empty()
-                || children.iter().any(|c| c.status != "completed")
-                || dependency_reason(s, t).is_some()
-            {
-                continue;
+            let done = {
+                let mut children = self.children(&task.id).peekable();
+                children.peek().is_some() && children.all(|child| child.stage == "done")
+            };
+            let stage = if done { "done" } else { "implementation" };
+            let current = task.stage.clone();
+            if current != stage && (done || current == "done") {
+                let task = &mut self.tasks[index];
+                let from = task.stage.clone();
+                task.stage = stage.into();
+                task.record(if done { "children_done" } else { "reopened" }, Actor::Scheduler, "containment", json!({}));
+                task.record_phase(&from, Actor::Scheduler, "containment");
+                changed = true;
             }
-            let tid = t.id.clone();
-            s.tasks[i].stage = "done".into();
-            s.tasks[i].status = "completed".into();
-            touch(&mut s.tasks[i]);
-            event(
-                s,
-                Some(&tid),
-                "epic_completed",
-                "coordinator",
-                "All child tasks completed",
-                json!({}),
-            );
+        }
+        changed
+    }
+}
+pub struct Engine {
+    pub directory: PathBuf,
+    pub state: State,
+    pub pending_deploy: Option<String>,
+    pub notices: Vec<Value>,
+}
+impl Engine {
+    pub fn new(directory: PathBuf) -> Result<Self> {
+        let file = directory.join("state.json");
+        let mut state: State = if file.exists() {
+            read(&file)?
+        } else {
+            let command = vec![std::env::current_exe()?.to_string_lossy().into(), "--codex".into()];
+            let config = Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new() };
+            State { schema_version: Some(history::SCHEMA_VERSION), paused: false, controls: Vec::new(), hold_until: 0, tasks: Vec::new(), archived: Vec::new(), config }
+        };
+        require(!(state.schema_version > Some(history::SCHEMA_VERSION)), "State schema is newer than this coordinator")?;
+        if state.config.replan.is_empty() {
+            state.config.replan = state.config.implementation.clone();
+        }
+        for index in 0..state.tasks.len() {
+            let task = &mut state.tasks[index];
+            if task.legacy_audit {
+                task.attributes.lane = Lane::Audit;
+            }
+            if task.legacy_evidence.to_string().contains("candidate") && task.attributes.artifact == Artifact::None {
+                task.attributes.artifact = Artifact::Candidate;
+            }
+            let task = &state.tasks[index];
+            let invalid = task.blocked || !task.refinements.is_empty() || state.check_definition(task).is_err();
+            if task.stage != "done" && task.active.is_none() && invalid && task.stage != "replan" {
+                let task = &mut state.tasks[index];
+                let from = task.stage.clone();
+                task.stage = "replan".into();
+                task.blocked = false;
+                task.feedback = vec!["Legacy definition violates current limits; rewrite it with typed attributes and relations".into()];
+                task.record_phase(&from, Actor::Scheduler, "migration");
+            }
+        }
+        Ok(Self { directory, state, pending_deploy: None, notices: Vec::new() })
+    }
+    pub fn task(&self, id: &str) -> Result<usize> {
+        self.state.index(id)
+    }
+    pub fn attempt_path(&self, id: &str) -> PathBuf {
+        self.directory.join("attempts").join(id)
+    }
+    pub(crate) fn commit(&mut self, mut state: State) -> Result<()> {
+        state.schema_version = Some(history::SCHEMA_VERSION);
+        write(&self.directory.join("state.json"), &state)?;
+        self.state = state;
+        Ok(())
+    }
+    fn change(&mut self, mutate: impl FnOnce(&mut State) -> Result<Value>) -> Result<Value> {
+        let mut state = self.state.clone();
+        let value = mutate(&mut state)?;
+        self.commit(state)?;
+        Ok(value)
+    }
+    pub fn task_value(&self, task: &Task, detailed: bool) -> Result<Value> {
+        let mut value = serde_json::to_value(task)?;
+        if !detailed {
+            value.as_object_mut().unwrap().remove("history");
+        }
+        let blocks: Vec<_> = self.state.tasks.iter().filter(|t| t.dependencies.contains(&task.id)).map(|t| &t.id).collect();
+        value["status"] = json!(task.status());
+        value["container"] = json!(task.container());
+        value["children"] = json!(self.state.children(&task.id).map(|t| &t.id).collect::<Vec<_>>());
+        value["blocks"] = json!(blocks);
+        value["definitionWords"] = json!(task.definition_words());
+        value["waitingReason"] = json!(task.recorded_wait);
+        value["strikes"] = json!(task.strikes());
+        value["analytics"] = metrics::lifecycle(task);
+        Ok(value)
+    }
+    pub fn create(&mut self, input: Value) -> Result<Value> {
+        let actor = Actor::api(&input)?;
+        let id = self.change(|state| Ok(json!(state.insert(input, actor, None)?)))?;
+        self.task_value(&self.state.tasks[self.task(id.as_str().unwrap())?], false)
+    }
+    pub fn edit(&mut self, id: &str, input: Value) -> Result<Value> {
+        let actor = Actor::api(&input)?;
+        let index = self.task(id)?;
+        self.change(|state| state.revise(index, Input::parse(input)?, actor, "edit").map(|()| Value::Null))?;
+        self.task_value(&self.state.tasks[index], false)
+    }
+    pub fn request_replan(&mut self, id: &str, input: Value) -> Result<Value> {
+        let actor = Actor::api(&input)?;
+        let index = self.task(id)?;
+        self.change(|state| {
+            let task = &mut state.tasks[index];
+            require(task.active.is_none() && task.stage != "done" && !task.container(), "Only idle, unfinished, non-container tasks can be replanned")?;
+            let from = task.stage.clone();
+            task.stage = "replan".into();
+            task.blocked = false;
+            task.retry_at = 0;
+            if let Some(reason) = input["reason"].as_str().filter(|r| !r.trim().is_empty()) {
+                task.feedback = vec![history::clip(reason, history::FINDING_WORDS)];
+            }
+            task.record("replan_requested", actor, "api", json!({"reason":input["reason"]}));
+            task.record_phase(&from, actor, "api");
+            Ok(Value::Null)
+        })?;
+        self.task_value(&self.state.tasks[index], false)
+    }
+    pub fn remove(&mut self, id: &str, actor: Actor) -> Result<()> {
+        let index = self.task(id)?;
+        let task = &self.state.tasks[index];
+        require(task.active.is_none(), "Task has an active worker")?;
+        let referenced = self.state.tasks.iter().any(|t| t.parent.as_deref() == Some(id) || t.dependencies.iter().chain(&t.after).any(|d| d == id));
+        require(!referenced, "Task has children or dependents; supersede it instead")?;
+        self.change(|state| {
+            let mut task = state.tasks.remove(index);
+            for other in &mut state.tasks {
+                other.conflicts.retain(|c| c != id);
+                other.related.retain(|c| c != id);
+            }
+            task.record(if task.stage == "done" { "archived" } else { "abandoned" }, actor, "delete", Value::Null);
+            state.archived.push(task);
+            Ok(Value::Null)
+        })
+        .map(drop)
+    }
+    pub fn configure(&mut self, value: Value) -> Result<()> {
+        let mut config: Config = serde_json::from_value(value)?;
+        if config.replan.is_empty() {
+            config.replan = config.implementation.clone();
+        }
+        require(![&config.implementation, &config.review, &config.replan].iter().any(|args| args.is_empty() || args.iter().any(|s| s.trim().is_empty())), "Worker commands must be nonempty string arrays")?;
+        self.change(|state| {
+            state.config = config;
+            Ok(Value::Null)
+        })
+        .map(drop)
+    }
+    pub fn control_as(&mut self, stop: bool, id: Option<&str>, actor: Actor, reason: &str) -> Result<()> {
+        require(id.is_some() || actor == Actor::Human, "Only an explicit user action can control all workspaces")?;
+        require(!reason.trim().is_empty(), "Control requires a reason")?;
+        if let (false, Some(id)) = (stop, id)
+            && actor != Actor::Human
+        {
+            let task = &self.state.tasks[self.task(id)?];
+            let user_stop = task.stopped && task.history.iter().rev().find(|e| matches!(e.kind.as_str(), "stopped" | "resumed")).is_some_and(|e| e.actor == Actor::Human);
+            require(!user_stop, "An explicit user task stop requires user resume authority")?;
+        }
+        let paused = self.state.paused;
+        self.change(|state| {
+            if id.is_none() {
+                if paused != stop {
+                    state.controls.push(json!({"at":now(),"actor":actor,"reason":reason,"paused":stop}));
+                }
+                state.paused = stop;
+                if !stop {
+                    state.hold_until = 0;
+                }
+            }
+            for task in state.tasks.iter_mut().filter(|task| id.is_none_or(|id| id == task.id)) {
+                let changed = if id.is_none() { paused != stop } else { task.stopped != stop || (!stop && (task.blocked || task.retry_at != 0)) };
+                if id.is_some() {
+                    task.stopped = stop;
+                    if !stop {
+                        task.blocked = false;
+                    }
+                }
+                if !stop {
+                    task.retry_at = 0;
+                }
+                if changed {
+                    task.record(if stop { "stopped" } else { "resumed" }, actor, "control", json!({"scope":if id.is_some() {"task"} else {"board"},"reason":reason}));
+                }
+            }
+            Ok(Value::Null)
+        })?;
+        let active: Vec<_> = self.state.tasks.iter().filter(|t| stop && id.is_none_or(|id| id == t.id)).filter_map(|t| t.active.clone()).collect();
+        active.iter().try_for_each(|id| self.signal_stop(id))
+    }
+    fn signal_stop(&self, id: &str) -> Result<()> {
+        Ok(fs::write(self.attempt_path(id).join("stop"), "")?)
+    }
+    fn launch(&self, id: &str) -> Result<()> {
+        let directory = self.attempt_path(id);
+        if directory.join("exit.json").exists() {
+            return Ok(());
+        }
+        let Ok(guard) = lock(&directory.join("lock")) else {
+            return Ok(());
+        };
+        drop(guard);
+        process::command(std::env::current_exe()?.to_str().ok_or("Invalid executable path")?).arg("--supervise").arg(directory).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+        Ok(())
+    }
+    fn request(&self, task: &Task, attempt_id: &str) -> Value {
+        let stage = task.stage.as_str();
+        let summary = |a: &Attempt| a.result.as_ref().map(|r| json!({"stage":a.stage,"status":r["status"],"summary":r["summary"],"findings":r["findings"],"criteria":r["criteria"]}));
+        let dependencies: Vec<_> = task
+            .dependencies
+            .iter()
+            .filter_map(|id| self.state.get(id))
+            .map(|d| {
+                let accepted = d.attempts.iter().rev().find(|a| a.revision == d.revision && a.stage == "implementation" && a.status() == Some("completed"));
+                json!({"id":d.id,"title":d.title,"summary":accepted.and_then(|a| a.result.as_ref()).map(|r| &r["summary"]),"artifact":accepted.and_then(|a| a.evidence.configuration.as_ref()).map(|c| &c["artifact"])})
+            })
+            .collect();
+        let directory = self.attempt_path(attempt_id);
+        let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
+            "cwd":task.workdir(),"model":task.model,"effort":task.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact),
+            "writable":task.writable},
+            "feedback":task.feedback,"dependencies":dependencies,"limits":history::versions()["limits"],"scratch":directory.join("scratch"),
+            "readOnly":stage != "implementation" || task.read_only()});
+        if stage == "review" {
+            let implementation = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.stage == "implementation" && a.status() == Some("completed"));
+            request["implementation"] = json!(implementation.map(|a| json!({"attemptId":a.id,"result":a.result,"artifact":a.evidence.configuration.as_ref().map(|c| &c["artifact"])})));
+        }
+        if stage == "replan" {
+            request["recentAttempts"] = json!(task.attempts.iter().rev().filter_map(summary).take(4).collect::<Vec<_>>());
+            request["legacyNotes"] = json!(task.refinements.iter().map(|r| history::clip(r, 60)).collect::<Vec<_>>());
+            request["capabilities"] = json!(self.state.config.capabilities);
+        }
+        request
+    }
+    fn start(&mut self, index: usize) -> Result<()> {
+        let task = &self.state.tasks[index];
+        let stage = task.stage.clone();
+        let registered = match stage.as_str() {
+            "review" => &self.state.config.review,
+            "replan" => &self.state.config.replan,
+            _ => &self.state.config.implementation,
+        };
+        let mut command = registered.to_vec();
+        if process::local_codex(registered) {
+            command[0] = std::env::current_exe()?.to_string_lossy().into_owned();
+        }
+        let settings = json!({"scratch":true,"acceptance":task.acceptance,"requested":{"model":task.model,"effort":task.effort},"needs":task.attributes.needs,
+            "registeredCommand":registered,"actualCommand":command,"stage":stage,"request":"request.json","revision":task.revision,
+            "workspaceId":task.workspace,"cwd":task.workdir(),"writable":task.writable,
+            "coordinatorVersion":env!("CARGO_PKG_VERSION"),"coordinatorBuild":crate::web::deployment()["digest"]});
+        let attempt =
+            Attempt { id: id(), revision: task.revision, stage: stage.clone(), started: now(), ended: None, result: None, error: None, evidence: AttemptEvidence { configuration: Some(settings), ..Default::default() } };
+        let mut request = self.request(task, &attempt.id);
+        request["command"] = json!(command);
+        write(&self.attempt_path(&attempt.id).join("request.json"), &request)?;
+        let attempt_id = attempt.id.clone();
+        self.change(|state| {
+            let (workspace, mut attempt) = (state.tasks[index].workspace.clone(), attempt);
+            for other in state.tasks.iter_mut().filter(|other| other.active.is_some() && other.workspace == workspace) {
+                attempt.evidence.project_overlapping_attempts.push(other.active.clone().unwrap());
+                other.attempts.last_mut().unwrap().evidence.project_overlapping_attempts.push(attempt.id.clone());
+            }
+            let task = &mut state.tasks[index];
+            task.active = Some(attempt.id.clone());
+            task.record("dispatched", Actor::Scheduler, "dispatch", json!({"stage":stage,"started":attempt.started}));
+            task.attempts.push(attempt);
+            Ok(Value::Null)
+        })?;
+        self.launch(&attempt_id)
+    }
+    fn observe(task: &mut Task, directory: &Path) -> Result<bool> {
+        let attempt = task.attempts.last_mut().unwrap();
+        let mut changed = false;
+        if attempt.evidence.launch.is_none() && directory.join("run.json").exists() {
+            attempt.evidence.launch = Some(read(&directory.join("run.json"))?);
+            let started = attempt.evidence.launch.as_ref().map(|run| run.started);
+            let (id, revision) = (attempt.id.clone(), attempt.revision);
+            let event = Event::new(task, "started", Actor::Worker, "supervisor", json!("run.json")).attempt(&id, revision, started);
+            task.history.push(event);
             changed = true;
         }
-        if !changed {
-            break;
+        let attempt = task.attempts.last_mut().unwrap();
+        if attempt.evidence.observed.is_none() && directory.join("launch-settings.json").exists() {
+            attempt.evidence.observed = Some(read(&directory.join("launch-settings.json"))?);
+            changed = true;
         }
+        Ok(changed)
     }
-    if s.settings.paused || !s.settings.auto_advance {
-        return Ok(());
-    }
-    reconcile_supervisor_repairs(s)?;
-    for i in 0..s.tasks.len() {
-        let t = s.tasks[i].clone();
-        if t.archived || t.kind == "epic" || t.human_approval {
-            continue;
+    fn validate_result(&self, task: &Task, attempt: &Attempt, exit: &Value) -> Result<Value> {
+        if let Some(error) = exit["error"].as_str() {
+            return Err(error.into());
         }
-        let result = if matches!(t.status.as_str(), "blocked" | "needs_input" | "failed") {
-            recover_worker_blocker(s, i)
-        } else if t.stage == "backlog"
-            && t.status == "ready"
-            && !t.acceptance.trim().is_empty()
-            && dependency_reason(s, &t).is_none()
-        {
-            move_stage(s, i, "planning", "coordinator", "Dependencies satisfied")
-        } else {
-            Ok(())
+        require(exit["code"] == 0, format!("Worker exited {}; inspect attempt log", exit["code"]))?;
+        let mut result: Value = read(&self.attempt_path(&attempt.id).join("result.json"))?;
+        let status = result["status"].as_str().unwrap_or_default().to_owned();
+        require(worker_statuses(&attempt.stage).contains(&status.as_str()), "Invalid worker status")?;
+        require(result["summary"].as_str().is_some_and(|s| !s.trim().is_empty()), "Worker summary is required")?;
+        let list = |value: &Value, items: usize| -> Vec<String> {
+            value.as_array().into_iter().flatten().filter_map(Value::as_str).filter(|s| !s.trim().is_empty()).take(items).map(|s| history::clip(s, history::FINDING_WORDS)).collect()
         };
-        if let Err(error) = result {
-            let message = error.to_string();
-            if !s.events.iter().any(|e| {
-                e.task_id.as_ref() == Some(&t.id)
-                    && e.kind == "task_reconcile_error"
-                    && e.message == message
-            }) {
-                event(
-                    s,
-                    Some(&t.id),
-                    "task_reconcile_error",
-                    "coordinator",
-                    &message,
-                    json!({}),
-                );
-                crate::callbacks::notify(s, i, "reconcile", &message);
+        result["summary"] = json!(history::clip(result["summary"].as_str().unwrap(), history::SUMMARY_WORDS));
+        result["findings"] = json!(list(&result["findings"], history::MAX_FINDINGS));
+        result["checks"] = json!(list(&result["checks"], history::MAX_FINDINGS + 2));
+        if attempt.stage == "review" {
+            let criteria: Vec<String> = serde_json::from_value(result["criteria"].clone()).map_err(|_| "Review must report criteria outcomes")?;
+            require(criteria.len() == task.acceptance.len() && criteria.iter().all(|c| matches!(c.as_str(), "passed" | "failed" | "blocked")), "Review must report one outcome per acceptance criterion")?;
+            let failed = criteria.iter().any(|c| c == "failed");
+            if status == "accepted" && criteria.iter().any(|c| c != "passed") {
+                result["status"] = json!(if failed { "rejected" } else { "blocked" });
+            }
+            require(!(status == "rejected" && !failed), "A rejection must mark at least one criterion failed")?;
+        }
+        if matches!(result["status"].as_str(), Some("rejected" | "blocked" | "held")) {
+            require(result["findings"].as_array().is_some_and(|f| !f.is_empty()), "Rejected, blocked and held results require findings")?;
+        }
+        Ok(result)
+    }
+    fn apply_plan(state: &mut State, index: usize, plan: &Value) -> Result<()> {
+        let task = state.tasks[index].clone();
+        let children = plan["children"].as_array().cloned().unwrap_or_default();
+        let base = |item: &Value, parent: bool| {
+            json!({"title":item["title"],"outcome":item["outcome"],"acceptance":if parent {json!([])} else {item["acceptance"].clone()},
+                "attributes":{"lane":item["lane"],"needs":item["needs"],"size":if parent {json!("large")} else {item["size"].clone()},
+                "priority":task.attributes.priority,
+                "artifact":if parent {json!("none")} else {item.get("artifact").cloned().unwrap_or(json!(task.attributes.artifact))},"deploy":!parent && item["artifact"] == "candidate" && task.attributes.deploy}})
+        };
+        if children.is_empty() {
+            state.revise(index, Input::parse(base(plan, false))?, Actor::Planner, "replan")?;
+            return require(state.tasks[index].stage != "replan", "Plan did not change the task definition");
+        }
+        state.revise(index, Input::parse(base(plan, true))?, Actor::Planner, "replan")?;
+        let mut ids: Vec<String> = Vec::new();
+        for child in &children {
+            let mut value = base(child, false);
+            value["cwd"] = json!(task.cwd);
+            value["writable"] = json!(task.writable);
+            value["after"] = json!(child["after"].as_array().into_iter().flatten().filter_map(Value::as_u64).filter_map(|i| ids.get(i as usize).cloned()).collect::<Vec<_>>());
+            ids.push(state.insert(value, Actor::Planner, Some(task.id.clone()))?);
+        }
+        Ok(())
+    }
+    fn collect(&mut self, index: usize, exit: Value) -> Result<()> {
+        let task = &self.state.tasks[index];
+        let Some(attempt) = task.attempts.last().filter(|_| task.active.is_some()) else {
+            return Ok(());
+        };
+        let stopped = exit["stopped"] == true;
+        let directory = self.attempt_path(&attempt.id);
+        let result = self.validate_result(task, attempt, &exit);
+        let log = fs::read_to_string(directory.join("log.txt")).unwrap_or_default();
+        let usage_reset = result.is_err().then(|| crate::telemetry::usage_reset(&log)).flatten();
+        let mut state = self.state.clone();
+        let task = &mut state.tasks[index];
+        Self::observe(task, &directory)?;
+        let previous_stage = task.stage.clone();
+        task.active = None;
+        let current = task.attempts.last().unwrap().revision == task.revision;
+        let attempt = task.attempts.last_mut().unwrap();
+        attempt.ended = exit["ended"].as_u64();
+        attempt.evidence.usage = read(&directory.join("usage.json")).ok();
+        Self::measure(attempt, &directory)?;
+        let mut deploy = false;
+        let mut notice = None;
+        match (stopped, result) {
+            (true, _) => attempt.error = Some("Stopped by user".into()),
+            (false, Err(error)) => {
+                attempt.error = Some(error.to_string());
+                if let Some(reset) = usage_reset {
+                    state.hold_until = reset.unwrap_or_else(|| now() + 3_600_000);
+                    notice = Some(json!({"event":"usage_limit","until":state.hold_until}));
+                } else if current {
+                    let failures = task.attempts.iter().rev().take_while(|a| a.error.as_deref().is_some_and(|e| e != "Stopped by user")).count() as u64;
+                    let attempt = task.attempts.last().unwrap();
+                    task.failure = error.to_string();
+                    task.retry_at = now() + attempt.ended.unwrap_or_else(now).saturating_sub(attempt.started).max(1000) * failures;
+                }
+            }
+            (false, Ok(mut result)) => {
+                let status = result["status"].as_str().unwrap().to_owned();
+                if attempt.stage == "implementation" && status == "completed" {
+                    attempt.evidence.configuration.get_or_insert_with(|| json!({}))["artifact"] = json!(evidence::artifact(&directory, task.attributes.artifact));
+                }
+                if attempt.stage == "review" && status == "accepted" {
+                    let recorded = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.status() == Some("completed")).and_then(|a| a.evidence.configuration.as_ref()).map(|c| c["artifact"].clone());
+                    let path = recorded.as_ref().and_then(|a| a["path"].as_str()).map(PathBuf::from);
+                    if path.as_deref().is_some_and(|p| evidence::digest(p).ok().as_ref() != recorded.as_ref().and_then(|a| a["digest"].as_str()).map(str::to_owned).as_ref()) {
+                        result["status"] = json!("rejected");
+                        result["findings"] = json!(["Artifact changed after implementation; rebuild it"]);
+                    }
+                }
+                let attempt = task.attempts.last_mut().unwrap();
+                attempt.result = Some(result.clone());
+                if current {
+                    task.failure.clear();
+                    task.retry_at = 0;
+                    task.feedback = serde_json::from_value(result["findings"].clone())?;
+                    match result["status"].as_str().unwrap() {
+                        "replanned" => {
+                            if let Err(error) = Self::apply_plan(&mut state, index, &result["plan"]) {
+                                let task = &mut state.tasks[index];
+                                task.attempts.last_mut().unwrap().result.as_mut().unwrap()["planError"] = json!(error.to_string());
+                                task.feedback = vec![history::clip(&error.to_string(), history::FINDING_WORDS)];
+                            }
+                        }
+                        "held" => {
+                            task.blocked = true;
+                            task.failure = result["summary"].as_str().unwrap().into();
+                            notice = Some(json!({"event":"held","taskId":task.id,"title":task.title,"reason":task.failure}));
+                        }
+                        "rejected" if task.strikes() >= history::STRIKES => task.stage = "replan".into(),
+                        "rejected" => {
+                            let failed: Vec<_> = result["criteria"].as_array().unwrap().iter().zip(&task.acceptance).filter(|(o, _)| *o == "failed").map(|(_, c)| format!("Failed criterion: {c}")).collect();
+                            task.feedback.splice(0..0, failed);
+                            task.stage = "implementation".into();
+                        }
+                        status => {
+                            task.stage = next_stage(status).unwrap().into();
+                            deploy = status == "accepted" && task.attributes.deploy;
+                        }
+                    }
+                }
             }
         }
+        let task = &mut state.tasks[index];
+        if task.stage == "replan" && task.failed_replans() >= history::STRIKES && !task.blocked {
+            task.blocked = true;
+            task.failure = "Replanning failed twice; a decision is needed".into();
+            notice = Some(json!({"event":"held","taskId":task.id,"title":task.title,"reason":task.failure}));
+        }
+        let attempt = task.attempts.last().unwrap();
+        let kind = attempt.status().unwrap_or(if stopped { "attempt_stopped" } else { "attempt_failed" }).to_owned();
+        let event = Event::new(task, &kind, Actor::Worker, "attempt_collection", json!({"currentRevision":current,"error":attempt.error,"ended":attempt.ended})).attempt(&attempt.id, attempt.revision, attempt.ended);
+        task.history.push(event);
+        task.record_phase(&previous_stage, Actor::Scheduler, "attempt_collection");
+        evidence::clean_scratch(&directory, task.attempts.last().unwrap());
+        let task_id = task.id.clone();
+        self.commit(state)?;
+        metrics::clean(&directory);
+        if deploy {
+            self.pending_deploy = Some(task_id);
+        }
+        self.notices.extend(notice);
+        Ok(())
     }
-    notify_unavailable_routes(s);
-    Ok(())
-}
-
-pub fn seed_demo(s: &mut Snapshot) -> AppResult<()> {
-    if s.tasks
-        .iter()
-        .any(|t| t.tags.iter().any(|v| v == "demo") && !t.archived)
-    {
-        return Err(conflict("Demo tasks are already present"));
+    fn measure(attempt: &mut Attempt, directory: &Path) -> Result<()> {
+        let before = read::<Value>(&directory.join("project-before.json")).ok();
+        let after = read::<Value>(&directory.join("project-after.json")).ok();
+        if before.is_some() || after.is_some() {
+            attempt.evidence.project_size = Some(json!({"delta":metrics::size_delta(before.as_ref().unwrap_or(&Value::Null),after.as_ref().unwrap_or(&Value::Null)),"before":before,"after":after}));
+        }
+        if let Some(configuration) = &attempt.evidence.configuration
+            && directory.join("baseline.json").exists()
+            && directory.join("final-snapshot.json").exists()
+        {
+            let base: PathBuf = serde_json::from_value(configuration["cwd"].clone())?;
+            let changes = directory.join("changes.json");
+            let mut changes = if changes.exists() { read::<Value>(&changes)? } else { metrics::compare(read(&directory.join("baseline.json"))?, read(&directory.join("final-snapshot.json"))?, &base, &[]) };
+            changes["attribution"] = json!(if attempt.evidence.project_overlapping_attempts.is_empty() { "scoped_observation" } else { "ambiguous" });
+            attempt.evidence.changes = Some(changes);
+        }
+        Ok(())
     }
-    let mut profiles = vec![];
-    for (name, stages) in [
-        ("Demo · Planner", vec!["planning"]),
-        ("Demo · Builder", vec!["implementation"]),
-        ("Demo · Reviewer", vec!["review"]),
-    ] {
-        let a = save_agent(
-            s,
-            None,
-            json!({"name":name,"adapter":"demo","model":"deterministic-demo","stages":stages}),
-        )?;
-        profiles.push(a);
+    fn poll_attempt(&mut self, index: usize) -> Result<()> {
+        let Some(id) = self.state.tasks[index].active.clone() else {
+            return Ok(());
+        };
+        let directory = self.attempt_path(&id);
+        let exit = directory.join("exit.json");
+        if exit.exists() {
+            return self.collect(index, read(&exit)?);
+        }
+        if self.state.paused || self.state.tasks[index].stopped {
+            self.signal_stop(&id)?;
+        }
+        let mut task = self.state.tasks[index].clone();
+        if Self::observe(&mut task, &directory)? {
+            let mut state = self.state.clone();
+            state.tasks[index] = task;
+            self.commit(state)?;
+        }
+        self.launch(&id).or_else(|error| write(&exit, &json!({"error":error.to_string(),"ended":now()})))
     }
-    let epic = create_task(
-        s,
-        json!({"title":"A calmer way to coordinate agents","kind":"epic","description":"An example epic. Demo agents simulate handoffs and do not change your files.","tags":["demo"],"complexity":13}),
-    )?;
-    for (index, (title, kind, points, stage)) in [
-        (
-            "Define the task handoff contract",
-            "research",
-            3,
-            "planning",
-        ),
-        (
-            "Build the local activity timeline",
-            "feature",
-            5,
-            "implementation",
-        ),
-        ("Check the retry and sendback rules", "bug", 3, "review"),
-        ("Verify acceptance criteria", "operations", 2, "review"),
-        ("Document agent setup", "documentation", 2, "backlog"),
-        (
-            "Explore better complexity estimates",
-            "research",
-            8,
-            "backlog",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut assignments = BTreeMap::new();
-        for a in &profiles {
-            for stage in &a.stages {
-                assignments.insert(stage.clone(), a.id.clone());
+    pub fn tick(&mut self) -> Result<()> {
+        let mut outcome = Ok(());
+        for index in 0..self.state.tasks.len() {
+            outcome = self.poll_attempt(index).and(outcome);
+        }
+        let mut state = self.state.clone();
+        if state.settle_containers() {
+            self.commit(state)?;
+        }
+        let mut order: Vec<usize> = (0..self.state.tasks.len()).collect();
+        order.sort_by_key(|&i| self.state.tasks[i].attributes.priority());
+        for index in order {
+            let ready = { self.state.queued(&self.state.tasks[index]) && self.state.waiting_reason(&self.state.tasks[index]).is_none() };
+            outcome = if ready { self.start(index) } else { Ok(()) }.and(outcome);
+        }
+        self.sync_waiting()?;
+        outcome
+    }
+    pub fn sync_waiting(&mut self) -> Result<()> {
+        let reasons: Vec<_> = self.state.tasks.iter().map(|task| self.state.waiting_reason(task)).collect();
+        if reasons.iter().zip(&self.state.tasks).all(|(reason, task)| reason == &task.recorded_wait) {
+            return Ok(());
+        }
+        let mut state = self.state.clone();
+        for (task, reason) in state.tasks.iter_mut().zip(reasons) {
+            if reason != task.recorded_wait {
+                task.record("waiting_changed", Actor::Scheduler, "scheduler", json!({"reason":reason}));
+                task.recorded_wait = reason;
             }
         }
-        let t = create_task(
-            s,
-            json!({"title":title,"task_type":kind,"complexity":points,"priority":if index==2 {1}else{2},"parent_id":epic.id,"description":"Sample task for exploring Relay. This is explicitly simulated work; replace it with your own tasks and agents.","acceptance":"The demo stage produces a clearly labeled artifact and preserves the handoff history.","tags":["demo"],"assignments":assignments}),
-        )?;
-        let ti = task_index(s, &t.id)?;
-        while s.tasks[ti].stage != stage {
-            let next = stage_index(&s.tasks[ti].stage).unwrap() + 1;
-            move_stage(
-                s,
-                ti,
-                STAGES[next],
-                "demo setup",
-                "Illustrative starting position; no real work has run",
-            )?;
-        }
+        self.commit(state)
     }
-    Ok(())
 }
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;
