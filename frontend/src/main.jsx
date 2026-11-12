@@ -17,7 +17,7 @@ const PAGES = ['Board', 'List', 'Graph', 'Analytics', 'Settings'];
 const words = text => (text || '').trim().split(/\s+/).filter(Boolean).length;
 const workspaceOf = t => t.workspace ?? t.cwd;
 const pathKey = p => (p || '').replace(/^\\\\\?\\/, '').replace(/[\\/]+$/, '').toLowerCase();
-const limitsFor = (state, path) => ({...state.versions.limits, ...(Object.entries(state.config.limits || {}).find(([k]) => pathKey(k) === pathKey(path))?.[1] || {})});
+const limitsFor = (state, path) => ({...state.versions.limits, ...(Object.entries(state.config.workspaces || {}).find(([k]) => pathKey(k) === pathKey(path))?.[1]?.limits || {})});
 const dependencyReasons = state => state.versions.dependencyReasons || ['uses_artifact', 'uses_api', 'uses_schema', 'uses_data'];
 const dependencyTarget = d => typeof d === 'string' ? d : d.target;
 const dependencyError = (links, reasons) => links.some(d => !dependencyTarget(d)) ? 'Choose a task for every dependency or remove the dependency.' : links.some(d => !reasons.includes(d.reason)) ? 'Choose an allowed reason for every dependency or remove the dependency.' : '';
@@ -110,8 +110,8 @@ function App() {
   }
   const tasks = state?.tasks || [];
   const byId = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
-  const workspaces = [...new Set(tasks.map(workspaceOf))].sort();
-  const scoped = tasks.filter(t => !workspace || workspaceOf(t) === workspace);
+  const workspaces = [...new Map([...Object.keys(state?.config?.workspaces || {}), ...tasks.map(workspaceOf)].filter(Boolean).map(path => [pathKey(path), path.replace(/^\\\\\?\\/, '')])).values()].sort();
+  const scoped = tasks.filter(t => !workspace || pathKey(workspaceOf(t)) === pathKey(workspace));
   const visible = scoped.filter(t => t.title.toLowerCase().includes(query.toLowerCase()) && Object.entries(filters).every(([key, value]) => !value || (key === 'lane' ? t.attributes.lane === value : value === 'uncategorized' ? !t.attributes[key]?.length : (t.attributes[key] || []).includes(value))));
   const go = p => { setPage(p); savePreference('coordinator.page', p); };
   const card = t => {
@@ -131,7 +131,7 @@ function App() {
       <aside>
         <div className="brand">Coordinator</div>
         <label>Workspace
-          <select aria-label="Workspace" value={workspace} onChange={e => { setWorkspace(e.target.value); savePreference('coordinator.workspace', e.target.value); }}>
+          <select aria-label="Workspace" value={workspaces.find(path => pathKey(path) === pathKey(workspace)) || ''} onChange={e => { setWorkspace(e.target.value); savePreference('coordinator.workspace', e.target.value); }}>
             <option value="">All workspaces</option>{workspaces.map(w => <option key={w}>{w}</option>)}
           </select>
         </label>

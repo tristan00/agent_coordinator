@@ -24,7 +24,7 @@ fn features(state: &State, task: &Task) -> Value {
 fn outcomes(task: &Task) -> Value {
     let count = |stage: &str, status: Option<&str>| task.attempts.iter().filter(|a| a.stage == stage && status.is_none_or(|s| a.status() == Some(s))).count();
     let first = task.attempts.iter().filter(|a| a.result.is_some()).take(2).filter_map(|a| a.status()).collect::<Vec<_>>();
-    let tokens: u64 = task.attempts.iter().filter_map(|a| a.evidence.usage.as_ref()?.total_tokens).sum();
+    let tokens: u64 = task.attempts.iter().filter_map(|a| a.evidence.usage.as_ref()?.tokens()).sum();
     json!({"stage":task.stage,"attempts":task.attempts.len(),"implementations":count("implementation", None),"reviews":count("review", None),
         "replans":count("replan", None),"rejections":count("review", Some("rejected")),"blocks":count("implementation", Some("blocked")) + count("review", Some("blocked")),
         "held":task.blocked,"errors":task.attempts.iter().filter(|a| a.error.is_some()).count(),

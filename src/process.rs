@@ -178,7 +178,7 @@ pub fn supervise(directory: &Path) -> Result<()> {
     if !directory.join("usage.json").exists()
         && let Some(components) = crate::telemetry::resource_usage(&directory.join("events.jsonl"))
     {
-        let _ = write(&directory.join("usage.json"), &Usage { total_tokens: None, components: Some(components), source: "codex_completed_turn_events".into() });
+        let _ = write(&directory.join("usage.json"), &Usage { total_tokens: crate::telemetry::total(&components), components: Some(components), source: "codex_completed_turn_events".into() });
     }
     write(&directory.join("exit.json"), &outcome)
 }
@@ -340,7 +340,7 @@ pub fn codex() -> Result<()> {
     crate::evidence::capture_trace(directory)?;
     let components = crate::telemetry::resource_usage(&directory.join("events.jsonl"));
     if tokens.is_some() || components.is_some() {
-        write(&directory.join("usage.json"), &Usage { total_tokens: tokens, components, source: "codex_token_footer".into() })?;
+        write(&directory.join("usage.json"), &Usage { total_tokens: tokens.or_else(|| components.as_ref().and_then(crate::telemetry::total)), components, source: "codex_token_footer".into() })?;
     }
     crate::require(status.success(), "Codex worker failed; inspect attempt log")?;
     Ok(())

@@ -24,14 +24,81 @@ pub fn deployment() -> &'static Value {
             "frontend":crate::redeploy::frontend_digest()})
     })
 }
-fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shutdown: &mut bool) -> Result<()> {
+fn authorized(request: &Request, port: u16) -> bool {
     let local = format!("127.0.0.1:{port}");
     let localhost = format!("localhost:{port}");
     let get_header = |name: &str| request.headers().iter().find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name)).map(|h| h.value.as_str());
-    if !get_header("Host").is_some_and(|v| v == local || v == localhost) || get_header("Origin").is_some_and(|v| v != format!("http://{local}") && v != format!("http://{localhost}")) {
+    get_header("Host").is_some_and(|v| v == local || v == localhost) && !get_header("Origin").is_some_and(|v| v != format!("http://{local}") && v != format!("http://{localhost}"))
+}
+fn decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = bytes.get(index + 1..index + 3).and_then(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok());
+        match (bytes[index], hex) {
+            (b'%', Some(value)) => {
+                output.push(value);
+                index += 3;
+            }
+            (b'+', _) => {
+                output.push(b' ');
+                index += 1;
+            }
+            (byte, _) => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+struct UpdateQuery {
+    workspace: Option<PathBuf>,
+    after: Option<u64>,
+    wait: u64,
+}
+fn update_query(url: &str) -> Result<UpdateQuery> {
+    let mut query = UpdateQuery { workspace: None, after: None, wait: 0 };
+    for pair in url.split_once('?').map_or("", |(_, query)| query).split('&').filter(|pair| !pair.is_empty()) {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = decode(value);
+        match name {
+            "workspace" => query.workspace = Some(crate::engine::workspace(Path::new(&value))?),
+            "after" => query.after = Some(value.parse().map_err(|_| "after must be a sequence number")?),
+            "wait" => query.wait = value.parse().map_err(|_| "wait must be whole seconds")?,
+            _ => return Err(format!("Unknown updates parameter {name}; use workspace, after or wait").into()),
+        }
+    }
+    Ok(query)
+}
+struct Parked {
+    request: Request,
+    query: UpdateQuery,
+    until: Instant,
+}
+fn parkable(request: &Request, engine: &Engine, port: u16) -> Option<UpdateQuery> {
+    if request.method().as_str() != "GET" || request.url().split('?').next() != Some("/api/updates") || !authorized(request, port) {
+        return None;
+    }
+    update_query(request.url())
+        .ok()
+        .filter(|query| query.wait > 0 && engine.state.settings(query.workspace.as_deref()).updates == crate::history::Updates::Events && !engine.changed_since(query.workspace.as_deref(), query.after))
+}
+fn release(parked: Vec<Parked>, engine: &Engine, error: &str, all: bool) -> Vec<Parked> {
+    let now = Instant::now();
+    let (ready, waiting): (Vec<_>, Vec<_>) = parked.into_iter().partition(|p| all || now >= p.until || engine.changed_since(p.query.workspace.as_deref(), p.query.after));
+    for p in ready {
+        let _ = send(p.request, 200, engine.updates(p.query.workspace.as_deref(), p.query.after, error));
+    }
+    waiting
+}
+fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shutdown: &mut bool) -> Result<()> {
+    if !authorized(&request, port) {
         return send(request, 403, json!({"error":"Invalid host or origin"}));
     }
-    let url = request.url().split('?').next().unwrap().to_owned();
+    let full = request.url().to_owned();
+    let url = full.split('?').next().unwrap().to_owned();
     let method = request.method().as_str().to_owned();
     let parts: Vec<_> = url.split('/').collect();
     if method == "GET" {
@@ -57,13 +124,13 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
             }
             return Ok(request.respond(Response::from_string("Worker has not produced a log yet."))?);
         }
-        return match get(engine, &parts, error) {
+        return match get(engine, &parts, &full, error) {
             Ok(Some(value)) => send(request, 200, value),
             Ok(None) => send(request, 404, json!({"error":"Not found"})),
             Err(error) => send(request, 500, json!({"error":error.to_string()})),
         };
     }
-    if !get_header("Content-Type").is_some_and(|v| v.starts_with("application/json")) {
+    if !request.headers().iter().any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Content-Type") && h.value.as_str().starts_with("application/json")) {
         return send(request, 415, json!({"error":"Use application/json"}));
     }
     let outcome = (|| -> Result<Value> {
@@ -132,8 +199,12 @@ fn handoff(engine: &mut Engine, action: &str, port: u16) -> Result<Value> {
     }
     Ok(event)
 }
-fn get(engine: &mut Engine, parts: &[&str], error: &str) -> Result<Option<Value>> {
+fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<Option<Value>> {
     let value = match parts {
+        ["", "api", "updates"] => {
+            let query = update_query(full)?;
+            engine.updates(query.workspace.as_deref(), query.after, error)
+        }
         ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
         ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
@@ -281,11 +352,15 @@ pub fn serve() -> Result<()> {
     let mut last_tick = Instant::now();
     let mut error = String::new();
     let mut shutdown = false;
+    let mut parked = Vec::new();
     while !shutdown {
-        if let Some(request) = server.recv_timeout(Duration::from_millis(100))?
-            && let Err(failure) = handle(request, &mut engine, port, &error, &mut shutdown)
-        {
-            eprintln!("{failure}");
+        if let Some(request) = server.recv_timeout(Duration::from_millis(100))? {
+            if let Some(query) = parkable(&request, &engine, port) {
+                let until = Instant::now() + Duration::from_secs(query.wait);
+                parked.push(Parked { request, query, until });
+            } else if let Err(failure) = handle(request, &mut engine, port, &error, &mut shutdown) {
+                eprintln!("{failure}");
+            }
         }
         if !shutdown && last_tick.elapsed() >= Duration::from_millis(100) {
             error = engine.tick().err().map(|e| e.to_string()).unwrap_or_default();
@@ -298,6 +373,7 @@ pub fn serve() -> Result<()> {
             }
             notify(&mut engine);
         }
+        parked = release(parked, &engine, &error, shutdown);
     }
     Ok(())
 }

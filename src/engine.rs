@@ -99,6 +99,8 @@ pub struct Task {
     pub history: Vec<Event>,
     #[serde(default)]
     pub recorded_wait: Option<String>,
+    #[serde(default)]
+    pub changed: u64,
     pub acceptance: Vec<String>,
     pub dependencies: Vec<Dependency>,
     #[serde(default)]
@@ -190,6 +192,16 @@ impl Task {
             let stage = self.stage.clone();
             self.record("phase_changed", actor, source, json!({"from":from,"to":stage}));
         }
+    }
+    pub fn brief(&self) -> Value {
+        let latest = self.attempts.iter().rev().find(|a| a.result.is_some() || a.error.is_some()).map(|a| {
+            let result = a.result.as_ref();
+            json!({"stage":a.stage,"status":a.status(),"summary":result.map(|r| &r["summary"]),"findings":result.map(|r| &r["findings"]),"criteria":result.map(|r| &r["criteria"]),"error":a.error})
+        });
+        let tokens: u64 = self.attempts.iter().filter_map(|a| a.evidence.usage.as_ref()?.tokens()).sum();
+        json!({"id":self.id,"key":self.key,"title":self.title,"workspace":self.workspace,"parent":self.parent,"stage":self.stage,"status":self.status(),"container":self.container(),
+            "active":self.active.is_some(),"stopped":self.stopped,"blocked":self.blocked,"revision":self.revision,"waitingReason":self.recorded_wait,"strikes":self.strikes(),
+            "feedback":self.feedback,"failure":self.failure,"attempts":self.attempts.len(),"tokens":tokens,"latest":latest})
     }
     fn failures(&self) -> BTreeMap<String, usize> {
         let mut failures = self.inherited.clone();
@@ -365,7 +377,19 @@ pub struct Config {
     #[serde(default)]
     pub notify: Vec<String>,
     #[serde(default)]
-    pub limits: BTreeMap<PathBuf, history::Limits>,
+    pub workspaces: BTreeMap<PathBuf, history::WorkspaceSettings>,
+    #[serde(default, skip_serializing)]
+    limits: BTreeMap<PathBuf, history::Limits>,
+}
+impl Config {
+    fn adopt_legacy_limits(&mut self) -> Result<()> {
+        for (path, limits) in std::mem::take(&mut self.limits) {
+            let settings = self.workspaces.entry(path.clone()).or_default();
+            require(settings.limits == history::Limits::default() || settings.limits == limits, format!("Workspace {} has conflicting limits and workspaces settings", path.display()))?;
+            settings.limits = limits;
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
@@ -382,6 +406,10 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archived: Vec<Task>,
     pub config: Config,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    changes: BTreeMap<PathBuf, u64>,
 }
 impl State {
     pub fn index(&self, id: &str) -> Result<usize> {
@@ -402,9 +430,12 @@ impl State {
         }
         chain
     }
+    pub fn settings(&self, key: Option<&Path>) -> history::WorkspaceSettings {
+        key.and_then(|key| self.config.workspaces.get(key)).copied().unwrap_or_default()
+    }
     pub fn limits(&self, task: &Task) -> history::Limits {
         let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
-        key.and_then(|key| self.config.limits.get(&key)).copied().unwrap_or_default()
+        self.settings(key.as_deref()).limits
     }
     pub fn check_definition(&self, task: &Task) -> Result<()> {
         let limits = self.limits(task);
@@ -480,12 +511,6 @@ impl State {
         for other in self.tasks.iter().filter(|o| o.active.is_some() && o.id != task.id) {
             if task.conflicts.contains(&other.id) || other.conflicts.contains(&task.id) {
                 return Some(format!("Conflicts with running {}", other.title));
-            }
-            if !task.read_only()
-                && !other.read_only()
-                && let Some(path) = task.writable.iter().find(|path| other.writable.iter().any(|held| covers(path, held) || covers(held, path)))
-            {
-                return Some(format!("Waiting for writable scope {} held by {}", path.display(), other.title));
             }
         }
         (now() < task.retry_at).then(|| format!("Retry scheduled at {}", task.retry_at))
@@ -714,8 +739,20 @@ impl Engine {
             serde_json::from_value(raw).map_err(|e| format!("{e}; use after, or nothing"))?
         } else {
             let command = vec![std::env::current_exe()?.to_string_lossy().into(), "--external".into()];
-            let config = Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), limits: BTreeMap::new() };
-            State { batches: Default::default(), schema_version: Some(history::SCHEMA_VERSION), paused: false, controls: Vec::new(), hold_until: 0, tasks: Vec::new(), archived: Vec::new(), config }
+            let config =
+                Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), workspaces: BTreeMap::new(), limits: BTreeMap::new() };
+            State {
+                batches: Default::default(),
+                schema_version: Some(history::SCHEMA_VERSION),
+                paused: false,
+                controls: Vec::new(),
+                hold_until: 0,
+                tasks: Vec::new(),
+                archived: Vec::new(),
+                config,
+                sequence: 0,
+                changes: BTreeMap::new(),
+            }
         };
         require(!(state.schema_version > Some(history::SCHEMA_VERSION)), "State schema is newer than this coordinator")?;
         if state.schema_version < Some(4) && directory.join("relationship-plan.json").exists() {
@@ -739,6 +776,7 @@ impl Engine {
         if state.config.replan.is_empty() {
             state.config.replan = state.config.implementation.clone();
         }
+        state.config.adopt_legacy_limits()?;
         for index in 0..state.tasks.len() {
             let task = &mut state.tasks[index];
             if task.legacy_audit {
@@ -770,6 +808,26 @@ impl Engine {
     }
     pub(crate) fn commit(&mut self, mut state: State) -> Result<()> {
         state.schema_version = Some(history::SCHEMA_VERSION);
+        let next = self.state.sequence + 1;
+        let mut changed: Vec<PathBuf> = Vec::new();
+        for task in &mut state.tasks {
+            if self.state.get(&task.id).is_none_or(|old| old.brief() != task.brief()) {
+                task.changed = next;
+                changed.push(task.workspace.clone().unwrap_or_default());
+            }
+        }
+        for old in self.state.tasks.iter().filter(|old| state.get(&old.id).is_none()) {
+            changed.push(old.workspace.clone().unwrap_or_default());
+        }
+        if (state.paused, state.hold_until, &state.config.workspaces) != (self.state.paused, self.state.hold_until, &self.state.config.workspaces) {
+            changed.push(PathBuf::new());
+        }
+        if !changed.is_empty() {
+            state.sequence = next;
+            for key in changed {
+                state.changes.insert(key, next);
+            }
+        }
         write(&self.directory.join("state.json"), &state)?;
         self.state = state;
         Ok(())
@@ -779,6 +837,15 @@ impl Engine {
         let value = mutate(&mut state)?;
         self.commit(state)?;
         Ok(value)
+    }
+    pub fn changed_since(&self, key: Option<&Path>, after: Option<u64>) -> bool {
+        after.is_none_or(|after| key.map_or(self.state.sequence > after, |key| [key, Path::new("")].into_iter().any(|key| self.state.changes.get(key).is_some_and(|at| *at > after))))
+    }
+    pub fn updates(&self, key: Option<&Path>, after: Option<u64>, error: &str) -> Value {
+        let scoped: Vec<&Task> = self.state.tasks.iter().filter(|task| key.is_none_or(|key| task.workspace.as_deref() == Some(key))).collect();
+        json!({"sequence":self.state.sequence,"updates":self.state.settings(key).updates,"paused":self.state.paused,"holdUntil":self.state.hold_until,"error":error,
+            "ids":scoped.iter().map(|task| &task.id).collect::<Vec<_>>(),
+            "tasks":scoped.iter().filter(|task| after.is_none_or(|after| task.changed > after)).map(|task| task.brief()).collect::<Vec<_>>()})
     }
     pub fn task_value(&self, task: &Task, detailed: bool) -> Result<Value> {
         let mut value = serde_json::to_value(task)?;
@@ -873,11 +940,12 @@ impl Engine {
             config.replan = config.implementation.clone();
         }
         require(![&config.implementation, &config.review, &config.replan].iter().any(|args| args.is_empty() || args.iter().any(|s| s.trim().is_empty())), "Worker commands must be nonempty string arrays")?;
-        config.limits = std::mem::take(&mut config.limits)
+        config.adopt_legacy_limits()?;
+        config.workspaces = std::mem::take(&mut config.workspaces)
             .into_iter()
-            .map(|(path, limits)| {
-                limits.validate()?;
-                Ok((workspace(&path).map_err(|e| format!("Limits workspace {}: {e}", path.display()))?, limits))
+            .map(|(path, settings)| {
+                settings.limits.validate()?;
+                Ok((workspace(&path).map_err(|e| format!("Workspace {}: {e}", path.display()))?, settings))
             })
             .collect::<Result<_>>()?;
         self.change(|state| {

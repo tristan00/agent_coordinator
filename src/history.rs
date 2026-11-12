@@ -2,8 +2,8 @@ use crate::{Result, now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-pub const SCHEMA_VERSION: u32 = 5;
-pub const METRIC_DEFINITION_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 6;
+pub const METRIC_DEFINITION_VERSION: u32 = 9;
 pub const STRIKES: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -29,6 +29,19 @@ impl Limits {
         value["strikes"] = json!(STRIKES);
         value
     }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Updates {
+    #[default]
+    Poll,
+    Events,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct WorkspaceSettings {
+    pub limits: Limits,
+    pub updates: Updates,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -191,6 +204,11 @@ pub struct Usage {
     pub components: Option<Value>,
     pub source: String,
 }
+impl Usage {
+    pub fn tokens(&self) -> Option<u64> {
+        self.total_tokens.or_else(|| self.components.as_ref().and_then(crate::telemetry::total))
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Launch {
@@ -212,7 +230,7 @@ pub struct Observed {
 pub fn versions() -> Value {
     json!({"schemaVersion":SCHEMA_VERSION,"dependencyReasons":crate::engine::DEPENDENCY_REASONS,"metricDefinitionVersion":METRIC_DEFINITION_VERSION,
         "classifications":classification_schema(),
-        "limits":Limits::default().value()})
+        "limits":Limits::default().value(),"workspace":WorkspaceSettings::default()})
 }
 pub fn clip(text: &str, words: usize) -> String {
     text.split_whitespace().take(words).collect::<Vec<_>>().join(" ")

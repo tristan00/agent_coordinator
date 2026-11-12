@@ -22,6 +22,10 @@ pub fn resource_usage(path: &std::path::Path) -> Option<Value> {
         .collect();
     Some(json!({"source":"events.jsonl:turn.completed","fields":fields}))
 }
+pub fn total(components: &Value) -> Option<u64> {
+    let value = |key: &str| components["fields"][key]["value"].as_u64();
+    value("input_tokens")?.checked_add(value("output_tokens")?)
+}
 pub fn usage_reset(log: &str) -> Option<Option<u64>> {
     let line = log.lines().rev().find(|line| line.contains("usage limit"))?;
     let text = line.split("try again at ").nth(1).map(|t| t.trim().trim_end_matches('.'));
