@@ -234,8 +234,17 @@ pub(crate) fn schema(stage: &str) -> Value {
     }
     object(properties)
 }
-const RULES: &str =
-    "Follow AGENTS.md in task.cwd. Keep summary under 40 words and at most 3 findings of 30 words. A denied command is not a reason to stop: use a different permitted method and continue. Never ask the user to act.";
+fn limit(request: &Value, key: &str) -> u64 {
+    request["limits"][key].as_u64().or_else(|| crate::history::Limits::default().value()[key].as_u64()).unwrap_or_default()
+}
+fn rules(request: &Value) -> String {
+    format!(
+        "Follow AGENTS.md in task.cwd. Keep summary under {} words and at most {} findings of {} words. A denied command is not a reason to stop: use a different permitted method and continue. Never ask the user to act.",
+        limit(request, "summaryWords"),
+        limit(request, "findings"),
+        limit(request, "findingWords")
+    )
+}
 pub fn external() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
     let result = PathBuf::from(std::env::var("COORDINATOR_RESULT")?);
@@ -243,20 +252,25 @@ pub fn external() -> Result<()> {
     let stage = request["stage"].as_str().unwrap_or("implementation");
     let schema_path = directory.join("schema.json");
     write(&schema_path, &schema(stage))?;
-    let prompt = format!("{}\n{RULES}\nWhen finished, write one JSON object matching the schema at {} to {}.\n{request}", action(&request, stage), schema_path.display(), result.display());
+    let prompt = format!("{}\n{}\nWhen finished, write one JSON object matching the schema at {} to {}.\n{request}", action(&request, stage), rules(&request), schema_path.display(), result.display());
     std::fs::write(directory.join("prompt.md"), prompt)?;
     while read::<Value>(&result).is_err() {
         thread::sleep(Duration::from_secs(1));
     }
     Ok(())
 }
-fn action(request: &Value, stage: &str) -> &'static str {
+fn action(request: &Value, stage: &str) -> String {
+    if stage == "replan" {
+        return format!(
+            "This task is blocked or failed review repeatedly. Inspect task.cwd read-only and recentAttempts, then return a plan that can succeed with the listed capabilities. Prefer splitting into small isolated children: one concern and one lane each, at most {} runnable criteria, title under {} words, under {} words. Order siblings with after indices. Dependencies require target/reason records: uses_artifact, uses_api, uses_schema or uses_data; use after, or nothing otherwise. Child dependency targets may be sibling indices or existing task IDs. Preserve existing dependencies on rewrites. With no children, the plan replaces the task definition. Never put task ids, hashes or coordination instructions in text. Return held only when a decision only the user can make is required; name it in one finding.",
+            limit(request, "criteria"),
+            limit(request, "titleWords"),
+            limit(request, "words")
+        );
+    }
     match stage {
         "review" => {
             "Independently verify the implementation in task.cwd against each acceptance criterion, read-only. Run the checks yourself; do not trust the implementation summary. Return criteria with one outcome per criterion in order. accepted only if every criterion passed. rejected if any failed; each finding states the failing behavior for the whole class of inputs. blocked only if a required check cannot run in the available environment."
-        }
-        "replan" => {
-            "This task is blocked or failed review repeatedly. Inspect task.cwd read-only and recentAttempts, then return a plan that can succeed with the listed capabilities. Prefer splitting into small isolated children: one concern and one lane each, at most 3 runnable criteria, title under 12 words, under 120 words. Order siblings with after indices. Dependencies require target/reason records: uses_artifact, uses_api, uses_schema or uses_data; use after, or nothing otherwise. Child dependency targets may be sibling indices or existing task IDs. Preserve existing dependencies on rewrites. With no children, the plan replaces the task definition. Never put task ids, hashes or coordination instructions in text. Return held only when a decision only the user can make is required; name it in one finding."
         }
         _ if request["readOnly"] == true => {
             "Perform the read-only audit of task.cwd against the acceptance criteria. Write the report to the absolute path in task.artifact. Return criteria with one outcome per criterion in order; completed only if every criterion passed."
@@ -265,6 +279,7 @@ fn action(request: &Value, stage: &str) -> &'static str {
             "Implement the task outcome in task.cwd and run checks proving each acceptance criterion. If feedback lists failed criteria, fix the cause for the whole class of inputs, not only the cited example. Use scratch for disposable files. If task.artifact is set, write that exact absolute path. Return criteria with one outcome per criterion in order; completed only if every criterion passed. Otherwise return blocked with a blocker kind and one finding."
         }
     }
+    .into()
 }
 pub fn codex() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
@@ -273,7 +288,7 @@ pub fn codex() -> Result<()> {
     let stage = request["stage"].as_str().unwrap_or("implementation");
     let schema_path = directory.join("schema.json");
     write(&schema_path, &schema(stage))?;
-    let prompt = format!("{}\n{RULES}\n{request}", action(&request, stage));
+    let prompt = format!("{}\n{}\n{request}", action(&request, stage), rules(&request));
     let program = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut cli = command(&program);
     let profile = std::env::var_os("USERPROFILE").map(PathBuf::from).filter(|path| path.is_absolute());

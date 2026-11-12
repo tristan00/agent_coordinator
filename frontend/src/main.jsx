@@ -16,6 +16,8 @@ const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 const PAGES = ['Board', 'List', 'Graph', 'Analytics', 'Settings'];
 const words = text => (text || '').trim().split(/\s+/).filter(Boolean).length;
 const workspaceOf = t => t.workspace ?? t.cwd;
+const pathKey = p => (p || '').replace(/^\\\\\?\\/, '').replace(/[\\/]+$/, '').toLowerCase();
+const limitsFor = (state, path) => ({...state.versions.limits, ...(Object.entries(state.config.limits || {}).find(([k]) => pathKey(k) === pathKey(path))?.[1] || {})});
 const dependencyReasons = state => state.versions.dependencyReasons || ['uses_artifact', 'uses_api', 'uses_schema', 'uses_data'];
 const dependencyTarget = d => typeof d === 'string' ? d : d.target;
 const dependencyError = (links, reasons) => links.some(d => !dependencyTarget(d)) ? 'Choose a task for every dependency or remove the dependency.' : links.some(d => !reasons.includes(d.reason)) ? 'Choose an allowed reason for every dependency or remove the dependency.' : '';
@@ -187,7 +189,7 @@ function Detail({task: t, byId, state, close, select, act, edit}) {
         <dt>Grouping</dt><dd>{t.parent ? 'Child of parent container' : t.standalone ? 'Standalone' : 'Unresolved — choose Parent container or Standalone in Edit'}</dd><dt>Lane</dt><dd>{t.attributes.lane}</dd><dt>Languages</dt><dd>{categoryText(t.attributes, 'languages')}</dd><dt>Functional responsibilities</dt><dd>{categoryText(t.attributes, 'functions')}</dd><dt>Execution capabilities</dt><dd>{t.attributes.needs.join(', ') || 'none'}</dd>
         <dt>Priority</dt><dd>{t.attributes.priority ?? 2}</dd><dt>Size</dt><dd>{t.attributes.size}</dd>
         <dt>Artifact</dt><dd>{t.attributes.artifact}{t.attributes.deploy ? ' · deploys on acceptance' : ''}</dd>
-        <dt>Words</dt><dd>{t.definitionWords} / {state.versions.limits.words}</dd>
+        <dt>Words</dt><dd>{t.definitionWords} / {limitsFor(state, workspaceOf(t)).words}</dd>
         {relations.map(([label, ids]) => <React.Fragment key={label}><dt>{label}</dt><dd className="links">{ids.map(link)}</dd></React.Fragment>)}
         <dt>Workspace</dt><dd className="path">{workspaceOf(t)}</dd>
       </dl>
@@ -206,9 +208,8 @@ function Detail({task: t, byId, state, close, select, act, edit}) {
 }
 
 function Editor({task, tasks, state, workspace, close}) {
-  const limits = state.versions.limits;
   const [form, setForm] = useState(() => ({
-    title: task?.title || '', outcome: task?.outcome || '', acceptance: Array.from({length: limits.criteria}, (_, i) => task?.acceptance[i] || ''),
+    title: task?.title || '', outcome: task?.outcome || '', acceptance: Array.from({length: Math.max(limitsFor(state, task ? workspaceOf(task) : workspace).criteria, task?.acceptance.length || 0)}, (_, i) => task?.acceptance[i] || ''),
     cwd: task?.cwd || workspace || '', lane: task?.attributes.lane || 'code', needs: task?.attributes.needs || [], priority: String(task?.attributes.priority ?? 2),
     languages: task?.attributes.languages || [], functions: task?.attributes.functions || [],
     size: task?.attributes.size || 'small', artifact: task?.attributes.artifact || 'none', deploy: !!task?.attributes.deploy,
@@ -221,6 +222,8 @@ function Editor({task, tasks, state, workspace, close}) {
   const [busy, setBusy] = useState(false);
   const set = (key, value) => setForm(f => ({...f, [key]: value}));
   const total = words(form.title) + words(form.outcome) + form.acceptance.reduce((n, c) => n + words(c), 0);
+  const limits = limitsFor(state, form.cwd);
+  const rows = Array.from({length: Math.max(limits.criteria, form.acceptance.length)}, (_, i) => form.acceptance[i] || '');
   const others = tasks.filter(t => t.id !== task?.id && (!workspace || workspaceOf(t) === workspace));
   const pick = key => (
     <label>{{dependencies: 'Blocked by (needs result)', after: 'Runs after (ordering only)', conflicts: 'Never runs alongside', related: 'Related'}[key]}
@@ -248,7 +251,7 @@ function Editor({task, tasks, state, workspace, close}) {
         <p className={total > limits.words ? 'error' : 'muted'}>{total} / {limits.words} words · at most {limits.criteria} criteria · leave criteria empty to make a container for child tasks</p>
         <label>Title<input required value={form.title} onChange={e => set('title', e.target.value)} /></label>
         <label>Outcome<textarea aria-label="Outcome" required rows="3" value={form.outcome} onChange={e => set('outcome', e.target.value)} /></label>
-        {form.acceptance.map((c, i) => <label key={i}>Criterion {i + 1}<input value={c} onChange={e => set('acceptance', form.acceptance.map((x, j) => (j === i ? e.target.value : x)))} /></label>)}
+        {rows.map((c, i) => <label key={i}>Criterion {i + 1}<input value={c} onChange={e => set('acceptance', rows.map((x, j) => (j === i ? e.target.value : x)))} /></label>)}
         <label>Working directory<input required value={form.cwd} onChange={e => set('cwd', e.target.value)} /></label>
         <div className="row">
           <label>Lane<select value={form.lane} onChange={e => set('lane', e.target.value)}>{LANES.map(v => <option key={v}>{v}</option>)}</select></label>
@@ -294,7 +297,7 @@ function Dependencies({value, change, options, reasons, invalid}) {
 }
 
 function GroupEditor({tasks, state, workspace, close}) {
-  const newChild = () => ({localKey: crypto.randomUUID(), title: '', outcome: '', acceptance: Array.from({length: state.versions.limits.criteria}, () => ''), dependencies: [], after: [], attributes: {lane: 'code', needs: [], languages: [], functions: []}});
+  const newChild = () => ({localKey: crypto.randomUUID(), title: '', outcome: '', acceptance: Array.from({length: limitsFor(state, workspace).criteria}, () => ''), dependencies: [], after: [], attributes: {lane: 'code', needs: [], languages: [], functions: []}});
   const [container, setContainer] = useState({title: '', outcome: '', cwd: workspace || '', acceptance: [], attributes: {languages: [], functions: []}});
   const [children, setChildren] = useState(() => [newChild()]);
   const [grouping, setGrouping] = useState('');

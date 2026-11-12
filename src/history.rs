@@ -4,13 +4,32 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 pub const SCHEMA_VERSION: u32 = 5;
 pub const METRIC_DEFINITION_VERSION: u32 = 8;
-pub const MAX_WORDS: usize = 120;
-pub const MAX_TITLE_WORDS: usize = 12;
-pub const MAX_CRITERIA: usize = 3;
-pub const SUMMARY_WORDS: usize = 40;
-pub const MAX_FINDINGS: usize = 3;
-pub const FINDING_WORDS: usize = 30;
 pub const STRIKES: usize = 2;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct Limits {
+    pub words: usize,
+    pub title_words: usize,
+    pub criteria: usize,
+    pub summary_words: usize,
+    pub findings: usize,
+    pub finding_words: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self { words: 120, title_words: 12, criteria: 3, summary_words: 40, findings: 3, finding_words: 30 }
+    }
+}
+impl Limits {
+    pub fn validate(&self) -> Result<()> {
+        crate::require([self.words, self.title_words, self.criteria, self.summary_words, self.findings, self.finding_words].iter().all(|v| *v > 0), "Limits must be positive integers")
+    }
+    pub fn value(&self) -> Value {
+        let mut value = json!(self);
+        value["strikes"] = json!(STRIKES);
+        value
+    }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lane {
@@ -193,7 +212,7 @@ pub struct Observed {
 pub fn versions() -> Value {
     json!({"schemaVersion":SCHEMA_VERSION,"dependencyReasons":crate::engine::DEPENDENCY_REASONS,"metricDefinitionVersion":METRIC_DEFINITION_VERSION,
         "classifications":classification_schema(),
-        "limits":{"words":MAX_WORDS,"titleWords":MAX_TITLE_WORDS,"criteria":MAX_CRITERIA,"summaryWords":SUMMARY_WORDS,"findings":MAX_FINDINGS,"findingWords":FINDING_WORDS,"strikes":STRIKES}})
+        "limits":Limits::default().value()})
 }
 pub fn clip(text: &str, words: usize) -> String {
     text.split_whitespace().take(words).collect::<Vec<_>>().join(" ")

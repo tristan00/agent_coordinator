@@ -364,6 +364,8 @@ pub struct Config {
     pub capabilities: Vec<Need>,
     #[serde(default)]
     pub notify: Vec<String>,
+    #[serde(default)]
+    pub limits: BTreeMap<PathBuf, history::Limits>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
@@ -400,12 +402,17 @@ impl State {
         }
         chain
     }
+    pub fn limits(&self, task: &Task) -> history::Limits {
+        let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
+        key.and_then(|key| self.config.limits.get(&key)).copied().unwrap_or_default()
+    }
     pub fn check_definition(&self, task: &Task) -> Result<()> {
+        let limits = self.limits(task);
         require(!(task.title.is_empty() || task.outcome.is_empty() || task.cwd.trim().is_empty()), "Title, outcome and cwd are required")?;
-        require(history::words(&task.title) <= history::MAX_TITLE_WORDS, "Title exceeds 12 words")?;
-        require(task.acceptance.len() <= history::MAX_CRITERIA, "At most 3 acceptance criteria; split the work into child tasks under a container")?;
+        require(history::words(&task.title) <= limits.title_words, format!("Title exceeds {} words", limits.title_words))?;
+        require(task.acceptance.len() <= limits.criteria, format!("At most {} acceptance criteria; split the work into child tasks under a container", limits.criteria))?;
         require(!task.acceptance.iter().any(|c| c.is_empty()), "Acceptance criteria must not be blank")?;
-        require(task.definition_words() <= history::MAX_WORDS, "Definition exceeds 120 words; split the work into child tasks under a container")?;
+        require(task.definition_words() <= limits.words, format!("Definition exceeds {} words; split the work into child tasks under a container", limits.words))?;
         require(![&task.title, &task.outcome].into_iter().chain(&task.acceptance).any(|t| history::coordination_prose(t)), "Task ids, digests and AGENTS.md belong in relations and worker protocol, not task prose")?;
         require(!(task.attributes.size == Size::Large && !task.container()), "Large work must be a container with child tasks")?;
         require(!(task.container() && task.attributes.artifact != Artifact::None), "Containers produce no artifact; children do")?;
@@ -707,7 +714,7 @@ impl Engine {
             serde_json::from_value(raw).map_err(|e| format!("{e}; use after, or nothing"))?
         } else {
             let command = vec![std::env::current_exe()?.to_string_lossy().into(), "--external".into()];
-            let config = Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new() };
+            let config = Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), limits: BTreeMap::new() };
             State { batches: Default::default(), schema_version: Some(history::SCHEMA_VERSION), paused: false, controls: Vec::new(), hold_until: 0, tasks: Vec::new(), archived: Vec::new(), config }
         };
         require(!(state.schema_version > Some(history::SCHEMA_VERSION)), "State schema is newer than this coordinator")?;
@@ -826,6 +833,7 @@ impl Engine {
         let actor = Actor::api(&input)?;
         let index = self.task(id)?;
         self.change(|state| {
+            let limits = state.limits(&state.tasks[index]);
             let task = &mut state.tasks[index];
             require(task.active.is_none() && task.stage != "done" && !task.container(), "Only idle, unfinished, non-container tasks can be replanned")?;
             let from = task.stage.clone();
@@ -833,7 +841,7 @@ impl Engine {
             task.blocked = false;
             task.retry_at = 0;
             if let Some(reason) = input["reason"].as_str().filter(|r| !r.trim().is_empty()) {
-                task.feedback = vec![history::clip(reason, history::FINDING_WORDS)];
+                task.feedback = vec![history::clip(reason, limits.finding_words)];
             }
             task.record("replan_requested", actor, "api", json!({"reason":input["reason"]}));
             task.record_phase(&from, actor, "api");
@@ -865,6 +873,13 @@ impl Engine {
             config.replan = config.implementation.clone();
         }
         require(![&config.implementation, &config.review, &config.replan].iter().any(|args| args.is_empty() || args.iter().any(|s| s.trim().is_empty())), "Worker commands must be nonempty string arrays")?;
+        config.limits = std::mem::take(&mut config.limits)
+            .into_iter()
+            .map(|(path, limits)| {
+                limits.validate()?;
+                Ok((workspace(&path).map_err(|e| format!("Limits workspace {}: {e}", path.display()))?, limits))
+            })
+            .collect::<Result<_>>()?;
         self.change(|state| {
             state.config = config;
             Ok(Value::Null)
@@ -946,7 +961,7 @@ impl Engine {
             "cwd":task.workdir(),"model":task.model,"effort":task.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
             "languages":task.attributes.languages,"functions":task.attributes.functions,
             "writable":task.writable,"dependencies":task.dependencies,"after":task.after},
-            "feedback":task.feedback,"dependencies":dependencies,"limits":history::versions()["limits"],"scratch":directory.join("scratch"),
+            "feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
             "readOnly":stage != "implementation" || task.read_only()});
         if stage == "review" {
             let implementation = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.stage == "implementation" && a.status() == Some("completed"));
@@ -1027,12 +1042,13 @@ impl Engine {
         }
         require(worker_statuses(&attempt.stage).contains(&status.as_str()), "Invalid worker status")?;
         require(result["summary"].as_str().is_some_and(|s| !s.trim().is_empty()), "Worker summary is required")?;
+        let limits = self.state.limits(task);
         let list = |value: &Value, items: usize| -> Vec<String> {
-            value.as_array().into_iter().flatten().filter_map(Value::as_str).filter(|s| !s.trim().is_empty()).take(items).map(|s| history::clip(s, history::FINDING_WORDS)).collect()
+            value.as_array().into_iter().flatten().filter_map(Value::as_str).filter(|s| !s.trim().is_empty()).take(items).map(|s| history::clip(s, limits.finding_words)).collect()
         };
-        result["summary"] = json!(history::clip(result["summary"].as_str().unwrap(), history::SUMMARY_WORDS));
-        result["findings"] = json!(list(&result["findings"], history::MAX_FINDINGS));
-        result["checks"] = json!(list(&result["checks"], history::MAX_FINDINGS + 2));
+        result["summary"] = json!(history::clip(result["summary"].as_str().unwrap(), limits.summary_words));
+        result["findings"] = json!(list(&result["findings"], limits.findings));
+        result["checks"] = json!(list(&result["checks"], limits.findings + 2));
         if attempt.stage != "replan" {
             let criteria: Vec<String> = serde_json::from_value(result["criteria"].clone()).map_err(|_| "Worker must report criteria outcomes")?;
             require(criteria.len() == task.acceptance.len() && criteria.iter().all(|c| matches!(c.as_str(), "passed" | "failed" | "blocked")), "Worker must report one outcome per acceptance criterion")?;
@@ -1042,8 +1058,8 @@ impl Engine {
             }
             require(!(status == "rejected" && !failed), "A rejection must mark at least one criterion failed")?;
             if status == "completed" && criteria.iter().any(|c| c != "passed") {
-                let unmet = criteria.iter().zip(&task.acceptance).filter(|(o, _)| *o != "passed").map(|(o, c)| history::clip(&format!("Unmet criterion ({o}): {c}"), history::FINDING_WORDS));
-                let findings: Vec<Value> = unmet.map(Value::from).chain(result["findings"].as_array().cloned().unwrap_or_default()).take(history::MAX_FINDINGS).collect();
+                let unmet = criteria.iter().zip(&task.acceptance).filter(|(o, _)| *o != "passed").map(|(o, c)| history::clip(&format!("Unmet criterion ({o}): {c}"), limits.finding_words));
+                let findings: Vec<Value> = unmet.map(Value::from).chain(result["findings"].as_array().cloned().unwrap_or_default()).take(limits.findings).collect();
                 result["status"] = json!("blocked");
                 result["findings"] = json!(findings);
             }
@@ -1173,9 +1189,10 @@ impl Engine {
                     match result["status"].as_str().unwrap() {
                         "replanned" => {
                             if let Err(error) = Self::apply_plan(&mut state, index, &result["plan"]) {
+                                let limits = state.limits(&state.tasks[index]);
                                 let task = &mut state.tasks[index];
                                 task.attempts.last_mut().unwrap().result.as_mut().unwrap()["planError"] = json!(error.to_string());
-                                task.feedback = vec![history::clip(&error.to_string(), history::FINDING_WORDS)];
+                                task.feedback = vec![history::clip(&error.to_string(), limits.finding_words)];
                             }
                         }
                         "held" => {

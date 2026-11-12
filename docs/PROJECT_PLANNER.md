@@ -2,7 +2,7 @@
 
 Turn requests into small tasks. Code runs everything else.
 
-POST /api/tasks with title, outcome, cwd, acceptance, attributes and relations. Enforced: title ≤12 words, ≤3 criteria, ≤120 words total, no task ids, hashes or AGENTS.md in prose. Unknown fields fail.
+POST /api/tasks with title, outcome, cwd, acceptance, attributes and relations. Per-workspace config.limits apply (default title ≤12 words, ≤3 criteria, ≤120 total); no task ids, hashes or AGENTS.md in prose. Unknown fields fail.
 
 Split work: one concern and lane per task. Large work is a container (no criteria, size large); children name it as parent and finish it.
 
