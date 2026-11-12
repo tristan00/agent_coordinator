@@ -28,7 +28,7 @@ function TaskNode({data}) {
   </>;
 }
 const nodeTypes = {task: TaskNode};
-const colors = {dependency: 'var(--accent)', after: 'var(--muted)', parent: 'var(--good)', conflict: 'var(--bad)', related: 'var(--muted)'};
+const colors = {dependency: 'var(--accent)', after: 'var(--muted)', parent: 'var(--parent)', conflict: 'var(--bad)', related: 'var(--muted)'};
 const dashes = {after: '8 5', conflict: '8 3 2 3', related: '2 5'};
 const names = {dependency: 'Dependency', after: 'Ordering', parent: 'Parent → child', conflict: 'Conflict', related: 'Related'};
 function RelationEdge(props) {
@@ -36,21 +36,41 @@ function RelationEdge(props) {
   const clearance = 22 + ['parent', 'dependency', 'after', 'conflict', 'related'].indexOf(data.kind) * 13;
   const hierarchy = data.kind === 'parent';
   const source = data.rectangles.find(r => r.id === props.source), destination = data.rectangles.find(r => r.id === props.target);
-  const start = {x: hierarchy ? x : Math.max(x, source.x + source.width) + clearance, y: hierarchy ? Math.max(y, source.y + source.height) + clearance : y};
-  const end = {x: hierarchy ? tx : Math.min(tx, destination.x) - clearance, y: hierarchy ? Math.min(ty, destination.y) - clearance : ty};
-  const offset = {parent: 0, dependency: -28, after: 28, conflict: -56, related: 56}[data.kind];
-  const waypoint = p => {
-    let result = {x: p.x, y: p.y + offset};
-    let obstacle;
-    while ((obstacle = data.rectangles.find(r => result.x > r.x - clearance && result.x < r.x + r.width + clearance && result.y > r.y - clearance && result.y < r.y + r.height + clearance))) result.y = offset < 0 ? obstacle.y - clearance : obstacle.y + obstacle.height + clearance;
-    return result;
-  };
-  const middle = offset ? [start, waypoint(start), waypoint(end), end] : [start, end];
-  const exit = {x: hierarchy ? x : Math.max(x, source.x + source.width), y: hierarchy ? Math.max(y, source.y + source.height) : y};
-  const entry = {x: hierarchy ? tx : Math.min(tx, destination.x), y: hierarchy ? Math.min(ty, destination.y) : ty};
-  const routed = connection(exit, entry, data.rectangles, clearance, middle);
-  const points = routed.length ? [{x, y}, ...routed, {x: tx, y: ty}] : [];
-  const path = points.map((p, i) => `${i ? 'L' : 'M'} ${p.x},${p.y}`).join(' ');
+  let points, path, dot;
+  if (hierarchy) {
+    const {index, count} = data.port;
+    const exit = {x: source.x + source.width * (index + 1) / (count + 1), y: source.y + source.height}, entry = {x: destination.x + destination.width * (destination.parent ? 0.75 : 0.5), y: destination.y};
+    const bend = Math.max(40, (entry.y - exit.y) / 2);
+    const curve = t => {
+      const u = 1 - t;
+      return {x: (u ** 3 + 3 * u * u * t) * exit.x + (3 * u * t * t + t ** 3) * entry.x, y: u ** 3 * exit.y + 3 * u * u * t * (exit.y + bend) + 3 * u * t * t * (entry.y - bend) + t ** 3 * entry.y};
+    };
+    const samples = Array.from({length: 33}, (_, i) => curve(i / 32));
+    const others = data.rectangles.filter(r => r.id !== props.source && r.id !== props.target);
+    const direct = entry.y > exit.y + 20 && samples.every(p => others.every(r => p.x < r.x - 8 || p.x > r.x + r.width + 8 || p.y < r.y - 8 || p.y > r.y + r.height + 8));
+    dot = exit;
+    if (direct) {
+      points = samples;
+      path = `M ${exit.x},${exit.y} C ${exit.x},${exit.y + bend} ${entry.x},${entry.y - bend} ${entry.x},${entry.y}`;
+    } else {
+      const lane = 10 + 18 * index / Math.max(1, count - 1);
+      const routed = connection(exit, entry, data.rectangles, lane, [{x: exit.x, y: exit.y + lane}, {x: entry.x, y: entry.y - lane}]);
+      points = routed.length ? routed : [exit, entry];
+    }
+  } else {
+    const start = {x: Math.max(x, source.x + source.width) + clearance, y};
+    const end = {x: Math.min(tx, destination.x) - clearance, y: ty};
+    const offset = {dependency: -28, after: 28, conflict: -56, related: 56}[data.kind];
+    const waypoint = p => {
+      let result = {x: p.x, y: p.y + offset};
+      let obstacle;
+      while ((obstacle = data.rectangles.find(r => result.x > r.x - clearance && result.x < r.x + r.width + clearance && result.y > r.y - clearance && result.y < r.y + r.height + clearance))) result.y = offset < 0 ? obstacle.y - clearance : obstacle.y + obstacle.height + clearance;
+      return result;
+    };
+    const routed = connection({x: Math.max(x, source.x + source.width), y}, {x: Math.min(tx, destination.x), y: ty}, data.rectangles, clearance, [start, waypoint(start), waypoint(end), end]);
+    points = routed.length ? [{x, y}, ...routed, {x: tx, y: ty}] : [];
+  }
+  path ||= points.map((p, i) => `${i ? 'L' : 'M'} ${p.x},${p.y}`).join(' ');
   const segments = points.slice(1).map((b, i) => ({a: points[i], b})).sort((a, b) => Math.hypot(b.a.x - b.b.x, b.a.y - b.b.y) - Math.hypot(a.a.x - a.b.x, a.a.y - a.b.y));
   const width = props.label.length * 6, height = 14;
   const candidates = segments.flatMap(({a, b}) => [.5, .25, .75].map(fraction => ({x: a.x + (b.x - a.x) * fraction + (a.x === b.x ? width / 2 + 8 : 0), y: a.y + (b.y - a.y) * fraction - 8})));
@@ -59,6 +79,7 @@ function RelationEdge(props) {
   while (!fits(label)) label.y -= height + 8;
   data.labels.set(props.id, {x: label.x - width / 2, y: label.y - height, width, height});
   return <><BaseEdge id={props.id} path={path} style={props.style} markerEnd={props.markerEnd} />
+    {dot && <circle className="hierarchy-dot" cx={dot.x} cy={dot.y} r={5} />}
     <text className="react-flow__edge-text" x={label.x} y={label.y} textAnchor="middle" style={props.labelStyle}>{props.label}</text></>;
 
 }
@@ -195,10 +216,11 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     const hidden = members.filter(id => !ids.has(id)).length;
     return {
       id: task.id, type: 'task', measured: measurements[task.id], position: established[task.id],
-      className: `graph-task ${parent ? 'graph-parent' : ''} ${task.blocked ? 'bad' : task.active && !task.stopped && activityEnabled ? 'live' : task.stage === 'done' ? 'good' : ''}`,
+      className: `graph-task ${parent ? 'graph-parent' : ''} ${task.parent ? 'graph-subtask' : ''} ${task.blocked ? 'bad' : task.active && !task.stopped && activityEnabled ? 'live' : task.stage === 'done' ? 'good' : ''}`,
       ariaLabel: `${parent ? 'Parent: ' : ''}${task.title}. ${task.status}. Press Enter or Space to inspect.`,
       data: {active: !!task.active && !task.blocked && !task.stopped && activityEnabled, label: <>
-        {parent && <span className="parent-label">Parent</span>}
+        {parent && <span className="parent-label">Parent · {members.length} {members.length === 1 ? 'subtask' : 'subtasks'}</span>}
+        {task.parent && <span className="subtask-label">Subtask</span>}
         <strong>{task.title}</strong><span>{task.status} · {task.attributes.lane}</span>
         {parent && <><span>{members.length} direct children · {hidden} hidden</span>
           <button className="nodrag nopan" aria-label={`${collapsed.has(task.id) ? 'Expand' : 'Collapse'} ${task.title}`} aria-expanded={!collapsed.has(task.id)} onClick={event => {
@@ -208,6 +230,12 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
         {task.parent && !ids.has(task.parent) && <span>Parent outside view: {byId.get(task.parent)?.title || task.parent}</span>}
       </>},
     };
+  });
+  const ports = new Map();
+  shown.forEach(task => {
+    const kids = (children.get(task.id) || []).filter(id => ids.has(id) && point(established[id]) && point(established[task.id]));
+    const center = id => established[id].x + (measurements[id]?.width || 220) / 2;
+    kids.sort((a, b) => center(a) - center(b) || established[a].y - established[b].y).forEach((id, index) => ports.set(id, {index, count: kids.length}));
   });
   const edges = [], relationships = [], seen = new Set(), labels = new Map();
   const endpoint = id => `${byId.get(id)?.title || 'Unavailable task'} [${id}]${ids.has(id) ? '' : ' (outside view)'}`;
@@ -222,7 +250,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     const description = `${endpoint(from)} ${undirected ? '↔' : '→'} ${endpoint(to)} · ${label}`;
     relationships.push({id, from, to, kind, label, description});
     if (!ids.has(from) || !ids.has(to)) return;
-    edges.push({id, source: from, target: to, label, ariaLabel: description, className: `graph-edge-${kind}`, data: {kind, labels, rectangles: nodes.map(n => ({id: n.id, ...n.position, width: measurements[n.id]?.width || 220, height: measurements[n.id]?.height || 160}))},
+    edges.push({id, source: from, target: to, label, ariaLabel: description, className: `graph-edge-${kind}`, data: {kind, labels, port: ports.get(to) || {index: 0, count: 1}, rectangles: nodes.map(n => ({id: n.id, parent: n.className.includes('graph-parent'), ...n.position, width: measurements[n.id]?.width || 220, height: measurements[n.id]?.height || 160}))},
       sourceHandle: kind === 'parent' ? 'hierarchy-out' : 'relations-out', targetHandle: kind === 'parent' ? 'hierarchy-in' : 'relations-in',
       type: 'relation',
       style: {stroke: colors[kind], strokeDasharray: dashes[kind], strokeWidth: kind === 'parent' ? 3 : kind === 'related' ? 1 : 1.5},

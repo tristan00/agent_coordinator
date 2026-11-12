@@ -1,10 +1,10 @@
 :root {
   --bg: #191b20; --panel: #23262d; --fg: #eceef3; --muted: #adb5c4; --line: #697383; --accent: #a6b6ff;
-  --good: #80d9a3; --warn: #f2cc70; --bad: #ff9b94; --live: #83c4ff; --on-accent: #191b20; color-scheme: dark;
+  --good: #80d9a3; --warn: #f2cc70; --bad: #ff9b94; --live: #83c4ff; --parent: #e59bf0; --on-accent: #191b20; color-scheme: dark;
 }
 :root[data-theme="light"] {
   --bg: #f6f7f9; --panel: #fff; --fg: #1d222b; --muted: #596170; --line: #828b99; --accent: #3f51b5;
-  --good: #256b41; --warn: #805100; --bad: #b3261e; --live: #155da8; --on-accent: #fff; color-scheme: light;
+  --good: #256b41; --warn: #805100; --bad: #b3261e; --live: #155da8; --parent: #8e2fa0; --on-accent: #fff; color-scheme: light;
 }
 * { box-sizing: border-box; }
 body { margin: 0; font: 14px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
@@ -57,7 +57,7 @@ main { padding: 16px 24px; min-width: 0; }
 .legend { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; }
 .legend i { display: inline-block; width: 22px; height: 0; border-top: 2px solid; margin-right: 4px; vertical-align: middle; }
 .legend i.dependency { border-color: var(--accent); } .legend i.after { border-top-style: dashed; border-color: var(--muted); }
-.legend i.parent { border-top-style: solid; border-color: var(--good); border-top-width: 3px; } .legend i.conflict { border-top-style: dashed; border-color: var(--bad); }
+.legend i.parent { border-top-style: solid; border-color: var(--parent); border-top-width: 3px; } .legend i.conflict { border-top-style: dashed; border-color: var(--bad); }
 dialog { border: 1px solid var(--line); border-radius: 10px; padding: 0; width: min(760px, 94vw); max-height: 90vh; background: var(--panel); color: var(--fg); }
 dialog > header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
 dialog > header h2 { margin: 0; font-size: 17px; }
@@ -101,11 +101,14 @@ dialog::backdrop { background: #0009; }
 .graph .react-flow__controls-button { width: 32px; height: 32px; }
 
 .graph .graph-task { padding: 12px; background: var(--bg); border: 1px solid var(--line); }
-.graph .graph-parent { border: 4px double var(--fg); border-radius: 24px 4px 24px 4px; }
+.graph .graph-parent { overflow: visible; border: 3px solid var(--parent); border-radius: 0 14px 14px 14px; background: color-mix(in srgb, var(--parent) 18%, var(--bg)); }
+.graph .graph-task.graph-subtask { border-left: 6px solid color-mix(in srgb, var(--parent) 60%, var(--line)); border-radius: 14px; }
 .graph-parent strong { font-size: 17px; font-weight: 800; }
-.graph-parent .parent-label { font-size: 10px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; color: var(--fg); }
+.graph-parent .parent-label { position: absolute; left: -3px; bottom: 100%; padding: 2px 12px 1px; border-radius: 8px 12px 0 0; background: var(--parent); color: var(--bg); font-size: 13px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
+.graph-subtask .subtask-label { color: color-mix(in srgb, var(--parent) 70%, var(--fg)); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; font-size: 11px; }
+.graph .hierarchy-dot { fill: var(--parent); stroke: var(--bg); stroke-width: 2; }
 .graph-parent button { margin-top: 8px; font-size: 11px; }
-.graph .hierarchy-port { visibility: visible; width: 8px; height: 8px; border: 2px solid var(--fg); background: var(--panel); border-radius: 0; }.legend { flex-wrap: wrap; }
+.legend { flex-wrap: wrap; }
 .legend i.conflict { border-top-style: dotted; }
 .legend i.related { border-top: 1px dotted var(--muted); }
 .graph-inspection, .graph-relationships { overflow-wrap: anywhere; }
