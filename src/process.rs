@@ -31,7 +31,7 @@ pub fn local_json(port: u16, route: &str, body: Option<&Value>) -> Result<Value>
         return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
     }
     let value: Value = serde_json::from_slice(&output.stdout)?;
-    if let Some(error) = value["error"].as_str() {
+    if let Some(error) = value["error"].as_str().filter(|error| !error.is_empty()) {
         return Err(error.to_owned().into());
     }
     Ok(value)
@@ -247,10 +247,10 @@ pub fn codex() -> Result<()> {
             "This task is blocked or failed review repeatedly. Inspect task.cwd read-only and recentAttempts, then return a plan that can succeed with the listed capabilities. Prefer splitting into small isolated children: one concern and one lane each, at most 3 runnable criteria, title under 12 words, under 120 words. Order siblings with after indices. Dependencies require target/reason records: uses_artifact, uses_api, uses_schema or uses_data; use after, or nothing otherwise. Child dependency targets may be sibling indices or existing task IDs. Preserve existing dependencies on rewrites. With no children, the plan replaces the task definition. Never put task ids, hashes or coordination instructions in text. Return held only when a decision only the user can make is required; name it in one finding."
         }
         _ if request["readOnly"] == true => {
-            "Perform the read-only audit of task.cwd against the acceptance criteria. Write the report to deliverables/report.md. Return criteria with one outcome per criterion in order; completed only if every criterion passed."
+            "Perform the read-only audit of task.cwd against the acceptance criteria. Write the report to the absolute path in task.artifact. Return criteria with one outcome per criterion in order; completed only if every criterion passed."
         }
         _ => {
-            "Implement the task outcome in task.cwd and run checks proving each acceptance criterion. If feedback lists failed criteria, fix the cause for the whole class of inputs, not only the cited example. Use scratch for disposable files. If task.artifact is set, write that file under deliverables beside scratch. Return criteria with one outcome per criterion in order; completed only if every criterion passed. Otherwise return blocked with a blocker kind and one finding."
+            "Implement the task outcome in task.cwd and run checks proving each acceptance criterion. If feedback lists failed criteria, fix the cause for the whole class of inputs, not only the cited example. Use scratch for disposable files. If task.artifact is set, write that exact absolute path. Return criteria with one outcome per criterion in order; completed only if every criterion passed. Otherwise return blocked with a blocker kind and one finding."
         }
     };
     let prompt = format!("{action}\n{RULES}\n{request}");

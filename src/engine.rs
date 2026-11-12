@@ -941,7 +941,7 @@ impl Engine {
             .collect();
         let directory = self.attempt_path(attempt_id);
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
-            "cwd":task.workdir(),"model":task.model,"effort":task.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact),
+            "cwd":task.workdir(),"model":task.model,"effort":task.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| directory.join(name)),
             "languages":task.attributes.languages,"functions":task.attributes.functions,
             "writable":task.writable,"dependencies":task.dependencies,"after":task.after},
             "feedback":task.feedback,"dependencies":dependencies,"limits":history::versions()["limits"],"scratch":directory.join("scratch"),
@@ -1016,8 +1016,13 @@ impl Engine {
             return Err(error.into());
         }
         require(exit["code"] == 0, format!("Worker exited {}; inspect attempt log", exit["code"]))?;
-        let mut result: Value = read(&self.attempt_path(&attempt.id).join("result.json"))?;
+        let directory = self.attempt_path(&attempt.id);
+        let mut result: Value = read(&directory.join("result.json"))?;
         let status = result["status"].as_str().unwrap_or_default().to_owned();
+        if attempt.stage == "implementation" && status == "completed" && let Some(name) = evidence::artifact_name(task.attributes.artifact) {
+            evidence::recover_artifact(&directory, name);
+            require(evidence::safe_file(&directory, name).is_some(), format!("Declared artifact missing; write it to {}", directory.join(name).display()))?;
+        }
         require(worker_statuses(&attempt.stage).contains(&status.as_str()), "Invalid worker status")?;
         require(result["summary"].as_str().is_some_and(|s| !s.trim().is_empty()), "Worker summary is required")?;
         let list = |value: &Value, items: usize| -> Vec<String> {

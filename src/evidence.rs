@@ -55,6 +55,13 @@ pub fn artifact_name(kind: Artifact) -> Option<&'static str> {
         Artifact::Report => Some("deliverables/report.md"),
     }
 }
+pub fn recover_artifact(directory: &Path, name: &str) {
+    let target = directory.join(name);
+    let stray = directory.join("scratch").join(name);
+    if !target.exists() && stray.is_file() && !crate::engine::linked_file(&stray) && target.parent().is_some_and(|p| fs::create_dir_all(p).is_ok()) {
+        let _ = fs::rename(&stray, &target).or_else(|_| fs::copy(&stray, &target).map(|_| ()));
+    }
+}
 pub fn artifact(directory: &Path, kind: Artifact) -> Option<Value> {
     let path = safe_file(directory, artifact_name(kind)?)?;
     let digest = digest(&path).ok()?;

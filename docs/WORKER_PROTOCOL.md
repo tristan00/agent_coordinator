@@ -6,6 +6,6 @@ Implementation returns completed, or blocked with a blocker kind. Review returns
 
 Summary ≤40 words, at most 3 findings of ≤30 words; longer text is cut.
 
-Review and replan are read-only. Put disposable files in scratch and the declared artifact at deliverables/candidate.exe or deliverables/report.md.
+Review and replan are read-only. Put disposable files in scratch and the declared artifact at the absolute path in task.artifact.
 
 A denied command is not a stop: use a different permitted method. Never ask the user to act. Fix failures for the whole class of inputs, not only the cited example. Keep runtime and test data outside the source directory.
