@@ -1,11 +1,12 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {ReactFlow, Background, Controls, MiniMap, MarkerType, Position, Handle, BaseEdge} from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import {connection, arrange} from './routing';
-import {createSimulation} from './layout';
+import {connection} from './routing';
+import {createSimulation, arrange, extend} from './layout';
 import {BorderBeam} from './Activity';
 
 const views = new Map();
+const legible = 0.6, margin = 24;
 const target = d => typeof d === 'string' ? d : d.target;
 const point = p => p && Number.isFinite(p.x) && Number.isFinite(p.y);
 function readView(key) {
@@ -78,63 +79,6 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   const [running, setRunning] = useState(false);
   const [enabled, setEnabled] = useState(false);
   const [reducedMotion, setReducedMotion] = useState(() => matchMedia('(prefers-reduced-motion: reduce)').matches);
-  const defaults = useMemo(() => arrange(tasks, measurements), [tasks, measurements]);
-  const established = {...positions};
-  for (const task of tasks) {
-    if (established[task.id]) continue;
-    let candidate = {...defaults[task.id]};
-    const height = measurements[task.id]?.height || 160 + Math.ceil(task.title.length / 22) * 20;
-    const collisions = () => Object.entries(established).filter(([id, p]) => Math.abs(p.x - candidate.x) < 300 && candidate.y < p.y + (measurements[id]?.height || 240) + 80 && candidate.y + height + 80 > p.y);
-    while (collisions().length) candidate.y = Math.max(...collisions().map(([id, p]) => p.y + (measurements[id]?.height || 240) + 110));
-    established[task.id] = candidate;
-  }
-  useEffect(() => {
-    if (tasks.some(t => !positions[t.id])) {setPositions(established); persist({positions: established});}
-  }, [tasks, positions]);
-  const persist = patch => {
-    view.current = {...view.current, ...patch}; views.set(key, view.current);
-    try { localStorage.setItem(key, JSON.stringify(view.current)); } catch {}
-  };
-  const stopLayout = () => {
-    simulation.current?.cancel();
-    simulation.current = null;
-    cancelAnimationFrame(frame.current);
-    frame.current = null;
-    setRunning(false);
-  };
-  const startLayout = () => {
-    stopLayout();
-    const current = createSimulation(tasks, established, measurements);
-    simulation.current = current;
-    setRunning(true);
-    const tick = () => {
-      if (simulation.current !== current) return;
-      const result = current.step();
-      setPositions(previous => ({...previous, ...result.positions}));
-      persist({positions: {...view.current.positions, ...result.positions}});
-      if (result.done) {frame.current = null; setRunning(false);}
-      else frame.current = requestAnimationFrame(tick);
-    };
-    tickLayout.current = tick;
-    frame.current = requestAnimationFrame(tick);
-  };
-  const wakeLayout = () => {
-    if (simulation.current && frame.current === null) {setRunning(true); frame.current = requestAnimationFrame(tickLayout.current);}
-  };
-  const releaseNode = id => {simulation.current?.unpin(id); wakeLayout();};
-  const layoutInputs = JSON.stringify(tasks.map(t => [t.id, t.parent, t.dependencies, t.after, t.conflicts, t.related]));
-  useEffect(() => {
-    if (enabled && !reducedMotion) startLayout();
-    else stopLayout();
-  }, [enabled, reducedMotion]);
-  useEffect(() => {simulation.current?.update(tasks, established, measurements); wakeLayout();}, [layoutInputs, measurements]);
-  useEffect(() => {
-    const preference = matchMedia('(prefers-reduced-motion: reduce)');
-    const changed = () => {setReducedMotion(preference.matches); if (preference.matches) {stopLayout(); setEnabled(false);}};
-    preference.addEventListener('change', changed);
-    return () => preference.removeEventListener('change', changed);
-  }, []);
-  useEffect(() => () => {simulation.current?.cancel(); cancelAnimationFrame(frame.current);}, []);
   const byId = new Map(allTasks.map(task => [task.id, task]));
   const children = new Map();
   allTasks.forEach(task => {
@@ -159,6 +103,92 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     }
     return true;
   });
+  const pane = useRef(null);
+  const framed = useRef(false);
+  const [ready, setReady] = useState(false);
+  const room = pane.current?.clientHeight ? {width: (pane.current.clientWidth - 2 * margin) / legible, height: (pane.current.clientHeight - 2 * margin) / legible, scale: legible} : undefined;
+  const shownKey = JSON.stringify(shown.map(t => [t.id, t.title, t.parent, t.container, t.dependencies, t.after, t.conflicts, t.related]));
+  const defaults = useMemo(() => arrange(shown, measurements, room), [shownKey, measurements, room?.width, room?.height]);
+  const measured = shown.every(t => measurements[t.id]);
+  const established = shown.some(t => point(positions[t.id])) ? extend(shown, positions, measurements) : {...positions, ...defaults};
+  const placed = tasks.filter(t => point(established[t.id]));
+  const missing = shown.some(t => !point(positions[t.id]));
+  useEffect(() => {
+    if (measured && missing) {setPositions(established); persist({positions: established});}
+  }, [measured, missing, shownKey, positions]);
+  const persist = patch => {
+    view.current = {...view.current, ...patch}; views.set(key, view.current);
+    try { localStorage.setItem(key, JSON.stringify(view.current)); } catch {}
+  };
+  const bounds = list => {
+    const boxes = list.map(t => ({...established[t.id], width: measurements[t.id]?.width || 220, height: measurements[t.id]?.height || 80}));
+    const x = Math.min(...boxes.map(b => b.x)), y = Math.min(...boxes.map(b => b.y));
+    return {x, y, width: Math.max(...boxes.map(b => b.x + b.width)) - x, height: Math.max(...boxes.map(b => b.y + b.height)) - y};
+  };
+  const frameGraph = () => {
+    const box = pane.current;
+    if (!flow.current || !box?.clientWidth || !shown.length) return;
+    const room = {width: box.clientWidth - 2 * margin, height: box.clientHeight - 2 * margin};
+    const fit = area => Math.min(1, room.width / area.width, room.height / area.height);
+    const all = bounds(shown), live = shown.filter(t => t.active && !t.stopped);
+    const focus = fit(all) >= legible || !live.length ? all : bounds(live);
+    const zoom = Math.max(fit(all), legible);
+    const centered = fit(focus) >= zoom;
+    const x = centered ? box.clientWidth / 2 - (focus.x + focus.width / 2) * zoom : margin - focus.x * zoom;
+    const y = centered ? box.clientHeight / 2 - (focus.y + focus.height / 2) * zoom : margin - focus.y * zoom;
+    flow.current.setViewport({x, y, zoom}, {duration: 0});
+  };
+  useEffect(() => {
+    if (framed.current || !ready || !measured || missing) return;
+    framed.current = true;
+    const saved = view.current.viewport, box = pane.current;
+    const seen = saved && box && shown.some(t => {
+      const p = established[t.id], width = (measurements[t.id]?.width || 220) * saved.zoom, height = (measurements[t.id]?.height || 80) * saved.zoom;
+      const x = p.x * saved.zoom + saved.x, y = p.y * saved.zoom + saved.y;
+      return x + width > 0 && y + height > 0 && x < box.clientWidth && y < box.clientHeight;
+    });
+    if (!seen) frameGraph();
+  });
+  const stopLayout = () => {
+    simulation.current?.cancel();
+    simulation.current = null;
+    cancelAnimationFrame(frame.current);
+    frame.current = null;
+    setRunning(false);
+  };
+  const startLayout = () => {
+    stopLayout();
+    const current = createSimulation(placed, established, measurements);
+    simulation.current = current;
+    setRunning(true);
+    const tick = () => {
+      if (simulation.current !== current) return;
+      const result = current.step();
+      setPositions(previous => ({...previous, ...result.positions}));
+      persist({positions: {...view.current.positions, ...result.positions}});
+      if (result.done) {frame.current = null; setRunning(false);}
+      else frame.current = requestAnimationFrame(tick);
+    };
+    tickLayout.current = tick;
+    frame.current = requestAnimationFrame(tick);
+  };
+  const wakeLayout = () => {
+    if (simulation.current && frame.current === null) {setRunning(true); frame.current = requestAnimationFrame(tickLayout.current);}
+  };
+  const releaseNode = id => {simulation.current?.unpin(id); wakeLayout();};
+  const layoutInputs = JSON.stringify(tasks.map(t => [t.id, t.parent, t.dependencies, t.after, t.conflicts, t.related]));
+  useEffect(() => {
+    if (enabled && !reducedMotion) startLayout();
+    else stopLayout();
+  }, [enabled, reducedMotion]);
+  useEffect(() => {simulation.current?.update(placed, established, measurements); wakeLayout();}, [layoutInputs, measurements, placed.length]);
+  useEffect(() => {
+    const preference = matchMedia('(prefers-reduced-motion: reduce)');
+    const changed = () => {setReducedMotion(preference.matches); if (preference.matches) {stopLayout(); setEnabled(false);}};
+    preference.addEventListener('change', changed);
+    return () => preference.removeEventListener('change', changed);
+  }, []);
+  useEffect(() => () => {simulation.current?.cancel(); cancelAnimationFrame(frame.current);}, []);
   const ids = new Set(shown.map(task => task.id));
   const nodes = shown.map(task => {
     const members = children.get(task.id) || [], parent = task.container || members.length > 0;
@@ -212,14 +242,15 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
       <input type="search" aria-label="Filter graph by title" placeholder="Filter graph by title" value={query} onChange={event => setQuery(event.target.value)} />
       <label className="check"><input type="checkbox" checked={showDone} onChange={event => setShowDone(event.target.checked)} /> Show finished tasks</label>
       <button onClick={() => flow.current?.fitView({duration: 0})}>Fit graph</button>
-      <button onClick={() => flow.current?.setViewport({x: 0, y: 0, zoom: 1}, {duration: 0})}>Reset view</button>
+      <button onClick={frameGraph}>Reset view</button>
+      <button onClick={() => {stopLayout(); setEnabled(false); framed.current = false; persist({positions: {}, viewport: undefined}); setPositions({});}}>Arrange</button>
       <label className="check"><input type="checkbox" role="switch" aria-label="Graph physics" aria-describedby="physics-status" checked={enabled} disabled={reducedMotion} onChange={event => {if (!event.target.checked) stopLayout(); setEnabled(event.target.checked);}} /> Physics</label>
       <span className="muted" id="physics-status" role="status">{reducedMotion ? 'Physics paused for reduced motion. Manual dragging is available.' : enabled ? running ? 'Arranging tasks…' : 'Layout settled' : 'Physics off · positions frozen'}</span>
       <span className="legend" aria-label="Relationship legend">{Object.entries(names).map(([kind, name]) => <span key={kind}><i className={kind} />{name}{['dependency', 'after'].includes(kind) ? ' →' : ''}</span>)}</span>
     </div>
     <p className="muted" id="graph-help">Drag tasks to arrange. Drag the background to pan. Scroll or pinch to zoom. Tab to a task and press Enter or Space to inspect; arrow keys move it. Hidden counts refer to immediate children. Focus or select an edge to inspect its full relationship. Supersession remains in task history.</p>
     {!shown.length && <p className="empty">No matching tasks in this scope.</p>}
-    <div className="graph" onKeyUpCapture={event => {if (event.key.startsWith('Arrow')) releaseNode(event.target.closest('.react-flow__node')?.dataset.id);}} onFocusCapture={event => {const edge = event.target.closest(".react-flow__edge"); if (edge) setInspected(edge.dataset.id);}} onKeyDownCapture={event => {
+    <div className="graph" ref={pane} onKeyUpCapture={event => {if (event.key.startsWith('Arrow')) releaseNode(event.target.closest('.react-flow__node')?.dataset.id);}} onFocusCapture={event => {const edge = event.target.closest(".react-flow__edge"); if (edge) setInspected(edge.dataset.id);}} onKeyDownCapture={event => {
       if (event.target.closest('button, input')) return;
       const node = event.target.closest('.react-flow__node');
       const direction = {ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1]}[event.key];
@@ -236,8 +267,8 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
         event.preventDefault(); event.stopPropagation(); select(node.dataset.id);
       }
     }}>
-      <ReactFlow onInit={instance => {flow.current = instance;}} minZoom={0.01} edgeTypes={edgeTypes} edgesFocusable onEdgeClick={(_, edge) => setInspected(edge.id)} onSelectionChange={({edges}) => {if (edges.length) setInspected(edges[0].id);}} nodeTypes={nodeTypes} nodes={nodes} edges={edges} aria-label="Task dependency graph" aria-describedby="graph-help"
-        defaultViewport={view.current.viewport} fitView={!view.current.viewport} nodesConnectable={false} edgesReconnectable={false}
+      <ReactFlow onInit={instance => {flow.current = instance; setReady(true);}} minZoom={0.01} edgeTypes={edgeTypes} edgesFocusable onEdgeClick={(_, edge) => setInspected(edge.id)} onSelectionChange={({edges}) => {if (edges.length) setInspected(edges[0].id);}} nodeTypes={nodeTypes} nodes={nodes} edges={edges} aria-label="Task dependency graph" aria-describedby="graph-help"
+        defaultViewport={view.current.viewport} nodesConnectable={false} edgesReconnectable={false}
         deleteKeyCode={null} nodeDragThreshold={5} nodeClickDistance={5} panOnDrag zoomOnScroll zoomOnPinch
         onNodeClick={(_, node) => select(node.id)}
         onNodeDragStart={(_, node) => simulation.current?.pin(node.id, node.position)}
