@@ -54,6 +54,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   const frame = useRef(null);
   const tickLayout = useRef(null);
   const [running, setRunning] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const [enabled, setEnabled] = useState(false);
   const [reducedMotion, setReducedMotion] = useState(() => matchMedia('(prefers-reduced-motion: reduce)').matches);
   const byId = new Map(allTasks.map(task => [task.id, task]));
@@ -133,6 +134,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     simulation.current = null;
     cancelAnimationFrame(frame.current);
     frame.current = null;
+    persist({});
     setRunning(false);
   };
   const startLayout = () => {
@@ -144,8 +146,8 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
       if (simulation.current !== current) return;
       const result = current.step();
       setPositions(previous => ({...previous, ...result.positions}));
-      persist({positions: {...view.current.positions, ...result.positions}});
-      if (result.done) {frame.current = null; setRunning(false);}
+      view.current = {...view.current, positions: {...view.current.positions, ...result.positions}};
+      if (result.done) {frame.current = null; setRunning(false); persist({});}
       else frame.current = requestAnimationFrame(tick);
     };
     tickLayout.current = tick;
@@ -189,6 +191,11 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
       </>},
     };
   });
+  const rectangles = nodes.map(n => ({id: n.id, parent: n.className.includes('graph-parent'), ...n.position, width: measurements[n.id]?.width || 220, height: measurements[n.id]?.height || 80}));
+  const endpoint = id => `${byId.get(id)?.title || 'Unavailable task'} [${id}]${ids.has(id) ? '' : ' (outside view)'}`;
+  const moving = running || dragging;
+  const geometryKey = JSON.stringify([rectangles, allTasks.map(t => [t.id, t.title, t.parent, t.dependencies, t.after, t.conflicts, t.related])]);
+  const {edges, relationships} = useMemo(() => {
   const ports = new Map();
   shown.forEach(task => {
     const kids = (children.get(task.id) || []).filter(id => ids.has(id) && point(established[id]) && point(established[task.id]));
@@ -196,9 +203,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     kids.sort((a, b) => center(a) - center(b) || established[a].y - established[b].y).forEach((id, index) => ports.set(id, {index, count: kids.length}));
   });
   const edges = [], relationships = [], seen = new Set();
-  const rectangles = nodes.map(n => ({id: n.id, parent: n.className.includes('graph-parent'), ...n.position, width: measurements[n.id]?.width || 220, height: measurements[n.id]?.height || 80}));
   const rectangle = new Map(rectangles.map(r => [r.id, r]));
-  const endpoint = id => `${byId.get(id)?.title || 'Unavailable task'} [${id}]${ids.has(id) ? '' : ' (outside view)'}`;
   function edge(from, to, kind, reason) {
     if (!ids.has(from) && !ids.has(to)) return;
     const undirected = ['conflict', 'related'].includes(kind);
@@ -229,9 +234,11 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   });
   const routes = relationLayout(edges.filter(e => e.data.kind !== 'parent').map(e => ({id: e.id, kind: e.data.kind, source: e.data.source, destination: e.data.destination})), rectangles);
   edges.forEach(e => {if (routes.has(e.id)) e.data = {kind: e.data.kind, ...routes.get(e.id)};});
-  const reasons = placeLabels(edges.map(e => ({id: e.id, text: e.label || '', points: e.data.points})), rectangles, slots.current);
+  const reasons = moving ? new Map() : placeLabels(edges.map(e => ({id: e.id, text: e.label || '', points: e.data.points})), rectangles, slots.current);
   edges.forEach(e => {e.data.text = reasons.get(e.id); e.data.tooltip = e.ariaLabel;});
-  drawn.current = [...edges.flatMap(e => e.data.points || []).map(p => ({x: p.x, y: p.y, width: 0, height: 0})), ...[...reasons.values()].map(({bounds: b}) => ({x: b.x0, y: b.y0, width: b.x1 - b.x0, height: b.y1 - b.y0}))];
+  if (!moving) drawn.current = [...edges.flatMap(e => e.data.points || []).map(p => ({x: p.x, y: p.y, width: 0, height: 0})), ...[...reasons.values()].map(({bounds: b}) => ({x: b.x0, y: b.y0, width: b.x1 - b.x0, height: b.y1 - b.y0}))];
+  return {edges, relationships};
+  }, [geometryKey, moving, showDone, query, collapsed]);
   const selectedRelation = relationships.find(edge => edge.id === inspected);
   return <>
     <div className="filters">
@@ -267,8 +274,8 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
         defaultViewport={view.current.viewport} nodesConnectable={false} edgesReconnectable={false}
         deleteKeyCode={null} nodeDragThreshold={5} nodeClickDistance={5} panOnDrag zoomOnScroll zoomOnPinch
         onNodeClick={(_, node) => select(node.id)}
-        onNodeDragStart={(_, node) => simulation.current?.pin(node.id, node.position)}
-        onNodeDragStop={(_, node) => releaseNode(node.id)}
+        onNodeDragStart={(_, node) => {setDragging(true); simulation.current?.pin(node.id, node.position);}}
+        onNodeDragStop={(_, node) => {setDragging(false); persist({}); releaseNode(node.id);}}
         onNodesChange={changes => {
           const measured = changes.filter(change => change.type === 'dimensions' && change.dimensions);
           if (measured.length) setMeasurements(previous => ({...previous, ...Object.fromEntries(measured.map(change => [change.id, change.dimensions]))}));
@@ -277,7 +284,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
           moved.forEach(change => simulation.current?.pin(change.id, change.position));
           setPositions(previous => {
             const next = {...previous, ...Object.fromEntries(moved.map(change => [change.id, change.position]))};
-            persist({positions: next}); return next;
+            view.current = {...view.current, positions: next}; return next;
           });
         }} onMoveEnd={(_, viewport) => persist({viewport})}>
         <Background color="var(--line)" /><Controls showInteractive={false} />
