@@ -85,6 +85,8 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   const framed = useRef(false);
   const drawn = useRef([]);
   const slots = useRef(new Map());
+  const routeCache = useRef(new Map());
+  const labelCache = useRef(new Map());
   const [ready, setReady] = useState(false);
   const room = pane.current?.clientHeight ? {width: (pane.current.clientWidth - 2 * margin) / legible, height: (pane.current.clientHeight - 2 * margin) / legible, scale: legible} : undefined;
   const shownKey = JSON.stringify(shown.map(t => [t.id, t.title, t.parent, t.container, t.dependencies, t.after, t.conflicts, t.related]));
@@ -234,8 +236,25 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   });
   const routes = relationLayout(edges.filter(e => e.data.kind !== 'parent').map(e => ({id: e.id, kind: e.data.kind, source: e.data.source, destination: e.data.destination})), rectangles);
   edges.forEach(e => {if (routes.has(e.id)) e.data = {kind: e.data.kind, ...routes.get(e.id)};});
-  const reasons = moving ? new Map() : placeLabels(edges.map(e => ({id: e.id, text: e.label || '', points: e.data.points})), rectangles, slots.current);
-  edges.forEach(e => {e.data.text = reasons.get(e.id); e.data.tooltip = e.ariaLabel;});
+  const box = r => JSON.stringify([r.x, r.y, r.width, r.height]);
+  const blockedBy = (points, source, destination) => (points || []).slice(2, -2).filter(p => rectangles.some(r => r.id !== source && r.id !== destination && p.x > r.x - 4 && p.x < r.x + r.width + 4 && p.y > r.y - 4 && p.y < r.y + r.height + 4)).length;
+  const stable = new Set(), nextRoutes = new Map(), degree = new Map();
+  edges.forEach(e => [e.source, e.target].forEach(id => degree.set(id, (degree.get(id) || 0) + 1)));
+  edges.forEach(e => {
+    const sig = box(rectangle.get(e.source)) + box(rectangle.get(e.target)) + degree.get(e.source) + ':' + degree.get(e.target);
+    const cached = routeCache.current.get(e.id);
+    if (cached && cached.sig === sig && (moving || blockedBy(cached.data.points, e.source, e.target) <= cached.blocked)) {e.data = cached.data; stable.add(e.id);}
+    nextRoutes.set(e.id, stable.has(e.id) ? cached : {sig, data: e.data, blocked: blockedBy(e.data.points, e.source, e.target)});
+  });
+  routeCache.current = nextRoutes;
+  const hits = (b, r) => b.x0 < r.x + r.width + 2 && r.x - 2 < b.x1 && b.y0 < r.y + r.height + 2 && r.y - 2 < b.y1;
+  const kept = new Map([...labelCache.current].filter(([id, t]) => stable.has(id) && (edges.find(e => e.id === id)?.label || '').endsWith(t.label) && (moving || !rectangles.some(r => hits(t.bounds, r)))));
+  const memory = new Map([...slots.current].filter(([id]) => kept.has(id)));
+  const reserved = [...kept.values()].map(({bounds: b}) => ({x: b.x0, y: b.y0, width: b.x1 - b.x0, height: b.y1 - b.y0}));
+  const reasons = moving ? kept : new Map([...placeLabels(edges.map(e => ({id: e.id, text: kept.has(e.id) ? '' : e.label || '', points: e.data.points})), [...rectangles, ...reserved], slots.current), ...kept]);
+  if (!moving) memory.forEach((slot, id) => slots.current.set(id, slot));
+  if (!moving) labelCache.current = reasons;
+  edges.forEach(e => {e.data = {...e.data, text: reasons.get(e.id), tooltip: e.ariaLabel};});
   if (!moving) drawn.current = [...edges.flatMap(e => e.data.points || []).map(p => ({x: p.x, y: p.y, width: 0, height: 0})), ...[...reasons.values()].map(({bounds: b}) => ({x: b.x0, y: b.y0, width: b.x1 - b.x0, height: b.y1 - b.y0}))];
   return {edges, relationships};
   }, [geometryKey, moving, showDone, query, collapsed]);
@@ -253,7 +272,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     </div>
     <p className="muted" id="graph-help">Drag tasks to arrange. Drag the background to pan. Scroll or pinch to zoom. Tab to a task and press Enter or Space to inspect; arrow keys move it. Hidden counts refer to immediate children. Focus or select an edge to inspect its full relationship. Supersession remains in task history.</p>
     {!shown.length && <p className="empty">No matching tasks in this scope.</p>}
-    <div className="graph" ref={pane} onKeyUpCapture={event => {if (event.key.startsWith('Arrow')) releaseNode(event.target.closest('.react-flow__node')?.dataset.id);}} onFocusCapture={event => {const edge = event.target.closest(".react-flow__edge"); if (edge) setInspected(edge.dataset.id);}} onKeyDownCapture={event => {
+    <div className="graph" ref={pane} onKeyUpCapture={event => {if (event.key.startsWith('Arrow')) persist({}); if (event.key.startsWith('Arrow')) releaseNode(event.target.closest('.react-flow__node')?.dataset.id);}} onFocusCapture={event => {const edge = event.target.closest(".react-flow__edge"); if (edge) setInspected(edge.dataset.id);}} onKeyDownCapture={event => {
       if (event.target.closest('button, input')) return;
       const node = event.target.closest('.react-flow__node');
       const direction = {ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1]}[event.key];
@@ -263,7 +282,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
           const current = previous[node.dataset.id] || defaults[node.dataset.id], step = event.shiftKey ? 50 : 10;
           const next = {...previous, [node.dataset.id]: {x: current.x + direction[0] * step, y: current.y + direction[1] * step}};
           simulation.current?.pin(node.dataset.id, next[node.dataset.id]);
-          persist({positions: next}); return next;
+          view.current = {...view.current, positions: next}; return next;
         });
       }
       if (node && (event.key === 'Enter' || event.key === ' ')) {
