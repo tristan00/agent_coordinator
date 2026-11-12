@@ -2,7 +2,7 @@ use crate::{Result, now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 5;
 pub const METRIC_DEFINITION_VERSION: u32 = 8;
 pub const MAX_WORDS: usize = 120;
 pub const MAX_TITLE_WORDS: usize = 12;
@@ -46,22 +46,48 @@ pub enum Artifact {
     Candidate,
     Report,
 }
+pub const LANGUAGES: &[&str] = &["c", "cpp", "csharp", "css", "go", "html", "java", "javascript", "kotlin", "php", "powershell", "python", "ruby", "rust", "shell", "sql", "swift", "typescript"];
+pub const FUNCTIONS: &[&str] = &["api", "build", "deployment", "documentation", "observability", "security", "storage", "testing", "ui"];
+fn categories<'de, D: serde::Deserializer<'de>>(input: D, values: &[&str]) -> std::result::Result<std::collections::BTreeSet<String>, D::Error> {
+    let selected = std::collections::BTreeSet::<String>::deserialize(input)?;
+    if let Some(value) = selected.iter().find(|value| !values.contains(&value.as_str())) {
+        return Err(serde::de::Error::custom(format!("Unknown classification {value}; expected one of {}", values.join(", "))));
+    }
+    Ok(selected)
+}
+fn languages<'de, D: serde::Deserializer<'de>>(input: D) -> std::result::Result<std::collections::BTreeSet<String>, D::Error> {
+    categories(input, LANGUAGES)
+}
+fn functions<'de, D: serde::Deserializer<'de>>(input: D) -> std::result::Result<std::collections::BTreeSet<String>, D::Error> {
+    categories(input, FUNCTIONS)
+}
+pub fn classification_schema() -> Value {
+    json!({"version":1,"languages":{"type":"array","items":{"type":"string","enum":LANGUAGES},"default":[]},
+        "functions":{"type":"array","items":{"type":"string","enum":FUNCTIONS},"default":[]},
+        "semantics":"Independent unordered sets; duplicates collapse and values serialize lexically. Select every applicable language and function, including mixed-language work. Empty or omitted sets mean uncategorized, never inferred from lane, text, or capabilities. Values are case-sensitive. Attributes replacement resets omitted sets; edits omitting attributes preserve them. Classifications do not affect dispatch or reopen work.",
+        "extensibility":"Closed versioned registries: add values to the server registry and increment this version; clients discover supported values here. Unknown values are rejected. Worker requirements remain exclusively in needs."})
+}
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Attributes {
     pub lane: Lane,
     pub needs: Vec<Need>,
+    #[serde(deserialize_with = "languages")]
+    pub languages: std::collections::BTreeSet<String>,
+    #[serde(deserialize_with = "functions")]
+    pub functions: std::collections::BTreeSet<String>,
     pub priority: Option<u8>,
     pub size: Size,
     pub artifact: Artifact,
     pub deploy: bool,
 }
 impl Attributes {
-    pub const FIELDS: [&'static str; 6] = ["lane", "needs", "priority", "size", "artifact", "deploy"];
+    pub const FIELDS: [&'static str; 8] = ["lane", "needs", "languages", "functions", "priority", "size", "artifact", "deploy"];
     pub fn priority(&self) -> u8 {
         self.priority.unwrap_or(2)
     }
     pub fn validate(&self) -> Result<()> {
+        crate::require(self.languages.iter().all(|v| LANGUAGES.contains(&v.as_str())) && self.functions.iter().all(|v| FUNCTIONS.contains(&v.as_str())), "Unknown classification")?;
         crate::require(self.priority.is_none_or(|p| p <= 3), "Priority must be 0 (highest) to 3")?;
         crate::require(!(self.deploy && self.artifact != Artifact::Candidate), "deploy requires artifact candidate")
     }
@@ -165,7 +191,8 @@ pub struct Observed {
     pub source: String,
 }
 pub fn versions() -> Value {
-    json!({"schemaVersion":SCHEMA_VERSION,"metricDefinitionVersion":METRIC_DEFINITION_VERSION,
+    json!({"schemaVersion":SCHEMA_VERSION,"dependencyReasons":crate::engine::DEPENDENCY_REASONS,"metricDefinitionVersion":METRIC_DEFINITION_VERSION,
+        "classifications":classification_schema(),
         "limits":{"words":MAX_WORDS,"titleWords":MAX_TITLE_WORDS,"criteria":MAX_CRITERIA,"summaryWords":SUMMARY_WORDS,"findings":MAX_FINDINGS,"findingWords":FINDING_WORDS,"strikes":STRIKES}})
 }
 pub fn clip(text: &str, words: usize) -> String {

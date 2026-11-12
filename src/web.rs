@@ -78,6 +78,7 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
                 Ok(event)
             }
             ("POST", ["", "api", "tasks"]) => engine.create(input),
+            ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input),
             ("PATCH", ["", "api", "tasks", id]) => engine.edit(id, input),
             ("POST", ["", "api", "tasks", id, "replan"]) => engine.request_replan(id, input),
             ("DELETE", ["", "api", "tasks", id]) => engine.remove(id, Actor::api(&input)?).map(|()| json!({"ok":true})),

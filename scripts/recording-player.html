@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>MJPEG recording playback</title>
+<style>body{background:#17212d;color:#fff;font:18px system-ui;max-width:960px;margin:40px auto}canvas{width:100%;background:#000}button,input{margin:12px}output{font-variant-numeric:tabular-nums}</style>
+<h1>MJPEG recording playback</h1><input type="file" accept=".avi"><canvas></canvas>
+<button id="play">Play</button><input id="seek" type="range" min="0" value="0"><output></output>
+<p>Timing begins at the first CDP frame. Original timestamps and output frame mapping are in the timing JSON.</p>
+<script>
+const embedded = null;
+const canvas = document.querySelector('canvas'), ctx = canvas.getContext('2d'), seek = document.querySelector('#seek'), label = document.querySelector('output');
+let frames = [], fps = 1, current = 0, playing = false, start = 0, generation = 0;
+async function show(i) {
+  const version = ++generation;
+  const bitmap = await createImageBitmap(frames[i]);
+  if (version === generation) {
+    ctx.drawImage(bitmap, 0, 0); current = i; seek.value = i;
+    canvas.dataset.frame = i;
+    label.value = `${(i / fps).toFixed(2)} / ${(frames.length / fps).toFixed(2)} s`;
+  }
+  bitmap.close();
+}
+async function load(bytes) {
+  playing = false; generation++; frames = [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const tag = p => String.fromCharCode(...bytes.subarray(p, p + 4));
+  if (tag(0) !== 'RIFF' || tag(8) !== 'AVI ') throw Error('Expected AVI');
+  function scan(a, b) {
+    for (let p = a; p < b;) {
+      const n = view.getUint32(p + 4, true), type = tag(p);
+      if (p + 8 + n > b) throw Error('Invalid chunk size');
+      if (type === 'LIST') scan(p + 12, p + 8 + n);
+      if (type === 'avih') {canvas.width = view.getUint32(p + 40, true); canvas.height = view.getUint32(p + 44, true);}
+      if (type === 'strh') fps = view.getUint32(p + 32, true) / view.getUint32(p + 28, true);
+      if (type === '00dc') frames.push(new Blob([bytes.subarray(p + 8, p + 8 + n)], {type:'image/jpeg'}));
+      p += 8 + n + n % 2;
+    }
+  }
+  scan(12, bytes.length);
+  if (!frames.length || !Number.isFinite(fps) || fps <= 0) throw Error('Missing video stream');
+  seek.max = frames.length - 1; await show(0);
+}
+async function tick(now) {
+  if (!playing) return;
+  const i = Math.max(0, Math.min(frames.length - 1, Math.floor((now - start) * fps / 1000)));
+  await show(i);
+  if (i === frames.length - 1) {playing = false; document.querySelector('#play').textContent = 'Play';}
+  else requestAnimationFrame(tick);
+}
+document.querySelector('#play').onclick = () => {
+  if (!frames.length) return;
+  playing = !playing;
+  document.querySelector('#play').textContent = playing ? 'Pause' : 'Play';
+  if (playing) {if (current === frames.length - 1) current = 0; start = performance.now() - current * 1000 / fps; requestAnimationFrame(tick);}
+};
+seek.oninput = () => {playing = false; document.querySelector('#play').textContent = 'Play'; show(Number(seek.value));};
+document.querySelector('input[type=file]').onchange = async e => {
+  try {await load(new Uint8Array(await e.target.files[0].arrayBuffer()));} catch(e) {label.value = e.message;}
+};
+if (embedded) load(Uint8Array.from(atob(embedded), c => c.charCodeAt(0)));
+</script></html>

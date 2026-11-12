@@ -2,7 +2,7 @@ use crate::history::{self, Actor, Artifact, AttemptEvidence, Attributes, Event, 
 use crate::{Result, evidence, lock, metrics, now, process, read, require, write};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::mem::{MaybeUninit, size_of};
 use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
@@ -32,6 +32,30 @@ pub fn worker_statuses(stage: &str) -> &'static [&'static str] {
 }
 fn normalized(text: &str) -> String {
     text.trim_matches('\u{feff}').split_whitespace().collect::<Vec<_>>().join(" ")
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyReason {
+    #[serde(rename = "uses_artifact")]
+    Artifact,
+    #[serde(rename = "uses_api")]
+    Api,
+    #[serde(rename = "uses_schema")]
+    Schema,
+    #[serde(rename = "uses_data")]
+    Data,
+}
+pub const DEPENDENCY_REASONS: [DependencyReason; 4] = [DependencyReason::Artifact, DependencyReason::Api, DependencyReason::Schema, DependencyReason::Data];
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dependency {
+    pub target: String,
+    pub reason: Option<DependencyReason>,
+}
+fn dependencies(value: &Value) -> Result<Vec<Dependency>> {
+    let links: Vec<Dependency> = serde_json::from_value(value.clone()).map_err(|e| format!("{e}; use after, or nothing"))?;
+    require(links.iter().all(|d| d.reason.is_some()), "Dependencies require a typed reason; use after, or nothing")?;
+    Ok(links)
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Attempt {
@@ -76,17 +100,23 @@ pub struct Task {
     #[serde(default)]
     pub recorded_wait: Option<String>,
     pub acceptance: Vec<String>,
-    pub dependencies: Vec<String>,
+    pub dependencies: Vec<Dependency>,
     #[serde(default)]
     pub after: Vec<String>,
     #[serde(default)]
     pub parent: Option<String>,
+    #[serde(default)]
+    pub standalone: bool,
     #[serde(default)]
     pub conflicts: Vec<String>,
     #[serde(default)]
     pub related: Vec<String>,
     #[serde(default)]
     pub writable: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inherited: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub replanned: bool,
     #[serde(default, rename = "audit", skip_serializing)]
     legacy_audit: bool,
     #[serde(default, rename = "evidenceRequirements", skip_serializing)]
@@ -149,7 +179,7 @@ impl Task {
     }
     fn snapshot(&self) -> Value {
         json!({"title":self.title,"outcome":self.outcome,"acceptance":self.acceptance,"cwd":self.cwd,"workspaceId":self.workspace,"key":self.key,
-            "dependencies":self.dependencies,"after":self.after,"parent":self.parent,"conflicts":self.conflicts,"related":self.related,
+            "dependencies":self.dependencies,"after":self.after,"parent":self.parent,"standalone":self.standalone,"conflicts":self.conflicts,"related":self.related,
             "writable":self.writable,"model":self.model,"effort":self.effort,"attributes":self.attributes,"definitionWords":self.definition_words()})
     }
     pub fn record(&mut self, kind: &str, actor: Actor, source: &str, evidence: Value) {
@@ -161,16 +191,20 @@ impl Task {
             self.record("phase_changed", actor, source, json!({"from":from,"to":stage}));
         }
     }
-    fn strikes(&self) -> usize {
-        let mut failures = vec![0; self.acceptance.len()];
-        for attempt in self.attempts.iter().filter(|a| a.revision == self.revision && a.status() == Some("rejected")) {
-            for (index, outcome) in attempt.result.as_ref().unwrap()["criteria"].as_array().into_iter().flatten().enumerate() {
-                if outcome == "failed" && index < failures.len() {
-                    failures[index] += 1;
+    fn failures(&self) -> BTreeMap<String, usize> {
+        let mut failures = self.inherited.clone();
+        for result in self.attempts.iter().filter(|a| a.revision == self.revision).filter_map(|a| a.result.as_ref()) {
+            for (outcome, criterion) in result["criteria"].as_array().into_iter().flatten().zip(&self.acceptance) {
+                if outcome == "failed" {
+                    *failures.entry(normalized(criterion)).or_default() += 1;
                 }
             }
         }
-        failures.into_iter().max().unwrap_or(0)
+        failures
+    }
+    fn strikes(&self) -> usize {
+        let failures = self.failures();
+        self.acceptance.iter().filter_map(|c| failures.get(&normalized(c))).copied().max().unwrap_or(0)
     }
     fn failed_replans(&self) -> usize {
         let resumed = self.history.iter().rev().find(|e| e.kind == "resumed").map_or(0, |e| e.at);
@@ -193,10 +227,12 @@ struct Input {
     outcome: Option<String>,
     cwd: Option<String>,
     acceptance: Option<Vec<String>>,
-    dependencies: Option<Vec<String>>,
+    dependencies: Option<Vec<Dependency>>,
     after: Option<Vec<String>>,
     #[serde(default, deserialize_with = "nullable")]
     parent: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    standalone: Option<Option<bool>>,
     conflicts: Option<Vec<String>>,
     related: Option<Vec<String>>,
     supersedes: Option<Vec<String>>,
@@ -213,13 +249,25 @@ impl Input {
             object.remove("actor");
             object.remove("reason");
         }
+        if let Some(value) = value.get("dependencies") {
+            dependencies(value)?;
+        }
         if let Some(attributes) = value.get("attributes").and_then(Value::as_object) {
             let unknown: Vec<_> = attributes.keys().filter(|k| !Attributes::FIELDS.contains(&k.as_str())).collect();
-            require(unknown.is_empty(), "Unknown attribute; use lane, needs, priority, size, artifact or deploy")?;
+            require(unknown.is_empty(), "Unknown attribute; use lane, needs, languages, functions, priority, size, artifact or deploy")?;
         }
         serde_json::from_value(value).map_err(|e| format!("{e}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, writable, attributes").into())
     }
+    fn grouping(&self) -> Result<()> {
+        require(self.parent.as_ref().is_some_and(Option::is_some) ^ (self.standalone == Some(Some(true))), "Choose exactly one grouping: parent container or standalone true")?;
+        require(self.standalone != Some(None), "standalone must be a boolean")
+    }
     fn apply(self, task: &mut Task) -> Result<()> {
+        if self.parent.is_some() || self.standalone.is_some() {
+            self.grouping()?;
+            task.parent = self.parent.clone().flatten();
+            task.standalone = self.standalone == Some(Some(true));
+        }
         let text = |s: String| s.trim().to_owned();
         if let Some(v) = self.title {
             task.title = text(v);
@@ -234,14 +282,14 @@ impl Input {
             task.cwd = v;
             task.workspace = Some(workspace(Path::new(&task.cwd))?);
         }
-        for (field, value) in [(&mut task.dependencies, self.dependencies), (&mut task.after, self.after), (&mut task.conflicts, self.conflicts), (&mut task.related, self.related)] {
+        if let Some(value) = self.dependencies {
+            task.dependencies = value;
+        }
+        for (field, value) in [(&mut task.after, self.after), (&mut task.conflicts, self.conflicts), (&mut task.related, self.related)] {
             if let Some(mut value) = value {
                 value.dedup();
                 *field = value;
             }
-        }
-        if let Some(v) = self.parent {
-            task.parent = v;
         }
         if let Some(v) = self.model {
             task.model = v.filter(|m| !m.trim().is_empty());
@@ -319,6 +367,8 @@ pub struct Config {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default)]
+    batches: std::collections::BTreeMap<String, Value>,
     #[serde(default, rename = "schemaVersion")]
     schema_version: Option<u32>,
     pub paused: bool,
@@ -366,7 +416,10 @@ impl State {
         validate_workdir(task.workdir())
     }
     fn check_relations(&self, task: &Task) -> Result<()> {
-        let related = task.dependencies.iter().chain(&task.after).chain(&task.conflicts).chain(&task.related).chain(&task.parent);
+        require(!(task.parent.is_some() && task.standalone), "Choose exactly one grouping: parent container or standalone true")?;
+        let mut targets = HashSet::new();
+        require(task.dependencies.iter().all(|d| targets.insert(&d.target)), "Duplicate dependency target")?;
+        let related = task.dependencies.iter().map(|d| &d.target).chain(&task.after).chain(&task.conflicts).chain(&task.related).chain(&task.parent);
         for id in related {
             require(id != &task.id, "A task cannot relate to itself")?;
             self.get(id).ok_or(format!("Related task not found: {id}"))?;
@@ -377,15 +430,15 @@ impl State {
         }
         let lineage: HashSet<&str> = self.ancestors(task).iter().map(|t| t.id.as_str()).collect();
         require(!lineage.contains(task.id.as_str()), "Parent cycle")?;
-        require(!task.dependencies.iter().chain(&task.after).any(|id| lineage.contains(id.as_str())), "A child cannot wait on its own container")?;
-        let mut pending: Vec<&String> = task.dependencies.iter().chain(&task.after).collect();
+        require(!task.dependencies.iter().map(|d| &d.target).chain(&task.after).any(|id| lineage.contains(id.as_str())), "A child cannot wait on its own container")?;
+        let mut pending: Vec<&String> = task.dependencies.iter().map(|d| &d.target).chain(&task.after).collect();
         let mut seen = HashSet::new();
         while let Some(id) = pending.pop() {
             require(id != &task.id, "Dependency or ordering cycle")?;
             if seen.insert(id)
                 && let Some(other) = self.get(id)
             {
-                pending.extend(other.dependencies.iter().chain(&other.after));
+                pending.extend(other.dependencies.iter().map(|d| &d.target).chain(&other.after));
             }
         }
         Ok(())
@@ -394,14 +447,22 @@ impl State {
         if !self.queued(task) {
             return None;
         }
+        for owner in std::iter::once(task).chain(self.ancestors(task)) {
+            if owner.parent.is_none() && !owner.standalone {
+                return Some("Unresolved grouping; choose parent container or standalone true".into());
+            }
+            if owner.dependencies.iter().any(|d| d.reason.is_none()) || self.check_relations(owner).is_err() {
+                return Some("Unresolved dependency; classify explicitly, use after, or nothing".into());
+            }
+        }
         if self.hold_until > now() {
             return Some(format!("Usage limit; dispatch resumes at {}", self.hold_until));
         }
         if task.container() {
             return Some(if self.children(&task.id).next().is_some() { "Waiting for child tasks" } else { "Container has no child tasks" }.into());
         }
-        let inherited = self.ancestors(task).into_iter().flat_map(|a| a.dependencies.iter().chain(&a.after));
-        for id in task.dependencies.iter().chain(inherited) {
+        let inherited = self.ancestors(task).into_iter().flat_map(|a| a.dependencies.iter().map(|d| &d.target).chain(&a.after));
+        for id in task.dependencies.iter().map(|d| &d.target).chain(inherited) {
             if let Some(other) = self.get(id).filter(|other| other.stage != "done") {
                 return Some(format!("Waiting for result from {}", other.title));
             }
@@ -430,7 +491,7 @@ impl State {
         let mut pending = vec![id.to_owned()];
         while let Some(id) = pending.pop() {
             for (index, task) in self.tasks.iter().enumerate() {
-                if task.dependencies.contains(&id) && !found.contains(&index) {
+                if task.dependencies.iter().any(|d| d.target == id) && !found.contains(&index) {
                     found.push(index);
                     pending.push(task.id.clone());
                 }
@@ -439,7 +500,12 @@ impl State {
         found
     }
     fn insert(&mut self, value: Value, actor: Actor, parent_override: Option<String>) -> Result<String> {
-        let input = Input::parse(value)?;
+        let mut input = Input::parse(value)?;
+        if let Some(parent) = parent_override {
+            input.parent = Some(Some(parent));
+            input.standalone = None;
+        }
+        input.grouping()?;
         let key = input.key.as_ref().map(|key| key.trim().to_owned());
         require(!key.as_ref().is_some_and(String::is_empty), "Task key must not be blank")?;
         let cwd = input.cwd.clone().ok_or("cwd is required")?;
@@ -456,9 +522,6 @@ impl State {
             json!({"id":id(),"title":"","outcome":"","cwd":cwd,"acceptance":[],"dependencies":[],"stage":"implementation","stopped":false,"attempts":[],"active":null,"feedback":[],"failure":"","retryAt":0,"key":key,"workspace":directory}),
         )?;
         input.apply(&mut task)?;
-        if parent_override.is_some() {
-            task.parent = parent_override;
-        }
         self.check_definition(&task)?;
         self.check_relations(&task)?;
         let id = task.id.clone();
@@ -466,10 +529,17 @@ impl State {
             let index = self.index(old)?;
             require(self.tasks[index].active.is_none() && self.children(old).next().is_none(), "Superseded tasks must be idle and have no children")?;
             for other in &mut self.tasks {
-                for list in [&mut other.dependencies, &mut other.after] {
+                let before = other.snapshot();
+                for link in other.dependencies.iter_mut().filter(|d| &d.target == old) {
+                    link.target = id.clone();
+                }
+                for list in [&mut other.after] {
                     for entry in list.iter_mut().filter(|entry| *entry == old) {
                         *entry = id.clone();
                     }
+                }
+                if before != other.snapshot() {
+                    other.record("rewired", actor, "supersession", json!({"before":before,"after":other.snapshot()}));
                 }
             }
             let mut retired = self.tasks.remove(index);
@@ -480,13 +550,73 @@ impl State {
         snapshot["supersedes"] = json!(supersedes);
         task.record("created", actor, "create", snapshot);
         self.tasks.push(task);
+        for task in &self.tasks {
+            self.check_relations(task)?;
+        }
         Ok(id)
+    }
+    fn insert_children(&mut self, parent: &str, children: &[Value], actor: Actor) -> Result<Value> {
+        require(!children.is_empty(), "Children are required")?;
+        let mut mapping = serde_json::Map::new();
+        let mut definitions = Vec::new();
+        for child in children {
+            let mut value = child.clone();
+            let object = value.as_object_mut().ok_or("Child must be an object")?;
+            let key = object.remove("localKey").and_then(|v| v.as_str().map(str::to_owned)).ok_or("Child localKey is required")?;
+            require(!key.trim().is_empty() && !mapping.contains_key(&key), "Child local keys must be nonblank and unique")?;
+            require(!object.contains_key("key") && !object.contains_key("supersedes") && !object.contains_key("parent") && !object.contains_key("standalone"), "Children inherit grouping and cannot replace tasks")?;
+            object.entry("cwd").or_insert(json!(self.get(parent).ok_or("Missing container")?.cwd));
+            let mut initial = value.clone();
+            for field in ["dependencies", "after", "conflicts", "related"] {
+                initial.as_object_mut().unwrap().remove(field);
+            }
+            let id = self.insert(initial, actor, Some(parent.to_owned()))?;
+            mapping.insert(key, json!(id));
+            definitions.push((id, value));
+        }
+        let resolve = |target: &mut Value| -> Result<()> {
+            if let Some(object) = target.as_object() {
+                require(object.len() == 1, "Sibling reference must contain only local")?;
+                let key = object.get("local").and_then(Value::as_str).ok_or("Sibling reference requires local key")?;
+                *target = mapping.get(key).cloned().ok_or("Unknown sibling local key")?;
+            }
+            require(target.is_string(), "Reference must be a task ID or local reference")
+        };
+        for (id, mut value) in definitions {
+            if let Some(links) = value.get_mut("dependencies") {
+                for link in links.as_array_mut().ok_or("Dependencies must be an array")? {
+                    resolve(link.get_mut("target").ok_or("Dependency target is required")?)?;
+                }
+            }
+            for field in ["after", "conflicts", "related"] {
+                if let Some(links) = value.get_mut(field) {
+                    for target in links.as_array_mut().ok_or("Relations must be arrays")? {
+                        resolve(target)?;
+                    }
+                }
+            }
+            let index = self.index(&id)?;
+            Input::parse(value)?.apply(&mut self.tasks[index])?;
+            self.check_definition(&self.tasks[index])?;
+            let snapshot = self.tasks[index].snapshot();
+            self.tasks[index].history.clear();
+            self.tasks[index].record("created", actor, "create", snapshot);
+        }
+        for task in &self.tasks {
+            self.check_relations(task)?;
+        }
+        Ok(Value::Object(mapping))
     }
     fn revise(&mut self, index: usize, input: Input, actor: Actor, source: &str) -> Result<()> {
         require(input.supersedes.is_none(), "supersedes applies only when creating a task")?;
         let previous = self.tasks[index].clone();
         let mut task = previous.clone();
         input.apply(&mut task)?;
+        if task.parent != previous.parent
+            && let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id))
+        {
+            require(parent.stage != "done", "Cannot add work under a completed container")?;
+        }
         if task.snapshot() == previous.snapshot() {
             return Ok(());
         }
@@ -496,6 +626,10 @@ impl State {
         let corrective = task.signature() != previous.signature() || (previous.stage == "replan" && !task.refinements.is_empty());
         if corrective {
             task.refinements.clear();
+            if source != "replan" {
+                task.inherited.clear();
+                task.replanned = false;
+            }
             for dependent in self.dependents(&task.id) {
                 let other = &mut self.tasks[dependent];
                 require(other.active.is_none(), format!("Stop dependent task \"{}\" before changing its prerequisite", other.title))?;
@@ -511,6 +645,9 @@ impl State {
         task.record(if corrective { "revised" } else { "updated" }, actor, source, task.snapshot());
         task.record_phase(&previous.stage, actor, source);
         self.tasks[index] = task;
+        for task in &self.tasks {
+            self.check_relations(task)?;
+        }
         Ok(())
     }
     fn settle_containers(&mut self) -> bool {
@@ -548,13 +685,50 @@ impl Engine {
     pub fn new(directory: PathBuf) -> Result<Self> {
         let file = directory.join("state.json");
         let mut state: State = if file.exists() {
-            read(&file)?
+            let mut raw: Value = read(&file)?;
+            if raw["schemaVersion"].as_u64().unwrap_or(0) < 4 {
+                for field in ["tasks", "archived"] {
+                    for task in raw.get_mut(field).and_then(Value::as_array_mut).into_iter().flatten() {
+                        for link in task["dependencies"].as_array_mut().into_iter().flatten() {
+                            if let Some(target) = link.as_str() {
+                                *link = json!({"target":target,"reason":null});
+                            }
+                        }
+                    }
+                }
+            }
+            for field in ["tasks", "archived"] {
+                for task in raw[field].as_array().into_iter().flatten() {
+                    for link in task["dependencies"].as_array().into_iter().flatten() {
+                        require(link.get("reason").is_some(), "Dependency reason missing; use after, or nothing")?;
+                    }
+                }
+            }
+            serde_json::from_value(raw).map_err(|e| format!("{e}; use after, or nothing"))?
         } else {
             let command = vec![std::env::current_exe()?.to_string_lossy().into(), "--codex".into()];
             let config = Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new() };
-            State { schema_version: Some(history::SCHEMA_VERSION), paused: false, controls: Vec::new(), hold_until: 0, tasks: Vec::new(), archived: Vec::new(), config }
+            State { batches: Default::default(), schema_version: Some(history::SCHEMA_VERSION), paused: false, controls: Vec::new(), hold_until: 0, tasks: Vec::new(), archived: Vec::new(), config }
         };
         require(!(state.schema_version > Some(history::SCHEMA_VERSION)), "State schema is newer than this coordinator")?;
+        if state.schema_version < Some(4) && directory.join("relationship-plan.json").exists() {
+            let plan: Value = read(&directory.join("relationship-plan.json"))?;
+            for decision in plan["tasks"].as_array().ok_or("Relationship plan requires tasks")? {
+                if let Some(task) = state.tasks.iter_mut().find(|t| decision["id"] == t.id) {
+                    let before = task.snapshot();
+                    let grouping = Input::parse(json!({"parent":decision.get("parent").cloned().unwrap_or(Value::Null),"standalone":decision.get("standalone").cloned().unwrap_or(json!(false))}))?;
+                    grouping.apply(task)?;
+                    task.dependencies = dependencies(&decision["dependencies"])?;
+                    task.after = serde_json::from_value(decision["after"].clone())?;
+                    task.record("relationships_classified", Actor::Human, "relationship-plan.json", json!({"before":before,"after":task.snapshot()}));
+                }
+            }
+        }
+        for task in &state.tasks {
+            if task.dependencies.iter().all(|d| d.reason.is_some()) {
+                state.check_relations(task)?;
+            }
+        }
         if state.config.replan.is_empty() {
             state.config.replan = state.config.implementation.clone();
         }
@@ -567,8 +741,8 @@ impl Engine {
                 task.attributes.artifact = Artifact::Candidate;
             }
             let task = &state.tasks[index];
-            let invalid = task.blocked || !task.refinements.is_empty() || state.check_definition(task).is_err();
-            if task.stage != "done" && task.active.is_none() && invalid && task.stage != "replan" {
+            let invalid = !task.refinements.is_empty() || state.check_definition(task).is_err();
+            if !task.stopped && !task.blocked && task.stage != "done" && task.active.is_none() && invalid && task.stage != "replan" {
                 let task = &mut state.tasks[index];
                 let from = task.stage.clone();
                 task.stage = "replan".into();
@@ -577,6 +751,8 @@ impl Engine {
                 task.record_phase(&from, Actor::Scheduler, "migration");
             }
         }
+        state.schema_version = Some(history::SCHEMA_VERSION);
+        write(&file, &state)?;
         Ok(Self { directory, state, pending_deploy: None, notices: Vec::new() })
     }
     pub fn task(&self, id: &str) -> Result<usize> {
@@ -602,7 +778,7 @@ impl Engine {
         if !detailed {
             value.as_object_mut().unwrap().remove("history");
         }
-        let blocks: Vec<_> = self.state.tasks.iter().filter(|t| t.dependencies.contains(&task.id)).map(|t| &t.id).collect();
+        let blocks: Vec<_> = self.state.tasks.iter().filter(|t| t.dependencies.iter().any(|d| d.target == task.id)).map(|t| &t.id).collect();
         value["status"] = json!(task.status());
         value["container"] = json!(task.container());
         value["children"] = json!(self.state.children(&task.id).map(|t| &t.id).collect::<Vec<_>>());
@@ -617,6 +793,28 @@ impl Engine {
         let actor = Actor::api(&input)?;
         let id = self.change(|state| Ok(json!(state.insert(input, actor, None)?)))?;
         self.task_value(&self.state.tasks[self.task(id.as_str().unwrap())?], false)
+    }
+    pub fn create_batch(&mut self, input: Value) -> Result<Value> {
+        let actor = Actor::api(&input)?;
+        let object = input.as_object().ok_or("Batch must be an object")?;
+        require(object.keys().all(|k| ["requestKey", "container", "children", "actor"].contains(&k.as_str())), "Unknown batch field")?;
+        let key = input["requestKey"].as_str().filter(|s| !s.trim().is_empty()).ok_or("requestKey is required")?.to_owned();
+        if let Some(receipt) = self.state.batches.get(&key) {
+            require(receipt["input"] == input, "Conflicting request replay")?;
+            return Ok(receipt["result"].clone());
+        }
+        self.change(|state| {
+            let container = input["container"].clone();
+            let parsed = Input::parse(container.clone())?;
+            require(parsed.key.is_none() && parsed.supersedes.is_none(), "Batch container cannot replace existing tasks")?;
+            let id = state.insert(container, actor, None)?;
+            require(state.get(&id).unwrap().container(), "Container must have no acceptance criteria")?;
+            let children = input["children"].as_array().ok_or("Children must be an array")?;
+            let mapping = state.insert_children(&id, children, actor)?;
+            let result = json!({"container":id,"children":mapping});
+            state.batches.insert(key, json!({"input":input,"result":result}));
+            Ok(result)
+        })
     }
     pub fn edit(&mut self, id: &str, input: Value) -> Result<Value> {
         let actor = Actor::api(&input)?;
@@ -647,7 +845,7 @@ impl Engine {
         let index = self.task(id)?;
         let task = &self.state.tasks[index];
         require(task.active.is_none(), "Task has an active worker")?;
-        let referenced = self.state.tasks.iter().any(|t| t.parent.as_deref() == Some(id) || t.dependencies.iter().chain(&t.after).any(|d| d == id));
+        let referenced = self.state.tasks.iter().any(|t| t.parent.as_deref() == Some(id) || t.dependencies.iter().map(|d| &d.target).chain(&t.after).any(|d| d == id));
         require(!referenced, "Task has children or dependents; supersede it instead")?;
         self.change(|state| {
             let mut task = state.tasks.remove(index);
@@ -734,17 +932,18 @@ impl Engine {
         let summary = |a: &Attempt| a.result.as_ref().map(|r| json!({"stage":a.stage,"status":r["status"],"summary":r["summary"],"findings":r["findings"],"criteria":r["criteria"]}));
         let dependencies: Vec<_> = task
             .dependencies
-            .iter()
-            .filter_map(|id| self.state.get(id))
-            .map(|d| {
+            .iter().chain(self.state.ancestors(task).into_iter().flat_map(|a| &a.dependencies))
+            .filter_map(|link| self.state.get(&link.target).map(|d| (link, d)))
+            .map(|(link, d)| {
                 let accepted = d.attempts.iter().rev().find(|a| a.revision == d.revision && a.stage == "implementation" && a.status() == Some("completed"));
-                json!({"id":d.id,"title":d.title,"summary":accepted.and_then(|a| a.result.as_ref()).map(|r| &r["summary"]),"artifact":accepted.and_then(|a| a.evidence.configuration.as_ref()).map(|c| &c["artifact"])})
+                json!({"id":d.id,"target":link.target,"reason":link.reason,"title":d.title,"summary":accepted.and_then(|a| a.result.as_ref()).map(|r| &r["summary"]),"artifact":accepted.and_then(|a| a.evidence.configuration.as_ref()).map(|c| &c["artifact"])})
             })
             .collect();
         let directory = self.attempt_path(attempt_id);
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
             "cwd":task.workdir(),"model":task.model,"effort":task.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact),
-            "writable":task.writable},
+            "languages":task.attributes.languages,"functions":task.attributes.functions,
+            "writable":task.writable,"dependencies":task.dependencies,"after":task.after},
             "feedback":task.feedback,"dependencies":dependencies,"limits":history::versions()["limits"],"scratch":directory.join("scratch"),
             "readOnly":stage != "implementation" || task.read_only()});
         if stage == "review" {
@@ -827,14 +1026,20 @@ impl Engine {
         result["summary"] = json!(history::clip(result["summary"].as_str().unwrap(), history::SUMMARY_WORDS));
         result["findings"] = json!(list(&result["findings"], history::MAX_FINDINGS));
         result["checks"] = json!(list(&result["checks"], history::MAX_FINDINGS + 2));
-        if attempt.stage == "review" {
-            let criteria: Vec<String> = serde_json::from_value(result["criteria"].clone()).map_err(|_| "Review must report criteria outcomes")?;
-            require(criteria.len() == task.acceptance.len() && criteria.iter().all(|c| matches!(c.as_str(), "passed" | "failed" | "blocked")), "Review must report one outcome per acceptance criterion")?;
+        if attempt.stage != "replan" {
+            let criteria: Vec<String> = serde_json::from_value(result["criteria"].clone()).map_err(|_| "Worker must report criteria outcomes")?;
+            require(criteria.len() == task.acceptance.len() && criteria.iter().all(|c| matches!(c.as_str(), "passed" | "failed" | "blocked")), "Worker must report one outcome per acceptance criterion")?;
             let failed = criteria.iter().any(|c| c == "failed");
             if status == "accepted" && criteria.iter().any(|c| c != "passed") {
                 result["status"] = json!(if failed { "rejected" } else { "blocked" });
             }
             require(!(status == "rejected" && !failed), "A rejection must mark at least one criterion failed")?;
+            if status == "completed" && criteria.iter().any(|c| c != "passed") {
+                let unmet = criteria.iter().zip(&task.acceptance).filter(|(o, _)| *o != "passed").map(|(o, c)| history::clip(&format!("Unmet criterion ({o}): {c}"), history::FINDING_WORDS));
+                let findings: Vec<Value> = unmet.map(Value::from).chain(result["findings"].as_array().cloned().unwrap_or_default()).take(history::MAX_FINDINGS).collect();
+                result["status"] = json!("blocked");
+                result["findings"] = json!(findings);
+            }
         }
         if matches!(result["status"].as_str(), Some("rejected" | "blocked" | "held")) {
             require(result["findings"].as_array().is_some_and(|f| !f.is_empty()), "Rejected, blocked and held results require findings")?;
@@ -842,28 +1047,66 @@ impl Engine {
         Ok(result)
     }
     fn apply_plan(state: &mut State, index: usize, plan: &Value) -> Result<()> {
+        let mut next = state.clone();
+        Self::plan(&mut next, index, plan)?;
+        *state = next;
+        Ok(())
+    }
+    fn plan(state: &mut State, index: usize, plan: &Value) -> Result<()> {
         let task = state.tasks[index].clone();
         let children = plan["children"].as_array().cloned().unwrap_or_default();
-        let base = |item: &Value, parent: bool| {
+        let failures = task.failures();
+        let criteria = |item: &Value| item["acceptance"].as_array().into_iter().flatten().filter_map(Value::as_str).map(normalized).collect::<Vec<_>>();
+        let proposed: Vec<String> = if children.is_empty() { criteria(plan) } else { children.iter().flat_map(criteria).collect() };
+        require(!proposed.iter().any(|c| failures.get(c).is_some_and(|n| *n >= history::STRIKES)), "Plan repeats a criterion that already failed twice; change the approach or hold for a decision")?;
+        let inherit = |state: &mut State, id: &str| -> Result<()> {
+            let index = state.index(id)?;
+            let child = &mut state.tasks[index];
+            child.inherited = child.acceptance.iter().map(|c| normalized(c)).filter_map(|c| failures.get(&c).map(|n| (c, *n))).collect();
+            child.replanned = true;
+            Ok(())
+        };
+        let base = |item: &Value, parent: bool, existing: bool| {
             json!({"title":item["title"],"outcome":item["outcome"],"acceptance":if parent {json!([])} else {item["acceptance"].clone()},
                 "attributes":{"lane":item["lane"],"needs":item["needs"],"size":if parent {json!("large")} else {item["size"].clone()},
                 "priority":task.attributes.priority,
+                "languages":item.get("languages").cloned().unwrap_or_else(|| if existing {json!(task.attributes.languages)} else {json!([])}),
+                "functions":item.get("functions").cloned().unwrap_or_else(|| if existing {json!(task.attributes.functions)} else {json!([])}),
                 "artifact":if parent {json!("none")} else {item.get("artifact").cloned().unwrap_or(json!(task.attributes.artifact))},"deploy":!parent && item["artifact"] == "candidate" && task.attributes.deploy}})
         };
         if children.is_empty() {
-            state.revise(index, Input::parse(base(plan, false))?, Actor::Planner, "replan")?;
-            return require(state.tasks[index].stage != "replan", "Plan did not change the task definition");
+            let mut value = base(plan, false, true);
+            if let Some(links) = plan.get("dependencies") {
+                value["dependencies"] = links.clone();
+            }
+            state.revise(index, Input::parse(value)?, Actor::Planner, "replan")?;
+            require(state.tasks[index].stage != "replan", "Plan did not change the task definition")?;
+            return inherit(state, &task.id);
         }
-        state.revise(index, Input::parse(base(plan, true))?, Actor::Planner, "replan")?;
-        let mut ids: Vec<String> = Vec::new();
-        for child in &children {
-            let mut value = base(child, false);
+        let mut value = base(plan, true, true);
+        if let Some(links) = plan.get("dependencies") {
+            value["dependencies"] = links.clone();
+        }
+        state.revise(index, Input::parse(value)?, Actor::Planner, "replan")?;
+        let mut definitions = Vec::new();
+        for (index, child) in children.iter().enumerate() {
+            let mut value = base(child, false, false);
             value["cwd"] = json!(task.cwd);
             value["writable"] = json!(task.writable);
-            value["after"] = json!(child["after"].as_array().into_iter().flatten().filter_map(Value::as_u64).filter_map(|i| ids.get(i as usize).cloned()).collect::<Vec<_>>());
-            ids.push(state.insert(value, Actor::Planner, Some(task.id.clone()))?);
+            value["localKey"] = json!(index.to_string());
+            let after: Vec<usize> = serde_json::from_value(child.get("after").cloned().unwrap_or(json!([])))?;
+            value["after"] = json!(after.iter().map(|i| json!({"local":i.to_string()})).collect::<Vec<_>>());
+            let mut links = child.get("dependencies").cloned().unwrap_or(json!([]));
+            for link in links.as_array_mut().ok_or("Dependencies must be records; use after, or nothing")? {
+                if let Some(index) = link["target"].as_u64() {
+                    link["target"] = json!({"local":index.to_string()});
+                }
+            }
+            value["dependencies"] = links;
+            definitions.push(value);
         }
-        Ok(())
+        let mapping = state.insert_children(&task.id, &definitions, Actor::Planner)?;
+        mapping.as_object().into_iter().flat_map(|m| m.values()).filter_map(Value::as_str).try_for_each(|id| inherit(state, id))
     }
     fn collect(&mut self, index: usize, exit: Value) -> Result<()> {
         let task = &self.state.tasks[index];
@@ -948,6 +1191,11 @@ impl Engine {
             }
         }
         let task = &mut state.tasks[index];
+        if task.stage == "replan" && previous_stage != "replan" && task.replanned && !task.blocked {
+            task.blocked = true;
+            task.failure = "Replanned work failed again; a decision is needed".into();
+            notice = Some(json!({"event":"held","taskId":task.id,"title":task.title,"reason":task.failure}));
+        }
         if task.stage == "replan" && task.failed_replans() >= history::STRIKES && !task.blocked {
             task.blocked = true;
             task.failure = "Replanning failed twice; a decision is needed".into();
@@ -995,6 +1243,9 @@ impl Engine {
         if exit.exists() {
             return self.collect(index, read(&exit)?);
         }
+        if std::iter::once(&self.state.tasks[index]).chain(self.state.ancestors(&self.state.tasks[index])).any(|t| t.parent.is_none() && !t.standalone) {
+            return self.signal_stop(&id);
+        }
         if self.state.paused || self.state.tasks[index].stopped {
             self.signal_stop(&id)?;
         }
@@ -1039,6 +1290,3 @@ impl Engine {
         self.commit(state)
     }
 }
-#[cfg(test)]
-#[path = "engine_tests.rs"]
-mod tests;
