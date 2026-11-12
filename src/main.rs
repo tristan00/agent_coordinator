@@ -4,6 +4,7 @@ mod evidence;
 mod history;
 mod metrics;
 mod process;
+mod redeploy;
 mod telemetry;
 mod web;
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,12 @@ fn lock(file: &Path) -> Result<File> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("--identity") => {
+            println!("{}", web::deployment());
+            Ok(())
+        }
+        Some("--redeploy") => redeploy::cli(&args[2..]),
+        Some("--redeploy-request") => redeploy::request(Path::new(args.get(2).ok_or("Missing request")?)),
         Some("--supervise") => process::supervise(Path::new(args.get(2).ok_or("Missing attempt path")?)),
         Some("--codex") => process::codex(),
         Some("--external") => process::external(),

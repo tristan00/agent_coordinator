@@ -19,7 +19,9 @@ pub fn deployment() -> &'static Value {
         let executable = std::env::current_exe().ok();
         let digest = executable.as_deref().and_then(|path| crate::evidence::digest(path).ok());
         json!({"status":if digest.is_some() {"verified_live"} else {"identity_unavailable"},
-            "pid":std::process::id(),"executable":executable,"digest":digest})
+            "pid":std::process::id(),"executable":executable,"digest":digest,
+            "protocol":1,"frontendSource":option_env!("COORDINATOR_FRONTEND_SHA"),"source":option_env!("COORDINATOR_SOURCE_SHA"),
+            "frontend":crate::redeploy::frontend_digest()})
     })
 }
 fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shutdown: &mut bool) -> Result<()> {
@@ -70,6 +72,13 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
         let input: Value = serde_json::from_str(if body.is_empty() { "{}" } else { &body })?;
         let reason = || input["reason"].as_str().ok_or("Control requires an explicit reason");
         match (method.as_str(), parts.as_slice()) {
+            ("POST", ["", "api", "deployment"]) => crate::redeploy::enqueue(input, &engine.directory, port),
+            ("POST", ["", "api", "deployment", "quiesce"]) => {
+                crate::require(input["expected"] == deployment()["digest"] && input["expected"].is_string(), "Running coordinator identity changed")?;
+                crate::redeploy::authorize_handoff(&engine.directory, &input)?;
+                *shutdown = true;
+                Ok(json!({"ready":true,"paused":engine.state.paused}))
+            }
             ("POST", ["", "api", "analytics"]) => crate::analytics::report(&engine.state, input),
             ("POST", ["", "api", "deployment", "handoff"]) => {
                 crate::require(input["expected"] == deployment()["digest"] && input["expected"].is_string(), "Running coordinator identity changed")?;
@@ -94,6 +103,7 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
     }
 }
 fn handoff(engine: &mut Engine, action: &str, port: u16) -> Result<Value> {
+    let _redeploy = lock(&engine.directory.join("redeploy.lock"))?;
     let mut target = if action == "rollback" {
         deployment_event(&engine.directory)["from"].clone()
     } else {
@@ -125,7 +135,8 @@ fn handoff(engine: &mut Engine, action: &str, port: u16) -> Result<Value> {
 fn get(engine: &mut Engine, parts: &[&str], error: &str) -> Result<Option<Value>> {
     let value = match parts {
         ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
-        ["", "api", "deployment"] => json!({"live":deployment(),"event":deployment_event(&engine.directory)}),
+        ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
+        ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
         ["", "api", "state"] => {
             engine.sync_waiting()?;
             let tasks = engine.state.tasks.iter().map(|task| engine.task_value(task, false)).collect::<Result<Vec<_>>>()?;
@@ -141,7 +152,7 @@ fn get(engine: &mut Engine, parts: &[&str], error: &str) -> Result<Option<Value>
     };
     Ok(Some(value))
 }
-fn data_directory() -> Result<PathBuf> {
+pub(crate) fn data_directory() -> Result<PathBuf> {
     let directory =
         std::env::var_os("COORDINATOR_DATA").map(PathBuf::from).or_else(|| std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("AgentCoordinator"))).ok_or("Set LOCALAPPDATA or COORDINATOR_DATA")?;
     let ambiguous = directory.components().any(|part| match part {
@@ -150,7 +161,7 @@ fn data_directory() -> Result<PathBuf> {
         _ => false,
     });
     crate::require(directory.is_absolute() && !ambiguous, "COORDINATOR_DATA must be an absolute directory without ambiguous components")?;
-    let project = resolve_scope_path(Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    let project = resolve_scope_path(Path::new(option_env!("COORDINATOR_SOURCE_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"))))?;
     let directory = resolve_scope_path(&directory)?;
     crate::require(!covers(&project, &directory), "COORDINATOR_DATA must be outside the project directory")?;
     fs::create_dir_all(&directory)?;
@@ -159,7 +170,13 @@ fn data_directory() -> Result<PathBuf> {
 fn deployment_event(directory: &Path) -> Value {
     crate::read(&directory.join("deployment.json")).unwrap_or(Value::Null)
 }
-fn server_command(path: &str, directory: &Path, port: u16) -> Result<std::process::Command> {
+pub(crate) fn server_command(path: &str, directory: &Path, port: u16) -> Result<std::process::Command> {
+    use std::os::windows::io::AsRawHandle;
+    for handle in [std::io::stdin().as_raw_handle(), std::io::stdout().as_raw_handle(), std::io::stderr().as_raw_handle()] {
+        unsafe {
+            windows_sys::Win32::Foundation::SetHandleInformation(handle as _, windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT, 0);
+        }
+    }
     let log = fs::OpenOptions::new().create(true).append(true).open(directory.join("deployment-server.log"))?;
     let mut command = crate::process::command(path);
     command.env("COORDINATOR_DATA", directory).env("PORT", port.to_string()).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
