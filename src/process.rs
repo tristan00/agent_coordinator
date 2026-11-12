@@ -102,13 +102,17 @@ pub fn supervise(directory: &Path) -> Result<()> {
         Err(error) => return write(&directory.join("exit.json"), &json!({"error":error.to_string(),"ended":now()})),
     };
     let run = || -> Result<Value> {
-        if directory.join("run.json").exists() || directory.join("launch-intent.json").exists() {
+        let request: Value = read(&directory.join("request.json"))?;
+        let resumable = request["command"][1] == "--external";
+        if !resumable && (directory.join("run.json").exists() || directory.join("launch-intent.json").exists()) {
+            if read::<Value>(&directory.join("result.json")).is_ok() {
+                return Ok(json!({"code":0,"recovered":true}));
+            }
             return Ok(json!({"error":"Supervisor interrupted; its worker job was terminated","interrupted":true}));
         }
         if directory.join("stop").exists() {
             return Ok(json!({"stopped":true}));
         }
-        let request: Value = read(&directory.join("request.json"))?;
         if request["scratch"].is_string() {
             std::fs::create_dir_all(directory.join("scratch"))?;
             std::fs::create_dir_all(directory.join("deliverables"))?;
