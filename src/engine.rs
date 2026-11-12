@@ -706,7 +706,7 @@ impl Engine {
             }
             serde_json::from_value(raw).map_err(|e| format!("{e}; use after, or nothing"))?
         } else {
-            let command = vec![std::env::current_exe()?.to_string_lossy().into(), "--codex".into()];
+            let command = vec![std::env::current_exe()?.to_string_lossy().into(), "--external".into()];
             let config = Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new() };
             State { batches: Default::default(), schema_version: Some(history::SCHEMA_VERSION), paused: false, controls: Vec::new(), hold_until: 0, tasks: Vec::new(), archived: Vec::new(), config }
         };
