@@ -37,7 +37,7 @@ pub fn local_json(port: u16, route: &str, body: Option<&Value>) -> Result<Value>
     Ok(value)
 }
 pub fn local_codex(args: &[String]) -> bool {
-    args.len() == 2 && args[1] == "--codex" && Path::new(&args[0]).file_stem().is_some_and(|name| name.eq_ignore_ascii_case("agent-coordinator"))
+    args.len() == 2 && matches!(args[1].as_str(), "--codex" | "--external") && Path::new(&args[0]).file_stem().is_some_and(|name| name.eq_ignore_ascii_case("agent-coordinator"))
 }
 fn job_result(status: i32) -> Result<()> {
     if status == 0 { Err(std::io::Error::last_os_error().into()) } else { Ok(()) }
@@ -232,14 +232,22 @@ pub(crate) fn schema(stage: &str) -> Value {
 }
 const RULES: &str =
     "Follow AGENTS.md in task.cwd. Keep summary under 40 words and at most 3 findings of 30 words. A denied command is not a reason to stop: use a different permitted method and continue. Never ask the user to act.";
-pub fn codex() -> Result<()> {
+pub fn external() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
-    let result = std::env::var("COORDINATOR_RESULT")?;
-    let directory = Path::new(&result).parent().unwrap();
+    let result = PathBuf::from(std::env::var("COORDINATOR_RESULT")?);
+    let directory = result.parent().unwrap();
     let stage = request["stage"].as_str().unwrap_or("implementation");
     let schema_path = directory.join("schema.json");
     write(&schema_path, &schema(stage))?;
-    let action = match stage {
+    let prompt = format!("{}\n{RULES}\nWhen finished, write one JSON object matching the schema at {} to {}.\n{request}", action(&request, stage), schema_path.display(), result.display());
+    std::fs::write(directory.join("prompt.md"), prompt)?;
+    while read::<Value>(&result).is_err() {
+        thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+fn action(request: &Value, stage: &str) -> &'static str {
+    match stage {
         "review" => {
             "Independently verify the implementation in task.cwd against each acceptance criterion, read-only. Run the checks yourself; do not trust the implementation summary. Return criteria with one outcome per criterion in order. accepted only if every criterion passed. rejected if any failed; each finding states the failing behavior for the whole class of inputs. blocked only if a required check cannot run in the available environment."
         }
@@ -252,8 +260,16 @@ pub fn codex() -> Result<()> {
         _ => {
             "Implement the task outcome in task.cwd and run checks proving each acceptance criterion. If feedback lists failed criteria, fix the cause for the whole class of inputs, not only the cited example. Use scratch for disposable files. If task.artifact is set, write that exact absolute path. Return criteria with one outcome per criterion in order; completed only if every criterion passed. Otherwise return blocked with a blocker kind and one finding."
         }
-    };
-    let prompt = format!("{action}\n{RULES}\n{request}");
+    }
+}
+pub fn codex() -> Result<()> {
+    let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
+    let result = std::env::var("COORDINATOR_RESULT")?;
+    let directory = Path::new(&result).parent().unwrap();
+    let stage = request["stage"].as_str().unwrap_or("implementation");
+    let schema_path = directory.join("schema.json");
+    write(&schema_path, &schema(stage))?;
+    let prompt = format!("{}\n{RULES}\n{request}", action(&request, stage));
     let program = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut cli = command(&program);
     let profile = std::env::var_os("USERPROFILE").map(PathBuf::from).filter(|path| path.is_absolute());

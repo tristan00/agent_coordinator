@@ -42,6 +42,7 @@ fn main() -> Result<()> {
     match args.get(1).map(String::as_str) {
         Some("--supervise") => process::supervise(Path::new(args.get(2).ok_or("Missing attempt path")?)),
         Some("--codex") => process::codex(),
+        Some("--external") => process::external(),
         Some("--worker") => process::worker(),
         Some("--deploy") => web::deploy(args.get(2).ok_or("Supply a task ID or rollback")?),
         Some("--finish-deploy") => web::finish_deploy(),
