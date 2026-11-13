@@ -56,3 +56,7 @@ fn parse_local(text: &str) -> Option<u64> {
     let ticks = (u64::from(file.dwHighDateTime) << 32) | u64::from(file.dwLowDateTime);
     (ticks / 10_000).checked_sub(11_644_473_600_000)
 }
+
+#[cfg(test)]
+#[path = "telemetry_tests.rs"]
+mod tests;
