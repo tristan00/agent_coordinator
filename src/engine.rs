@@ -659,6 +659,7 @@ impl State {
             }
             let index = self.index(&id)?;
             Input::parse(value)?.apply(&mut self.tasks[index])?;
+            self.tasks[index].workspace = self.tasks[index].workspace.clone().map(|directory| self.owning_workspace(directory));
             self.check_definition(&self.tasks[index])?;
             let snapshot = self.tasks[index].snapshot();
             self.tasks[index].history.clear();
