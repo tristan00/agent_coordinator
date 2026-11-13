@@ -469,7 +469,6 @@ impl State {
         }
         if let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id)) {
             require(parent.container(), "Parent must be a container (no acceptance criteria)")?;
-            require(parent.stage != "done" || task.stage == "done", "Cannot add work under a completed container")?;
         }
         let lineage: HashSet<&str> = self.ancestors(task).iter().map(|t| t.id.as_str()).collect();
         require(!lineage.contains(task.id.as_str()), "Parent cycle")?;
@@ -567,6 +566,9 @@ impl State {
         }
         self.check_definition(&task)?;
         self.check_relations(&task)?;
+        if let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id)) {
+            require(parent.stage != "done", "Cannot add work under a completed container")?;
+        }
         let id = task.id.clone();
         for old in &supersedes {
             let index = self.index(old)?;
@@ -733,7 +735,7 @@ impl Engine {
         let mut state: State = if file.exists() {
             let mut raw: Value = read(&file)?;
             if raw["schemaVersion"].as_u64().unwrap_or(0) < 7 {
-                for settings in raw["config"]["workspaces"].as_object_mut().into_iter().flat_map(|items| items.values_mut()) {
+                for settings in raw.get_mut("config").and_then(|c| c.get_mut("workspaces")).and_then(Value::as_object_mut).into_iter().flat_map(|items| items.values_mut()) {
                     settings["planner"] = json!("sol_light");
                     settings["worker"] = json!("sol_light");
                 }
@@ -984,6 +986,9 @@ impl Engine {
     pub fn control_as(&mut self, stop: bool, id: Option<&str>, actor: Actor, reason: &str) -> Result<()> {
         require(id.is_some() || actor == Actor::Human, "Only an explicit user action can control all workspaces")?;
         require(!reason.trim().is_empty(), "Control requires a reason")?;
+        if let Some(id) = id {
+            self.task(id)?;
+        }
         if let (false, Some(id)) = (stop, id)
             && actor != Actor::Human
         {

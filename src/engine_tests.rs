@@ -473,8 +473,7 @@ fn containers_wait_for_children_and_settle_when_children_finish() {
 }
 
 #[test]
-#[ignore = "editing a done child of a done container fails with Cannot add work under a completed container"]
-fn bug_editing_a_done_child_under_a_done_container_is_refused() {
+fn editing_a_done_child_reopens_its_done_container() {
     let mut board = Board::new();
     let container = board.create(board.container("Group"));
     let child = board.create(board.child("Only child", &container));
@@ -483,6 +482,27 @@ fn bug_editing_a_done_child_under_a_done_container_is_refused() {
     state.settle_containers();
     board.engine.commit(state).unwrap();
     board.engine.edit(&child, json!({"outcome":"A corrected outcome"})).unwrap();
+    let mut state = board.engine.state.clone();
+    assert!(state.settle_containers());
+    assert_eq!(state.tasks[state.index(&container).unwrap()].stage, "implementation");
+}
+
+#[test]
+fn editing_a_prerequisite_reopens_its_dependent_inside_a_done_container() {
+    let mut board = Board::new();
+    let prerequisite = board.add("Prerequisite");
+    board.accept(&prerequisite);
+    let container = board.create(board.container("Group"));
+    let mut child = board.child("Consumer", &container);
+    child["dependencies"] = json!([{"target":prerequisite,"reason":"uses_api"}]);
+    let child = board.create(child);
+    board.accept(&child);
+    let mut state = board.engine.state.clone();
+    state.settle_containers();
+    board.engine.commit(state).unwrap();
+    assert_eq!(board.task(&container).stage, "done");
+    board.engine.edit(&prerequisite, json!({"outcome":"A corrected prerequisite"})).unwrap();
+    assert_eq!(board.task(&child).stage, "implementation");
     let mut state = board.engine.state.clone();
     assert!(state.settle_containers());
     assert_eq!(state.tasks[state.index(&container).unwrap()].stage, "implementation");
@@ -881,8 +901,7 @@ fn control_requires_reasons_and_respects_user_stops() {
 }
 
 #[test]
-#[ignore = "stopping an unknown task id succeeds while resuming one fails with Task not found"]
-fn bug_stopping_an_unknown_task_reports_success() {
+fn stopping_an_unknown_task_is_rejected() {
     let mut board = Board::new();
     assert!(board.engine.control_as(true, Some("missing"), Actor::Human, "stop").is_err());
 }
@@ -1088,8 +1107,7 @@ fn legacy_state(version: Value, tasks: Vec<Value>) -> Value {
 }
 
 #[test]
-#[ignore = "pre schema 7 states without config.workspaces fail: migration indexing inserts null workspaces"]
-fn bug_pre_schema_seven_state_without_workspaces_fails_to_load() {
+fn pre_schema_seven_state_without_workspaces_loads() {
     let temp = Temp::new();
     let ws = temp.dir("ws");
     let mut state = legacy_state(json!(6), vec![legacy("a", &ws, json!({"standalone":true}))]);
