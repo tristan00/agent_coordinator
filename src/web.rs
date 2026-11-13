@@ -155,6 +155,7 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
             ("POST", ["", "api", "wipe"]) => engine.wipe(),
             ("POST", ["", "api", "tasks"]) => engine.create(input),
             ("POST", ["", "api", "workspaces"]) => crate::workspace_prompts::create(engine, input, &crate::workspace_prompts::root()),
+            ("POST", ["", "api", "workspaces", "generate"]) => crate::workspace_prompts::generate(engine, input, &crate::workspace_prompts::root()),
             ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input),
             ("PATCH", ["", "api", "tasks", id]) => engine.edit(id, input),
             ("POST", ["", "api", "tasks", id, "replan"]) => engine.request_replan(id, input),

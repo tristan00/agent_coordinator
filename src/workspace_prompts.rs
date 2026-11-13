@@ -108,6 +108,56 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     result
 }
 
+const LIMIT_RANGES: [(&str, u64, u64); 6] = [("words", 60, 240), ("titleWords", 6, 20), ("criteria", 1, 6), ("summaryWords", 20, 80), ("findings", 1, 6), ("findingWords", 15, 60)];
+struct Random(u64);
+impl Random {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, count: usize) -> usize {
+        (self.next() % count as u64) as usize
+    }
+    fn shuffled<T>(&mut self, mut items: Vec<T>) -> Vec<T> {
+        for index in (1..items.len()).rev() {
+            items.swap(index, self.below(index + 1));
+        }
+        items
+    }
+}
+pub fn generate(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
+    let paths: Vec<PathBuf> = serde_json::from_value(input["paths"].clone()).map_err(|_| "paths must be a list of new absolute directories")?;
+    require(!paths.is_empty(), "paths must not be empty")?;
+    require(paths.iter().all(|path| path.is_absolute() && !path.exists()), "Every path must be a new absolute directory")?;
+    require(paths.iter().collect::<std::collections::BTreeSet<_>>().len() == paths.len(), "Paths must be distinct")?;
+    let seed = input["seed"].as_u64().unwrap_or_else(|| crate::now() ^ (u64::from(std::process::id()) << 40));
+    let mut random = Random(seed);
+    let agents = crate::agents::enabled(&Default::default(), engine.state.family);
+    let workers: Vec<String> = agents.keys().cloned().collect();
+    let planners: Vec<String> = agents.iter().filter(|(_, agent)| !agent.worker_only).map(|(id, _)| id.clone()).collect();
+    require(!planners.is_empty(), "No agents are enabled for this launcher family; start the coordinator from Claude Code or Codex, or set AGENT_FAMILY")?;
+    let listed = catalog(root)?;
+    let deck = |role: &str, random: &mut Random| -> Result<Vec<String>> {
+        let names: Vec<String> = listed[role].as_array().into_iter().flatten().filter_map(|entry| entry["candidate"].as_str().map(str::to_owned)).collect();
+        require(!names.is_empty(), format!("prompt_candidate/{role} has no valid prompt"))?;
+        Ok(random.shuffled(names))
+    };
+    let (planner_prompts, worker_prompts) = (deck("project_planner", &mut random)?, deck("worker_protocol", &mut random)?);
+    let mut created = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let limits: serde_json::Map<String, Value> = LIMIT_RANGES.iter().map(|(key, low, high)| (key.to_string(), json!(low + random.next() % (high - low + 1)))).collect();
+        let updates = ["poll", "events"][random.below(2)];
+        let (planner, worker) = (&planners[random.below(planners.len())], &workers[random.below(workers.len())]);
+        let settings = json!({"limits":limits,"updates":updates,"planner":planner,"worker":worker});
+        created.push(create(engine, json!({"path":path,"settings":settings,
+            "project_planner":planner_prompts[index % planner_prompts.len()],"worker_protocol":worker_prompts[index % worker_prompts.len()]}), root)?);
+    }
+    Ok(json!({"seed":seed,"workspaces":created}))
+}
+
 #[cfg(test)]
 #[path = "workspace_prompts_tests.rs"]
 mod tests;

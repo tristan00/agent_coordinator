@@ -77,3 +77,33 @@ fn creation_copies_both_selections_and_freezes_their_hashes() {
     let loaded = fixture.engine();
     assert_eq!(loaded.state.config.workspaces[&directory], settings);
 }
+
+#[test]
+fn generation_deals_every_prompt_before_repeating_and_is_reproducible_by_seed() {
+    let fixture = Fixture::new();
+    for index in 0..3 {
+        fs::write(fixture.0.join(format!("project_planner/p{index}.md")), format!("Planner candidate {index}.")).unwrap();
+        fs::write(fixture.0.join(format!("worker_protocol/w{index}.md")), format!("Worker candidate {index}.")).unwrap();
+    }
+    let run = |prefix: &str| {
+        let mut engine = fixture.engine();
+        let paths: Vec<_> = (0..6).map(|i| fixture.0.join(format!("{prefix}{i}"))).collect();
+        generate(&mut engine, json!({"paths":paths,"seed":42}), &fixture.0).unwrap()
+    };
+    let first = run("a");
+    let pick = |result: &Value, role: &str| -> Vec<String> { result["workspaces"].as_array().unwrap().iter().map(|w| w["settings"]["prompts"][role]["candidate"].as_str().unwrap().to_owned()).collect() };
+    for role in ["project_planner", "worker_protocol"] {
+        let names = pick(&first, role);
+        assert_eq!(names[..3].iter().collect::<std::collections::BTreeSet<_>>().len(), 3, "{role}: {names:?}");
+        assert_eq!(names[..3], names[3..]);
+    }
+    let second = run("b");
+    let models = |result: &Value| -> Vec<(Value, Value, Value)> { result["workspaces"].as_array().unwrap().iter().map(|w| (w["settings"]["planner"].clone(), w["settings"]["worker"].clone(), w["settings"]["limits"].clone())).collect() };
+    assert_eq!((models(&first), pick(&first, "project_planner")), (models(&second), pick(&second, "project_planner")));
+    for workspace in first["workspaces"].as_array().unwrap() {
+        assert_ne!(workspace["settings"]["planner"], "luna_6_high");
+    }
+    let mut engine = fixture.engine();
+    assert!(generate(&mut engine, json!({"paths":[fixture.0.join("a0")]}), &fixture.0).is_err());
+    assert!(generate(&mut engine, json!({"paths":[]}), &fixture.0).is_err());
+}
