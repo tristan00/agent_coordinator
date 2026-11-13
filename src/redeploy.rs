@@ -122,6 +122,9 @@ fn run(program: &mut std::process::Command, failure: &str) -> Result<()> {
     require(output.status.success(), format!("{failure}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)))
 }
 pub fn build_source(source: &Path, cache: &Path) -> Result<Value> {
+    let source_path = PathBuf::from(shell_path(source));
+    let cache_path = PathBuf::from(shell_path(cache));
+    let (source, cache) = (source_path.as_path(), cache_path.as_path());
     require(!cache.starts_with(source), "Build cache must be outside source")?;
     fs::create_dir_all(cache)?;
     let _guard = lock(&cache.join("build.lock"))?;
@@ -167,6 +170,12 @@ pub fn build_source(source: &Path, cache: &Path) -> Result<Value> {
 fn shell_path(path: &Path) -> String {
     let path = path.to_string_lossy();
     if let Some(unc) = path.strip_prefix("\\\\?\\UNC\\") { format!("\\\\{unc}") } else { path.strip_prefix("\\\\?\\").unwrap_or(&path).to_owned() }
+}
+#[test]
+fn build_paths_accept_windows_canonical_paths() {
+    assert_eq!(shell_path(Path::new(r"\\?\C:\build\source")), r"C:\build\source");
+    assert_eq!(shell_path(Path::new(r"\\?\UNC\server\share\build")), r"\\server\share\build");
+    assert_eq!(shell_path(Path::new("/tmp/build")), "/tmp/build");
 }
 fn port(directory: &Path) -> Result<u16> {
     if let Ok(value) = std::env::var("PORT") {
