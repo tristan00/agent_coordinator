@@ -310,7 +310,12 @@ impl Input {
             task.effort = v;
         }
         if let Some(v) = self.attributes {
-            task.attributes = serde_json::from_value(v)?;
+            let mut merged = serde_json::to_value(&task.attributes)?;
+            match (merged.as_object_mut(), v.as_object()) {
+                (Some(base), Some(changes)) => base.extend(changes.clone()),
+                _ => merged = v,
+            }
+            task.attributes = serde_json::from_value(merged)?;
             task.attributes.needs.sort();
             task.attributes.needs.dedup();
         }
@@ -1221,7 +1226,7 @@ impl Engine {
                 "priority":task.attributes.priority,
                 "languages":item.get("languages").cloned().unwrap_or_else(|| if existing {json!(task.attributes.languages)} else {json!([])}),
                 "functions":item.get("functions").cloned().unwrap_or_else(|| if existing {json!(task.attributes.functions)} else {json!([])}),
-                "artifact":if parent {json!("none")} else {item.get("artifact").cloned().unwrap_or(json!(task.attributes.artifact))},"deploy":!parent && item["artifact"] == "candidate" && task.attributes.deploy}})
+                "artifact":if parent {json!("none")} else {item.get("artifact").cloned().unwrap_or(json!(task.attributes.artifact))},"deploy":!parent && item["artifact"] == "candidate" && task.attributes.deploy,"model":null}})
         };
         if children.is_empty() {
             let mut value = base(plan, false, true);

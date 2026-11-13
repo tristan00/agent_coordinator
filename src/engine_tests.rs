@@ -1324,3 +1324,16 @@ fn model_listing_reports_enabled_options_and_the_default() {
     let hosted = listed["agents"].as_array().unwrap().iter().find(|a| a["id"] == "sol_6_1_light").unwrap();
     assert_eq!((hosted["local"].as_bool(), hosted["available"].is_null()), (Some(false), true));
 }
+
+#[test]
+fn patching_one_attribute_keeps_the_others() {
+    let mut board = model_board();
+    let id = board.create(board.with("Tune parser", json!({"attributes":{"lane":"data","size":"medium","needs":["network"],"priority":1}})));
+    board.engine.edit(&id, json!({"attributes":{"model":"local_qwen3_4b"}})).unwrap();
+    let attributes = &board.task(&id).attributes;
+    assert!(attributes.size == Size::Medium);
+    assert_eq!((attributes.lane, attributes.priority, attributes.model.as_deref()), (Lane::Data, Some(1), Some("local_qwen3_4b")));
+    assert_eq!(attributes.needs.len(), 1);
+    board.engine.edit(&id, json!({"attributes":{"model":null}})).unwrap();
+    assert_eq!((board.task(&id).attributes.model.as_deref(), board.task(&id).attributes.lane), (None, Lane::Data));
+}
