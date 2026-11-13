@@ -751,10 +751,9 @@ impl Engine {
         let file = directory.join("state.json");
         let mut state: State = if file.exists() {
             let mut raw: Value = read(&file)?;
-            if raw["schemaVersion"].as_u64().unwrap_or(0) < 7 {
-                for settings in raw.get_mut("config").and_then(|c| c.get_mut("workspaces")).and_then(Value::as_object_mut).into_iter().flat_map(|items| items.values_mut()) {
-                    settings["planner"] = json!("sol_light");
-                    settings["worker"] = json!("sol_light");
+            for role in ["implementation", "review", "replan"] {
+                if raw["config"][role][1] == "--codex" {
+                    raw["config"][role][1] = json!("--agent");
                 }
             }
             if raw["schemaVersion"].as_u64().unwrap_or(0) < 4 {
@@ -1137,12 +1136,12 @@ impl Engine {
             _ => &self.state.config.implementation,
         };
         let mut command = registered.to_vec();
-        if process::local_codex(registered) {
+        if process::local_agent(registered) {
             command[0] = std::env::current_exe()?.to_string_lossy().into_owned();
         }
         let workspace_settings = self.state.settings(task.workspace.as_deref());
         let (worker, agent) = workspace_settings.task_agent(task.worker_model(), self.state.family)?;
-        if !process::local_codex(registered) {
+        if !process::local_agent(registered) {
             require(command.iter().any(|arg| arg == "{model}") && command.iter().any(|arg| arg.contains("{effort}")), "Worker command requires explicit {model} and {effort} placeholders")?;
         }
         let actual_command: Vec<_> = command.iter().map(|arg| arg.replace("{model}", &agent.model).replace("{effort}", agent.effort())).collect();

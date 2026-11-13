@@ -53,7 +53,7 @@ fn main() -> Result<()> {
         Some("--redeploy") => redeploy::cli(&args[2..]),
         Some("--redeploy-request") => redeploy::request(Path::new(args.get(2).ok_or("Missing request")?)),
         Some("--supervise") => process::supervise(Path::new(args.get(2).ok_or("Missing attempt path")?)),
-        Some("--codex" | "--agent") => process::codex(),
+        Some("--agent") => process::agent(),
         Some("--external") => process::external(),
         Some("--worker") => process::worker(),
         Some("--deploy") => web::deploy(args.get(2).ok_or("Supply a task ID or rollback")?),

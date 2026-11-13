@@ -36,8 +36,8 @@ pub fn local_json(port: u16, route: &str, body: Option<&Value>) -> Result<Value>
     }
     Ok(value)
 }
-pub fn local_codex(args: &[String]) -> bool {
-    args.len() == 2 && matches!(args[1].as_str(), "--codex" | "--agent" | "--external") && Path::new(&args[0]).file_stem().is_some_and(|name| name.eq_ignore_ascii_case("agent-coordinator"))
+pub fn local_agent(args: &[String]) -> bool {
+    args.len() == 2 && matches!(args[1].as_str(), "--agent" | "--external") && Path::new(&args[0]).file_stem().is_some_and(|name| name.eq_ignore_ascii_case("agent-coordinator"))
 }
 fn job_result(status: i32) -> Result<()> {
     if status == 0 { Err(std::io::Error::last_os_error().into()) } else { Ok(()) }
@@ -197,7 +197,7 @@ pub fn worker() -> Result<()> {
     let request: Value = serde_json::from_str(&input)?;
     let selection = request_agent(&request)?;
     let args: Vec<String> = serde_json::from_value(request["command"].clone())?;
-    crate::require(local_codex(&args) || (args.iter().any(|arg| arg == "{model}") && args.iter().any(|arg| arg.contains("{effort}"))), "Worker command requires explicit {model} and {effort} placeholders")?;
+    crate::require(local_agent(&args) || (args.iter().any(|arg| arg == "{model}") && args.iter().any(|arg| arg.contains("{effort}"))), "Worker command requires explicit {model} and {effort} placeholders")?;
     let args: Vec<_> = args.iter().map(|arg| arg.replace("{model}", &selection.model).replace("{effort}", selection.effort())).collect();
     let mut child = command(&args[0]).args(&args[1..]).stdin(Stdio::piped()).spawn()?;
     forward_input(&mut child, input.into_bytes());
@@ -298,7 +298,7 @@ pub(crate) fn prompt(request: &Value, stage: &str) -> Result<String> {
     Ok(format!("{}
 {}", action(request, stage), rules(request)?))
 }
-pub fn codex() -> Result<()> {
+pub fn agent() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
     let agent = request_agent(&request)?;
     match agent.harness {
