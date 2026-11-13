@@ -384,3 +384,7 @@ pub fn serve() -> Result<()> {
 pub(crate) fn deployment_reviewed(task: &Task) -> bool {
     task.stage == "done" && task.attempts.iter().rev().any(|attempt| attempt.revision == task.revision && attempt.stage == "review" && attempt.result.as_ref().is_some_and(|result| result["status"] == "accepted"))
 }
+
+#[cfg(test)]
+#[path = "web_tests.rs"]
+mod tests;

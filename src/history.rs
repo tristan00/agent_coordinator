@@ -262,3 +262,7 @@ pub fn coordination_prose(text: &str) -> bool {
             (parts.len() >= 3 && parts[0].len() == 13 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))) || (token.len() >= 40 && token.bytes().all(|b| b.is_ascii_hexdigit()))
         })
 }
+
+#[cfg(test)]
+#[path = "history_tests.rs"]
+mod tests;

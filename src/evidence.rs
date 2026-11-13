@@ -67,3 +67,7 @@ pub fn artifact(directory: &Path, kind: Artifact) -> Option<Value> {
     let digest = digest(&path).ok()?;
     Some(json!({"path":path,"digest":digest}))
 }
+
+#[cfg(test)]
+#[path = "evidence_tests.rs"]
+mod tests;

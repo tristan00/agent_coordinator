@@ -66,3 +66,7 @@ pub fn report(state: &State, input: Value) -> Result<Value> {
     Ok(json!({"metricDefinitionVersion":crate::history::METRIC_DEFINITION_VERSION,"groupBy":query.group_by,"groups":summary,"tasks":rows,
         "definitions":{"firstPass":"Done non-container task whose first implementation completed and first review accepted","replans":"Replan attempts, triggered by blocks or repeated failure of one criterion"}}))
 }
+
+#[cfg(test)]
+#[path = "analytics_tests.rs"]
+mod tests;

@@ -268,3 +268,7 @@ pub fn size_delta(before: &Value, after: &Value) -> Value {
         .collect();
     json!({"includedCategories":categories,"status":if before["status"] == "measured" && after["status"] == "measured" {"measured"} else {"partial"},"attribution":"endpoint_project_delta_not_task_change"})
 }
+
+#[cfg(test)]
+#[path = "metrics_tests.rs"]
+mod tests;

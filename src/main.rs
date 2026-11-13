@@ -9,6 +9,8 @@ mod metrics;
 mod process;
 mod redeploy;
 mod telemetry;
+#[cfg(test)]
+mod test_support;
 mod web;
 mod workspace_prompts;
 use serde::{Deserialize, Serialize};

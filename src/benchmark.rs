@@ -66,3 +66,7 @@ impl Engine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "benchmark_tests.rs"]
+mod tests;
