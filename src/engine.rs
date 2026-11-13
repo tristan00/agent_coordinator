@@ -144,6 +144,9 @@ impl Task {
     pub fn read_only(&self) -> bool {
         self.attributes.lane == Lane::Audit
     }
+    pub(crate) fn worker_model(&self) -> Option<&str> {
+        self.attributes.model.as_deref().filter(|_| self.stage == "implementation")
+    }
     fn workdir(&self) -> &Path {
         Path::new(&self.cwd)
     }
@@ -448,7 +451,7 @@ impl State {
             .into_iter()
             .map(|(id, agent)| json!({"id":id,"provider":agent.provider,"model":agent.model,"effort":agent.effort,"local":agent.provider == crate::agents::Provider::Local,"note":agent.note,"available":crate::agents::available(&agent)}))
             .collect();
-        json!({"family":self.family,"default":settings.worker,"agents":agents,"usage":"Set attributes.model to an id to choose a task's worker; omit it to use the default."})
+        json!({"family":self.family,"default":settings.worker,"agents":agents,"usage":"Set attributes.model to an id to choose who implements a task; omit it to use the default. Review and replan always use the default."})
     }
     pub fn limits(&self, task: &Task) -> history::Limits {
         let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
@@ -543,7 +546,7 @@ impl State {
                 return Some(format!("Conflicts with running {}", other.title));
             }
         }
-        if let Some((id, agent)) = self.chosen_model(task)
+        if let Some((id, agent)) = self.chosen_model(task).filter(|_| task.worker_model().is_some())
             && crate::agents::available(&agent) == Some(false)
         {
             return Some(format!("Model {id} is not being served"));
@@ -1094,7 +1097,7 @@ impl Engine {
         let home = produced.filter(|_| stage == "review").map_or_else(|| directory.clone(), |a| self.attempt_path(&a.id));
         let settings = self.state.settings(task.workspace.as_deref());
         settings.validate(self.state.family)?;
-        let (worker, agent) = settings.task_agent(task.attributes.model.as_deref(), self.state.family)?;
+        let (worker, agent) = settings.task_agent(task.worker_model(), self.state.family)?;
         let cwd = workspace(Path::new(&task.cwd))?;
         let documents = self.state.benchmark_runs.keys().find(|path| cwd.starts_with(path)).map(PathBuf::as_path)
             .or(task.workspace.as_deref()).ok_or("Workspace directory is required")?;
@@ -1129,7 +1132,7 @@ impl Engine {
             command[0] = std::env::current_exe()?.to_string_lossy().into_owned();
         }
         let workspace_settings = self.state.settings(task.workspace.as_deref());
-        let (worker, agent) = workspace_settings.task_agent(task.attributes.model.as_deref(), self.state.family)?;
+        let (worker, agent) = workspace_settings.task_agent(task.worker_model(), self.state.family)?;
         if !process::local_codex(registered) {
             require(command.iter().any(|arg| arg == "{model}") && command.iter().any(|arg| arg.contains("{effort}")), "Worker command requires explicit {model} and {effort} placeholders")?;
         }

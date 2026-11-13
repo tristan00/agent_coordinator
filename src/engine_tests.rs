@@ -1368,3 +1368,18 @@ fn a_model_that_stops_being_served_holds_dispatch_with_a_reason() {
     board.engine.edit(&id, json!({"attributes":{"model":null}})).unwrap();
     assert_eq!(board.waiting(&id), None);
 }
+
+#[test]
+fn only_implementation_runs_on_the_chosen_model() {
+    let mut board = model_board();
+    let id = board.create(board.with("Summarize", json!({"attributes":{"model":"local_qwen3_4b"}})));
+    assert_eq!(board.task(&id).worker_model(), Some("local_qwen3_4b"));
+    board.run(&id, outcome("completed", &["passed"]));
+    assert_eq!(board.task(&id).stage, "review");
+    assert_eq!(board.task(&id).worker_model(), None);
+    let family = board.engine.state.family;
+    let settings = board.engine.state.settings(board.task(&id).workspace.as_deref());
+    assert_eq!(settings.task_agent(board.task(&id).worker_model(), family).unwrap().0, "sol_6_1_light");
+    serve_local(&[]);
+    assert_eq!(board.waiting(&id), None, "review does not wait for the implementation model");
+}
