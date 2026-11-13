@@ -1377,4 +1377,8 @@ fn tasks_in_a_subfolder_belong_to_the_configured_workspace_that_contains_it() {
     assert_eq!(find(&other), Some(workspace(&outside).unwrap()));
     let task = engine.state.tasks.iter().find(|t| t.id == inside["id"].as_str().unwrap()).unwrap();
     assert_eq!(engine.state.settings(task.workspace.as_deref()).worker.as_deref(), Some("sol_6_1_light"));
+    let batch = engine.create_batch(json!({"requestKey":"sub-1","container":{"title":"Group","outcome":"Done","cwd":child,"acceptance":[],"standalone":true},
+        "children":[{"localKey":"a","title":"Child","outcome":"Done","acceptance":["Works"]}]})).unwrap();
+    assert!(engine.state.tasks.iter().filter(|t| t.cwd == child.to_string_lossy() || t.parent.is_some()).all(|t| t.workspace == Some(key.clone())), "{batch}");
+    assert_eq!(engine.state.tasks.iter().filter(|t| t.parent.is_some()).count(), 1);
 }
