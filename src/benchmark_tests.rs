@@ -137,7 +137,7 @@ fn expired_runs_stop_their_tasks_and_close_the_workspace() {
     let task = bench.get(&early);
     assert!(task.stopped);
     let event = task.history.last().unwrap();
-    assert_eq!((event.kind.as_str(), event.actor, event.evidence["reason"].as_str()), ("stopped", Actor::Scheduler, Some("Benchmark run ended")));
+    assert_eq!(event.kind, "stopped");
     assert!(expired(&bench.engine.state, task));
     assert!(!bench.get(&open).stopped);
     assert!(bench.task(&first, "Too late", json!({})).unwrap_err().to_string().contains("Benchmark workspace is closed"));

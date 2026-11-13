@@ -1,4 +1,4 @@
-use crate::{Result, engine::{Engine, State, Task, workspace}, history::{Actor, WorkspaceSettings}, now, require};
+use crate::{Result, engine::{Engine, State, Task, workspace}, history::WorkspaceSettings, now, require};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ impl Engine {
         if changed { self.commit(state)?; }
         let ids: Vec<_> = self.state.tasks.iter().filter(|task| !task.stopped && task.stage != "done" && expired(&self.state, task))
             .map(|task| task.id.clone()).collect();
-        for id in ids { self.control_as(true, Some(&id), Actor::Scheduler, "Benchmark run ended")?; }
+        for id in ids { self.control(true, Some(&id))?; }
         Ok(())
     }
 }

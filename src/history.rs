@@ -159,23 +159,6 @@ pub fn effort(value: &str) -> Result<&str> {
         _ => Err("Effort must be minimal, low, medium, high, or xhigh".into()),
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Actor {
-    Human,
-    Planner,
-    Scheduler,
-    Worker,
-}
-impl Actor {
-    pub fn api(input: &Value) -> Result<Self> {
-        match input.get("actor").and_then(Value::as_str) {
-            None | Some("planner") => Ok(Self::Planner),
-            Some("human") => Ok(Self::Human),
-            _ => Err("Task API actor must be human or planner".into()),
-        }
-    }
-}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Event {
@@ -186,12 +169,11 @@ pub struct Event {
     pub attempt_id: Option<String>,
     pub at: u64,
     pub kind: String,
-    pub(crate) actor: Actor,
     provenance: String,
     pub evidence: Value,
 }
 impl Event {
-    pub fn new(task: &crate::engine::Task, kind: &str, actor: Actor, source: &str, evidence: Value) -> Self {
+    pub fn new(task: &crate::engine::Task, kind: &str, source: &str, evidence: Value) -> Self {
         Self {
             sequence: task.history.len() + 1,
             task_id: task.id.clone(),
@@ -200,7 +182,6 @@ impl Event {
             attempt_id: task.active.clone(),
             at: now(),
             kind: kind.into(),
-            actor,
             provenance: source.into(),
             evidence,
         }

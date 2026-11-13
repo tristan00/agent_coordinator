@@ -105,16 +105,6 @@ fn classification_schema_lists_registries() {
 }
 
 #[test]
-fn actor_api_accepts_only_human_or_planner() {
-    assert_eq!(Actor::api(&json!({})).unwrap(), Actor::Planner);
-    assert_eq!(Actor::api(&json!({"actor":"planner"})).unwrap(), Actor::Planner);
-    assert_eq!(Actor::api(&json!({"actor":"human"})).unwrap(), Actor::Human);
-    assert!(Actor::api(&json!({"actor":"worker"})).is_err());
-    assert!(Actor::api(&json!({"actor":"scheduler"})).is_err());
-    assert!(Actor::api(&json!({"actor":"Human"})).is_err());
-}
-
-#[test]
 fn usage_tokens_prefer_reported_total_over_components() {
     let components = json!({"fields":{"input_tokens":{"value":10},"output_tokens":{"value":5}}});
     let usage = |total: Option<u64>, components: Option<Value>| Usage { total_tokens: total, components, source: "test".into() };
@@ -138,11 +128,11 @@ fn events_number_sequentially_and_take_attempt_details() {
     let temp = crate::test_support::Temp::new();
     let mut task: crate::engine::Task = serde_json::from_value(json!({"id":"t","title":"T","outcome":"O","cwd":temp.path(),"acceptance":[],"dependencies":[],
         "stage":"implementation","stopped":false,"attempts":[],"active":"a1","feedback":[],"failure":"","retryAt":0,"revision":4})).unwrap();
-    let first = Event::new(&task, "created", Actor::Human, "test", json!({}));
-    assert_eq!((first.sequence, first.revision, first.attempt_id.as_deref(), first.actor), (1, 4, Some("a1"), Actor::Human));
+    let first = Event::new(&task, "created", "test", json!({}));
+    assert_eq!((first.sequence, first.revision, first.attempt_id.as_deref()), (1, 4, Some("a1")));
     task.history.push(first);
-    let second = Event::new(&task, "started", Actor::Worker, "test", Value::Null).attempt("a2", 3, Some(42));
+    let second = Event::new(&task, "started", "test", Value::Null).attempt("a2", 3, Some(42));
     assert_eq!((second.sequence, second.revision, second.attempt_id.as_deref(), second.at), (2, 3, Some("a2"), 42));
-    let unchanged = Event::new(&task, "x", Actor::Worker, "test", Value::Null);
+    let unchanged = Event::new(&task, "x", "test", Value::Null);
     assert_eq!(unchanged.clone().attempt("a3", 1, None).at, unchanged.at);
 }

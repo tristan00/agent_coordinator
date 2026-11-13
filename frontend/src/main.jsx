@@ -104,7 +104,7 @@ function App() {
     poll();
     return () => { live = false; clearTimeout(timer); };
   }, [refresh]);
-  async function act(path, method = 'POST', body = {actor: 'human', reason: 'User board control'}) {
+  async function act(path, method = 'POST', body = {}) {
     setError('');
     try { await api(path, method, body); await refresh(); return true; } catch (e) { setError(e.message); return false; }
   }
@@ -179,8 +179,8 @@ function Detail({task: t, byId, state, close, select, act, edit}) {
         <span className="pill">{t.status}</span><span>Stage {t.stage} · revision {t.revision}</span>
         {t.stage !== 'done' && <button onClick={() => act(`/api/tasks/${t.id}/${control}`)}>{control === 'resume' ? 'Resume' : 'Stop'}</button>}
         <button disabled={!!t.active} onClick={() => edit(t)}>Edit</button>
-        {t.stage !== 'done' && !t.container && <button disabled={!!t.active} onClick={() => act(`/api/tasks/${t.id}/replan`, 'POST', {actor: 'human', reason: 'User requested a new plan'})}>Replan</button>}
-        <button disabled={!!t.active} onClick={async () => { if (confirm('Archive this task?') && await act(`/api/tasks/${t.id}`, 'DELETE', {actor: 'human'})) close(); }}>Archive</button>
+        {t.stage !== 'done' && !t.container && <button disabled={!!t.active} onClick={() => act(`/api/tasks/${t.id}/replan`, 'POST')}>Replan</button>}
+        <button disabled={!!t.active} onClick={async () => { if (confirm('Archive this task?') && await act(`/api/tasks/${t.id}`, 'DELETE')) close(); }}>Archive</button>
       </div>
       <p className={`reason ${phase(t, state).tone}`}>{phase(t, state).text}</p>
       <p>{t.outcome}</p>
@@ -237,7 +237,7 @@ function Editor({task, tasks, state, workspace, close}) {
     if (invalid) {setError(invalid); return;}
     if ((!task || groupingChanged) && (!grouping || (grouping === 'parent' && !form.parent))) {setError('Choose Parent container or Standalone explicitly.'); return;}
     const acceptance = form.acceptance.map(c => c.trim()).filter(Boolean);
-    const body = {actor: 'human', title: form.title, outcome: form.outcome, acceptance, cwd: form.cwd,
+    const body = {title: form.title, outcome: form.outcome, acceptance, cwd: form.cwd,
       dependencies: form.dependencies, after: form.after, conflicts: form.conflicts, related: form.related,
       writable: form.writable.split('\n').map(w => w.trim()).filter(Boolean), model: form.model || null, effort: form.effort || null,
       attributes: {languages: form.languages, functions: form.functions, lane: form.lane, needs: form.needs, priority: Number(form.priority), size: form.size, artifact: form.artifact, deploy: form.deploy}};
@@ -315,7 +315,7 @@ function GroupEditor({tasks, state, workspace, close}) {
     if (!children.length) {setError('Add at least one child task.'); return;}
     const invalid = classificationError(container.attributes, state) || children.map(c => classificationError(c.attributes, state) || dependencyError(c.dependencies, dependencyReasons(state))).find(Boolean);
     if (invalid) {setError(invalid); return;}
-    const body = {actor: 'human', container: {...container, ...(grouping === 'parent' ? {parent, standalone: false} : {standalone: true})}, children: children.map(c => ({...c, acceptance: c.acceptance.map(v => v.trim()).filter(Boolean), dependencies: c.dependencies.map(d => ({...d, target: reference(d.target)})), after: c.after.map(reference)}))};
+    const body = {container: {...container, ...(grouping === 'parent' ? {parent, standalone: false} : {standalone: true})}, children: children.map(c => ({...c, acceptance: c.acceptance.map(v => v.trim()).filter(Boolean), dependencies: c.dependencies.map(d => ({...d, target: reference(d.target)})), after: c.after.map(reference)}))};
     if (body.children.some(c => !c.acceptance.length)) {setError('Every child needs an acceptance criterion.'); return;}
     const signature = JSON.stringify(body);
     if (replay.current?.signature !== signature) replay.current = {signature, requestKey: crypto.randomUUID()};

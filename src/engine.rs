@@ -1,4 +1,4 @@
-use crate::history::{self, Actor, Artifact, AttemptEvidence, Attributes, Event, Lane, Need, Size};
+use crate::history::{self, Artifact, AttemptEvidence, Attributes, Event, Lane, Need, Size};
 use crate::{Result, evidence, lock, metrics, now, process, read, require, write};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -187,13 +187,13 @@ impl Task {
             "dependencies":self.dependencies,"after":self.after,"parent":self.parent,"standalone":self.standalone,"conflicts":self.conflicts,"related":self.related,
             "writable":self.writable,"model":self.model,"effort":self.effort,"attributes":self.attributes,"definitionWords":self.definition_words()})
     }
-    pub fn record(&mut self, kind: &str, actor: Actor, source: &str, evidence: Value) {
-        self.history.push(Event::new(self, kind, actor, source, evidence));
+    pub fn record(&mut self, kind: &str, source: &str, evidence: Value) {
+        self.history.push(Event::new(self, kind, source, evidence));
     }
-    fn record_phase(&mut self, from: &str, actor: Actor, source: &str) {
+    fn record_phase(&mut self, from: &str, source: &str) {
         if from != self.stage {
             let stage = self.stage.clone();
-            self.record("phase_changed", actor, source, json!({"from":from,"to":stage}));
+            self.record("phase_changed", source, json!({"from":from,"to":stage}));
         }
     }
     pub fn brief(&self) -> Value {
@@ -261,7 +261,6 @@ struct Input {
 impl Input {
     fn parse(mut value: Value) -> Result<Self> {
         if let Some(object) = value.as_object_mut() {
-            object.remove("actor");
             object.remove("reason");
         }
         if let Some(value) = value.get("dependencies") {
@@ -556,7 +555,7 @@ impl State {
         }
         found
     }
-    fn insert(&mut self, value: Value, actor: Actor, parent_override: Option<String>) -> Result<String> {
+    fn insert(&mut self, value: Value, parent_override: Option<String>) -> Result<String> {
         let mut input = Input::parse(value)?;
         if let Some(parent) = parent_override {
             input.parent = Some(Some(parent));
@@ -574,7 +573,7 @@ impl State {
             && let Some(index) = self.tasks.iter().position(|task| task.key.as_ref() == Some(key) && task.workspace.as_ref() == Some(&directory) && (directory == run_directory || task.cwd == cwd))
         {
             let id = self.tasks[index].id.clone();
-            self.revise(index, input, actor, "keyed_create")?;
+            self.revise(index, input, "keyed_create")?;
             return Ok(id);
         }
         let supersedes = input.supersedes.clone().unwrap_or_default();
@@ -605,23 +604,23 @@ impl State {
                     }
                 }
                 if before != other.snapshot() {
-                    other.record("rewired", actor, "supersession", json!({"before":before,"after":other.snapshot()}));
+                    other.record("rewired", "supersession", json!({"before":before,"after":other.snapshot()}));
                 }
             }
             let mut retired = self.tasks.remove(index);
-            retired.record("superseded", actor, "create", json!({"by":id}));
+            retired.record("superseded", "create", json!({"by":id}));
             self.archived.push(retired);
         }
         let mut snapshot = task.snapshot();
         snapshot["supersedes"] = json!(supersedes);
-        task.record("created", actor, "create", snapshot);
+        task.record("created", "create", snapshot);
         self.tasks.push(task);
         for task in &self.tasks {
             self.check_relations(task)?;
         }
         Ok(id)
     }
-    fn insert_children(&mut self, parent: &str, children: &[Value], actor: Actor) -> Result<Value> {
+    fn insert_children(&mut self, parent: &str, children: &[Value]) -> Result<Value> {
         require(!children.is_empty(), "Children are required")?;
         let mut mapping = serde_json::Map::new();
         let mut definitions = Vec::new();
@@ -636,7 +635,7 @@ impl State {
             for field in ["dependencies", "after", "conflicts", "related"] {
                 initial.as_object_mut().unwrap().remove(field);
             }
-            let id = self.insert(initial, actor, Some(parent.to_owned()))?;
+            let id = self.insert(initial, Some(parent.to_owned()))?;
             mapping.insert(key, json!(id));
             definitions.push((id, value));
         }
@@ -666,14 +665,14 @@ impl State {
             self.check_definition(&self.tasks[index])?;
             let snapshot = self.tasks[index].snapshot();
             self.tasks[index].history.clear();
-            self.tasks[index].record("created", actor, "create", snapshot);
+            self.tasks[index].record("created", "create", snapshot);
         }
         for task in &self.tasks {
             self.check_relations(task)?;
         }
         Ok(Value::Object(mapping))
     }
-    fn revise(&mut self, index: usize, input: Input, actor: Actor, source: &str) -> Result<()> {
+    fn revise(&mut self, index: usize, input: Input, source: &str) -> Result<()> {
         require(input.supersedes.is_none(), "supersedes applies only when creating a task")?;
         let previous = self.tasks[index].clone();
         let mut task = previous.clone();
@@ -707,14 +706,14 @@ impl State {
                 if other.stage != "implementation" || other.attempts.iter().any(|a| a.revision == other.revision) {
                     let from = other.stage.clone();
                     other.reset_work();
-                    other.record("reopened", actor, source, json!({"causedBy":task.id}));
-                    other.record_phase(&from, actor, source);
+                    other.record("reopened", source, json!({"causedBy":task.id}));
+                    other.record_phase(&from, source);
                 }
             }
             task.reset_work();
         }
-        task.record(if corrective { "revised" } else { "updated" }, actor, source, task.snapshot());
-        task.record_phase(&previous.stage, actor, source);
+        task.record(if corrective { "revised" } else { "updated" }, source, task.snapshot());
+        task.record_phase(&previous.stage, source);
         self.tasks[index] = task;
         for task in &self.tasks {
             self.check_relations(task)?;
@@ -738,8 +737,8 @@ impl State {
                 let task = &mut self.tasks[index];
                 let from = task.stage.clone();
                 task.stage = stage.into();
-                task.record(if done { "children_done" } else { "reopened" }, Actor::Scheduler, "containment", json!({}));
-                task.record_phase(&from, Actor::Scheduler, "containment");
+                task.record(if done { "children_done" } else { "reopened" }, "containment", json!({}));
+                task.record_phase(&from, "containment");
                 changed = true;
             }
         }
@@ -811,7 +810,7 @@ impl Engine {
                     grouping.apply(task)?;
                     task.dependencies = dependencies(&decision["dependencies"])?;
                     task.after = serde_json::from_value(decision["after"].clone())?;
-                    task.record("relationships_classified", Actor::Human, "relationship-plan.json", json!({"before":before,"after":task.snapshot()}));
+                    task.record("relationships_classified", "relationship-plan.json", json!({"before":before,"after":task.snapshot()}));
                 }
             }
         }
@@ -841,7 +840,7 @@ impl Engine {
                 task.stage = "replan".into();
                 task.blocked = false;
                 task.feedback = vec!["Legacy definition violates current limits; rewrite it with typed attributes and relations".into()];
-                task.record_phase(&from, Actor::Scheduler, "migration");
+                task.record_phase(&from, "migration");
             }
         }
         state.schema_version = Some(history::SCHEMA_VERSION);
@@ -912,14 +911,12 @@ impl Engine {
         Ok(value)
     }
     pub fn create(&mut self, input: Value) -> Result<Value> {
-        let actor = Actor::api(&input)?;
-        let id = self.change(|state| Ok(json!(state.insert(input, actor, None)?)))?;
+        let id = self.change(|state| Ok(json!(state.insert(input, None)?)))?;
         self.task_value(&self.state.tasks[self.task(id.as_str().unwrap())?], false)
     }
     pub fn create_batch(&mut self, input: Value) -> Result<Value> {
-        let actor = Actor::api(&input)?;
         let object = input.as_object().ok_or("Batch must be an object")?;
-        require(object.keys().all(|k| ["requestKey", "container", "children", "actor"].contains(&k.as_str())), "Unknown batch field")?;
+        require(object.keys().all(|k| ["requestKey", "container", "children"].contains(&k.as_str())), "Unknown batch field")?;
         let key = input["requestKey"].as_str().filter(|s| !s.trim().is_empty()).ok_or("requestKey is required")?.to_owned();
         if let Some(receipt) = self.state.batches.get(&key) {
             require(receipt["input"] == input, "Conflicting request replay")?;
@@ -929,23 +926,21 @@ impl Engine {
             let container = input["container"].clone();
             let parsed = Input::parse(container.clone())?;
             require(parsed.key.is_none() && parsed.supersedes.is_none(), "Batch container cannot replace existing tasks")?;
-            let id = state.insert(container, actor, None)?;
+            let id = state.insert(container, None)?;
             require(state.get(&id).unwrap().container(), "Container must have no acceptance criteria")?;
             let children = input["children"].as_array().ok_or("Children must be an array")?;
-            let mapping = state.insert_children(&id, children, actor)?;
+            let mapping = state.insert_children(&id, children)?;
             let result = json!({"container":id,"children":mapping});
             state.batches.insert(key, json!({"input":input,"result":result}));
             Ok(result)
         })
     }
     pub fn edit(&mut self, id: &str, input: Value) -> Result<Value> {
-        let actor = Actor::api(&input)?;
         let index = self.task(id)?;
-        self.change(|state| state.revise(index, Input::parse(input)?, actor, "edit").map(|()| Value::Null))?;
+        self.change(|state| state.revise(index, Input::parse(input)?, "edit").map(|()| Value::Null))?;
         self.task_value(&self.state.tasks[index], false)
     }
     pub fn request_replan(&mut self, id: &str, input: Value) -> Result<Value> {
-        let actor = Actor::api(&input)?;
         let index = self.task(id)?;
         self.change(|state| {
             let limits = state.limits(&state.tasks[index]);
@@ -958,13 +953,13 @@ impl Engine {
             if let Some(reason) = input["reason"].as_str().filter(|r| !r.trim().is_empty()) {
                 task.feedback = vec![history::clip(reason, limits.finding_words)];
             }
-            task.record("replan_requested", actor, "api", json!({"reason":input["reason"]}));
-            task.record_phase(&from, actor, "api");
+            task.record("replan_requested", "api", json!({"reason":input["reason"]}));
+            task.record_phase(&from, "api");
             Ok(Value::Null)
         })?;
         self.task_value(&self.state.tasks[index], false)
     }
-    pub fn remove(&mut self, id: &str, actor: Actor) -> Result<()> {
+    pub fn remove(&mut self, id: &str) -> Result<()> {
         let index = self.task(id)?;
         let task = &self.state.tasks[index];
         require(task.active.is_none(), "Task has an active worker")?;
@@ -976,15 +971,13 @@ impl Engine {
                 other.conflicts.retain(|c| c != id);
                 other.related.retain(|c| c != id);
             }
-            task.record(if task.stage == "done" { "archived" } else { "abandoned" }, actor, "delete", Value::Null);
+            task.record(if task.stage == "done" { "archived" } else { "abandoned" }, "delete", Value::Null);
             state.archived.push(task);
             Ok(Value::Null)
         })
         .map(drop)
     }
-    pub fn wipe(&mut self, input: Value) -> Result<Value> {
-        require(input["confirm"] == "wipe everything", "Send {\"actor\":\"human\",\"confirm\":\"wipe everything\"}; this permanently deletes every task, workspace directory, attempt, batch and benchmark run with no backup")?;
-        require(Actor::api(&input)? == Actor::Human, "Only an explicit user action can wipe the coordinator")?;
+    pub fn wipe(&mut self) -> Result<Value> {
         let active: Vec<String> = self.state.tasks.iter().filter_map(|t| t.active.clone()).collect();
         for id in &active {
             self.signal_stop(id)?;
@@ -1055,24 +1048,15 @@ impl Engine {
         })
         .map(drop)
     }
-    pub fn control_as(&mut self, stop: bool, id: Option<&str>, actor: Actor, reason: &str) -> Result<()> {
-        require(id.is_some() || actor == Actor::Human, "Only an explicit user action can control all workspaces")?;
-        require(!reason.trim().is_empty(), "Control requires a reason")?;
+    pub fn control(&mut self, stop: bool, id: Option<&str>) -> Result<()> {
         if let Some(id) = id {
             self.task(id)?;
-        }
-        if let (false, Some(id)) = (stop, id)
-            && actor != Actor::Human
-        {
-            let task = &self.state.tasks[self.task(id)?];
-            let user_stop = task.stopped && task.history.iter().rev().find(|e| matches!(e.kind.as_str(), "stopped" | "resumed")).is_some_and(|e| e.actor == Actor::Human);
-            require(!user_stop, "An explicit user task stop requires user resume authority")?;
         }
         let paused = self.state.paused;
         self.change(|state| {
             if id.is_none() {
                 if paused != stop {
-                    state.controls.push(json!({"at":now(),"actor":actor,"reason":reason,"paused":stop}));
+                    state.controls.push(json!({"at":now(),"paused":stop}));
                 }
                 state.paused = stop;
                 if !stop {
@@ -1091,7 +1075,7 @@ impl Engine {
                     task.retry_at = 0;
                 }
                 if changed {
-                    task.record(if stop { "stopped" } else { "resumed" }, actor, "control", json!({"scope":if id.is_some() {"task"} else {"board"},"reason":reason}));
+                    task.record(if stop { "stopped" } else { "resumed" }, "control", json!({"scope":if id.is_some() {"task"} else {"board"}}));
                 }
             }
             Ok(Value::Null)
@@ -1189,7 +1173,7 @@ impl Engine {
             }
             let task = &mut state.tasks[index];
             task.active = Some(attempt.id.clone());
-            task.record("dispatched", Actor::Scheduler, "dispatch", json!({"stage":stage,"started":attempt.started}));
+            task.record("dispatched", "dispatch", json!({"stage":stage,"started":attempt.started}));
             task.attempts.push(attempt);
             Ok(Value::Null)
         })?;
@@ -1202,7 +1186,7 @@ impl Engine {
             attempt.evidence.launch = Some(read(&directory.join("run.json"))?);
             let started = attempt.evidence.launch.as_ref().map(|run| run.started);
             let (id, revision) = (attempt.id.clone(), attempt.revision);
-            let event = Event::new(task, "started", Actor::Worker, "supervisor", json!("run.json")).attempt(&id, revision, started);
+            let event = Event::new(task, "started", "supervisor", json!("run.json")).attempt(&id, revision, started);
             task.history.push(event);
             changed = true;
         }
@@ -1287,7 +1271,7 @@ impl Engine {
             if let Some(links) = plan.get("dependencies") {
                 value["dependencies"] = links.clone();
             }
-            state.revise(index, Input::parse(value)?, Actor::Planner, "replan")?;
+            state.revise(index, Input::parse(value)?, "replan")?;
             require(state.tasks[index].stage != "replan", "Plan did not change the task definition")?;
             return inherit(state, &task.id);
         }
@@ -1295,7 +1279,7 @@ impl Engine {
         if let Some(links) = plan.get("dependencies") {
             value["dependencies"] = links.clone();
         }
-        state.revise(index, Input::parse(value)?, Actor::Planner, "replan")?;
+        state.revise(index, Input::parse(value)?, "replan")?;
         let mut definitions = Vec::new();
         for (index, child) in children.iter().enumerate() {
             let mut value = base(child, false, false);
@@ -1313,7 +1297,7 @@ impl Engine {
             value["dependencies"] = links;
             definitions.push(value);
         }
-        let mapping = state.insert_children(&task.id, &definitions, Actor::Planner)?;
+        let mapping = state.insert_children(&task.id, &definitions)?;
         mapping.as_object().into_iter().flat_map(|m| m.values()).filter_map(Value::as_str).try_for_each(|id| inherit(state, id))
     }
     fn collect(&mut self, index: usize, exit: Value) -> Result<()> {
@@ -1412,9 +1396,9 @@ impl Engine {
         }
         let attempt = task.attempts.last().unwrap();
         let kind = attempt.status().unwrap_or(if stopped { "attempt_stopped" } else { "attempt_failed" }).to_owned();
-        let event = Event::new(task, &kind, Actor::Worker, "attempt_collection", json!({"currentRevision":current,"error":attempt.error,"ended":attempt.ended})).attempt(&attempt.id, attempt.revision, attempt.ended);
+        let event = Event::new(task, &kind, "attempt_collection", json!({"currentRevision":current,"error":attempt.error,"ended":attempt.ended})).attempt(&attempt.id, attempt.revision, attempt.ended);
         task.history.push(event);
-        task.record_phase(&previous_stage, Actor::Scheduler, "attempt_collection");
+        task.record_phase(&previous_stage, "attempt_collection");
         evidence::clean_scratch(&directory, task.attempts.last().unwrap());
         let task_id = task.id.clone();
         self.commit(state)?;
@@ -1493,7 +1477,7 @@ impl Engine {
         let mut state = self.state.clone();
         for (task, reason) in state.tasks.iter_mut().zip(reasons) {
             if reason != task.recorded_wait {
-                task.record("waiting_changed", Actor::Scheduler, "scheduler", json!({"reason":reason}));
+                task.record("waiting_changed", "scheduler", json!({"reason":reason}));
                 task.recorded_wait = reason;
             }
         }

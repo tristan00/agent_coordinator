@@ -110,15 +110,11 @@ fn task_routes_create_edit_replan_and_delete() {
     assert_eq!(site.engine.state.tasks[0].outcome, "Edited outcome");
     site.send(api(Method::Post, &format!("/api/tasks/{id}/replan"), json!({"reason":"Rethink"})));
     assert_eq!(site.engine.state.tasks[0].stage, "replan");
-    site.send(api(Method::Post, &format!("/api/tasks/{id}/stop"), json!({"actor":"human"})));
-    assert!(!site.engine.state.tasks[0].stopped);
-    site.send(api(Method::Post, &format!("/api/tasks/{id}/stop"), json!({"actor":"human","reason":"Pause it"})));
+    site.send(api(Method::Post, &format!("/api/tasks/{id}/stop"), json!({})));
     assert!(site.engine.state.tasks[0].stopped);
-    site.send(api(Method::Post, &format!("/api/tasks/{id}/resume"), json!({"actor":"planner","reason":"Go"})));
-    assert!(site.engine.state.tasks[0].stopped);
-    site.send(api(Method::Post, &format!("/api/tasks/{id}/resume"), json!({"actor":"human","reason":"Go"})));
+    site.send(api(Method::Post, &format!("/api/tasks/{id}/resume"), json!({})));
     assert!(!site.engine.state.tasks[0].stopped);
-    site.send(api(Method::Delete, &format!("/api/tasks/{id}"), json!({"actor":"human"})));
+    site.send(api(Method::Delete, &format!("/api/tasks/{id}"), json!({})));
     assert!(site.engine.state.tasks.is_empty());
     assert_eq!(site.engine.state.archived.len(), 1);
 }
@@ -126,11 +122,9 @@ fn task_routes_create_edit_replan_and_delete() {
 #[test]
 fn board_and_batch_routes_apply_their_effects() {
     let mut site = Site::new();
-    site.send(api(Method::Post, "/api/stop", json!({"reason":"Planner pause"})));
-    assert!(!site.engine.state.paused);
-    site.send(api(Method::Post, "/api/stop", json!({"actor":"human","reason":"Pause"})));
+    site.send(api(Method::Post, "/api/stop", json!({})));
     assert!(site.engine.state.paused);
-    site.send(api(Method::Post, "/api/resume", json!({"actor":"human","reason":"Resume"})));
+    site.send(api(Method::Post, "/api/resume", json!({})));
     assert!(!site.engine.state.paused);
     let container = merge(site.spec("Group"), json!({"acceptance":[]}));
     let batch = json!({"requestKey":"web-1","container":container,"children":[{"localKey":"a","title":"Child","outcome":"o","acceptance":["c"]}]});

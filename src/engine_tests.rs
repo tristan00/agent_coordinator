@@ -66,7 +66,7 @@ impl Board {
             let task = &mut state.tasks[index];
             let stage = task.stage.clone();
             task.active = Some(attempt_id.clone());
-            task.record("dispatched", Actor::Scheduler, "dispatch", json!({"stage":stage}));
+            task.record("dispatched", "dispatch", json!({"stage":stage}));
             let evidence = AttemptEvidence { configuration: Some(json!({"scratch":true})), ..Default::default() };
             task.attempts.push(Attempt { id: attempt_id, revision: task.revision, stage, started: now(), ended: None, result: None, error: None, evidence });
         });
@@ -126,7 +126,7 @@ fn stage_transitions_and_worker_statuses_define_the_pipeline() {
 #[test]
 fn minimal_standalone_task_is_created_in_its_canonical_workspace() {
     let mut board = Board::new();
-    let created = board.engine.create(board.with("  Build the parser  ", json!({"actor":"human"}))).unwrap();
+    let created = board.engine.create(board.with("  Build the parser  ", json!({}))).unwrap();
     assert_eq!(created["status"], "To do");
     assert_eq!(created["container"], false);
     assert_eq!(created["definitionWords"], 3 + 4 + 3);
@@ -137,7 +137,7 @@ fn minimal_standalone_task_is_created_in_its_canonical_workspace() {
     assert_eq!(task.workspace.as_deref(), Some(board.ws.as_path()));
     assert_eq!((task.stage.as_str(), task.revision, task.status()), ("implementation", 0, "To do"));
     assert_eq!(task.history.len(), 1);
-    assert_eq!((task.history[0].kind.as_str(), task.history[0].actor), ("created", Actor::Human));
+    assert_eq!(task.history[0].kind, "created");
     assert!(read::<Value>(&board.engine.directory.join("state.json")).unwrap()["tasks"][0]["id"] == id);
 }
 
@@ -246,14 +246,6 @@ fn grouping_requires_exactly_one_of_parent_or_standalone() {
     assert!(board.edit_error(&child, json!({"parent":null})).contains("Choose exactly one grouping"));
     board.engine.edit(&child, json!({"parent":null,"standalone":true})).unwrap();
     assert!(board.task(&child).standalone && board.task(&child).parent.is_none());
-}
-
-#[test]
-fn api_actor_must_be_human_or_planner() {
-    let mut board = Board::new();
-    assert!(board.fail(board.with("Title", json!({"actor":"worker"}))).contains("actor must be human or planner"));
-    let id = board.add("Planner default");
-    assert_eq!(board.task(&id).history[0].actor, Actor::Planner);
 }
 
 #[test]
@@ -398,18 +390,18 @@ fn remove_archives_leaves_and_refuses_referenced_or_active_tasks() {
     let a = board.add("Alpha");
     let b = board.create(board.with("Beta", json!({"after":[a]})));
     let c = board.create(board.with("Gamma", json!({"conflicts":[a],"related":[a]})));
-    assert!(board.engine.remove(&a, Actor::Human).unwrap_err().to_string().contains("children or dependents"));
-    board.engine.remove(&b, Actor::Human).unwrap();
+    assert!(board.engine.remove(&a).unwrap_err().to_string().contains("children or dependents"));
+    board.engine.remove(&b).unwrap();
     assert_eq!(board.engine.state.archived[0].history.last().unwrap().kind, "abandoned");
-    board.engine.remove(&a, Actor::Planner).unwrap();
+    board.engine.remove(&a).unwrap();
     assert!(board.task(&c).conflicts.is_empty() && board.task(&c).related.is_empty());
     board.accept(&c);
-    board.engine.remove(&c, Actor::Human).unwrap();
+    board.engine.remove(&c).unwrap();
     assert_eq!(board.engine.state.archived.last().unwrap().history.last().unwrap().kind, "archived");
     let d = board.add("Delta");
     board.dispatch(&d);
-    assert!(board.engine.remove(&d, Actor::Human).unwrap_err().to_string().contains("active worker"));
-    assert!(board.engine.remove("missing", Actor::Human).is_err());
+    assert!(board.engine.remove(&d).unwrap_err().to_string().contains("active worker"));
+    assert!(board.engine.remove("missing").is_err());
 }
 
 #[test]
@@ -427,7 +419,7 @@ fn waiting_reasons_cover_dependencies_ordering_conflicts_and_holds() {
     assert_eq!(board.waiting(&d).as_deref(), Some("Conflicts with running Alpha"));
     assert_eq!(board.waiting(&a), None);
     board.finish(&a, json!({"stopped":true,"code":1,"ended":now()}), None);
-    board.engine.control_as(true, Some(&a), Actor::Human, "pause alpha").unwrap();
+    board.engine.control(true, Some(&a)).unwrap();
     assert_eq!(board.waiting(&c), None);
     assert_eq!(board.waiting(&b).as_deref(), Some("Waiting for result from Alpha"));
     let future = now() + 60_000;
@@ -438,7 +430,7 @@ fn waiting_reasons_cover_dependencies_ordering_conflicts_and_holds() {
         state.tasks.iter_mut().filter(|t| t.id == c).for_each(|t| t.retry_at = future);
     });
     assert_eq!(board.waiting(&c), Some(format!("Retry scheduled at {future}")));
-    board.engine.control_as(true, None, Actor::Human, "pause board").unwrap();
+    board.engine.control(true, None).unwrap();
     assert_eq!(board.waiting(&b), None);
 }
 
@@ -562,7 +554,7 @@ fn successful_replan_revises_the_task_and_a_second_failure_is_held() {
     assert_eq!((task.stage.as_str(), task.revision, task.replanned, task.strikes()), ("implementation", 1, true, 0));
     assert_eq!((task.title.as_str(), task.acceptance[0].as_str()), ("Revised title", "A different criterion holds"));
     assert!(task.inherited.is_empty());
-    assert!(task.history.iter().any(|e| e.kind == "revised" && e.actor == Actor::Planner));
+    assert!(task.history.iter().any(|e| e.kind == "revised"));
     board.run(&id, json!({"status":"completed","summary":"Could not","criteria":["blocked"],"findings":["Missing access"]}));
     let task = board.task(&id);
     assert_eq!((task.stage.as_str(), task.blocked), ("replan", true));
@@ -607,7 +599,7 @@ fn replans_repeating_a_twice_failed_criterion_are_refused_then_held() {
     assert!(task.blocked);
     assert_eq!(task.failure, "Replanning failed twice; a decision is needed");
     board.mutate(|state| state.tasks[0].attempts.iter_mut().for_each(|a| a.started -= 10_000));
-    board.engine.control_as(false, Some(&id), Actor::Human, "decided").unwrap();
+    board.engine.control(false, Some(&id)).unwrap();
     assert!(!board.task(&id).blocked);
     board.run(&id, plan("First criterion holds"));
     assert!(!board.task(&id).blocked);
@@ -740,7 +732,7 @@ fn usage_limit_logs_hold_dispatch_without_counting_failures() {
     assert_eq!(board.engine.notices.last().unwrap()["event"], "usage_limit");
     assert_eq!((board.task(&id).failure.as_str(), board.task(&id).retry_at), ("", 0));
     assert!(board.waiting(&id).unwrap().starts_with("Usage limit"));
-    board.engine.control_as(false, None, Actor::Human, "resume").unwrap();
+    board.engine.control(false, None).unwrap();
     assert_eq!(board.engine.state.hold_until, 0);
     board.dispatch(&id);
     fs::write(board.directory(&id).join("log.txt"), "usage limit reached\n").unwrap();
@@ -802,7 +794,7 @@ fn editing_a_prerequisite_reopens_dependents_transitively() {
     board.run(&b, outcome("completed", &["passed"]));
     board.run(&c, outcome("completed", &["passed"]));
     board.accept(&ordered);
-    board.engine.edit(&a, json!({"outcome":"A corrected outcome","actor":"human"})).unwrap();
+    board.engine.edit(&a, json!({"outcome":"A corrected outcome"})).unwrap();
     let task = board.task(&a);
     assert_eq!((task.stage.as_str(), task.revision), ("implementation", 1));
     assert_eq!(task.history.last().unwrap().kind, "phase_changed");
@@ -862,7 +854,6 @@ fn request_replan_validates_target_and_clips_reason() {
     board.dispatch(&active);
     assert!(board.engine.request_replan(&active, json!({})).is_err());
     let id = board.add("Alpha");
-    assert!(board.engine.request_replan(&id, json!({"actor":"worker"})).is_err());
     let value = board.engine.request_replan(&id, json!({"reason":"word ".repeat(45)})).unwrap();
     assert_eq!(value["status"], "In progress");
     let task = board.task(&id);
@@ -874,36 +865,33 @@ fn request_replan_validates_target_and_clips_reason() {
 }
 
 #[test]
-fn control_requires_reasons_and_respects_user_stops() {
+fn control_stops_and_resumes_tasks_and_the_board() {
     let mut board = Board::new();
     let id = board.add("Alpha");
-    assert!(board.engine.control_as(true, None, Actor::Planner, "pause").unwrap_err().to_string().contains("explicit user action"));
-    assert!(board.engine.control_as(true, Some(&id), Actor::Human, " ").unwrap_err().to_string().contains("requires a reason"));
-    board.engine.control_as(true, Some(&id), Actor::Human, "hold on").unwrap();
+    board.engine.control(true, Some(&id)).unwrap();
     assert!(board.task(&id).stopped);
-    assert!(board.engine.control_as(false, Some(&id), Actor::Planner, "go").unwrap_err().to_string().contains("user resume authority"));
-    board.engine.control_as(false, Some(&id), Actor::Human, "go").unwrap();
+    board.engine.control(false, Some(&id)).unwrap();
     assert!(!board.task(&id).stopped);
-    board.engine.control_as(true, Some(&id), Actor::Planner, "planner hold").unwrap();
-    board.engine.control_as(false, Some(&id), Actor::Planner, "planner go").unwrap();
+    board.engine.control(true, Some(&id)).unwrap();
+    board.engine.control(false, Some(&id)).unwrap();
     let events = board.kinds(&id).iter().filter(|k| *k == "stopped" || *k == "resumed").count();
     assert_eq!(events, 4);
-    board.engine.control_as(false, Some(&id), Actor::Planner, "again").unwrap();
+    board.engine.control(false, Some(&id)).unwrap();
     assert_eq!(board.kinds(&id).iter().filter(|k| *k == "resumed").count(), 2);
-    board.engine.control_as(true, None, Actor::Human, "board pause").unwrap();
-    board.engine.control_as(true, None, Actor::Human, "board pause again").unwrap();
+    board.engine.control(true, None).unwrap();
+    board.engine.control(true, None).unwrap();
     assert!(board.engine.state.paused);
     assert_eq!(board.engine.state.controls.len(), 1);
     assert_eq!(board.task(&id).history.last().unwrap().evidence["scope"], "board");
-    board.engine.control_as(false, None, Actor::Human, "board resume").unwrap();
+    board.engine.control(false, None).unwrap();
     assert!(!board.engine.state.paused);
-    assert!(board.engine.control_as(false, Some("missing"), Actor::Planner, "x").is_err());
+    assert!(board.engine.control(false, Some("missing")).is_err());
 }
 
 #[test]
 fn stopping_an_unknown_task_is_rejected() {
     let mut board = Board::new();
-    assert!(board.engine.control_as(true, Some("missing"), Actor::Human, "stop").is_err());
+    assert!(board.engine.control(true, Some("missing")).is_err());
 }
 
 #[test]
@@ -911,7 +899,7 @@ fn stopping_an_active_task_signals_its_attempt() {
     let mut board = Board::new();
     let id = board.add("Alpha");
     let attempt = board.dispatch(&id);
-    board.engine.control_as(true, Some(&id), Actor::Human, "halt").unwrap();
+    board.engine.control(true, Some(&id)).unwrap();
     assert!(board.engine.attempt_path(&attempt).join("stop").exists());
 }
 
@@ -930,7 +918,7 @@ fn sync_waiting_records_reason_changes_once() {
 }
 
 fn batch(board: &Board) -> Value {
-    json!({"requestKey":"req-1","actor":"human","container":board.container("Feature"),"children":[
+    json!({"requestKey":"req-1","container":board.container("Feature"),"children":[
         {"localKey":"schema","title":"Define schema","outcome":"Schema exists","acceptance":["Schema validates"]},
         {"localKey":"api","title":"Serve api","outcome":"Api serves","acceptance":["Api responds"],
             "dependencies":[{"target":{"local":"schema"},"reason":"uses_schema"}],"after":[{"local":"schema"}],"related":[{"local":"schema"}]}]})
@@ -949,7 +937,7 @@ fn batch_creates_a_container_with_locally_linked_children() {
         let task = board.task(id);
         assert_eq!((task.parent.as_deref(), task.cwd.as_str()), (Some(container.as_str()), board.ws.to_str().unwrap()));
         assert_eq!(task.history.len(), 1);
-        assert_eq!((task.history[0].kind.as_str(), task.history[0].actor), ("created", Actor::Human));
+        assert_eq!(task.history[0].kind, "created");
     }
     let task = board.task(&api);
     assert_eq!(task.dependencies, [Dependency { target: schema.clone(), reason: Some(DependencyReason::Schema) }]);
@@ -969,9 +957,6 @@ fn batch_replay_is_idempotent_and_conflicting_replay_is_rejected() {
     let mut changed = input.clone();
     changed["children"][0]["title"] = json!("Define the schema");
     assert!(board.engine.create_batch(changed).unwrap_err().to_string().contains("Conflicting request replay"));
-    let mut actor = input.clone();
-    actor["actor"] = json!("planner");
-    assert!(board.engine.create_batch(actor).unwrap_err().to_string().contains("Conflicting request replay"));
     let mut other = input;
     other["requestKey"] = json!("req-2");
     let second = board.engine.create_batch(other).unwrap();
@@ -991,7 +976,6 @@ fn batch_rejects_invalid_shapes_atomically() {
     missing.as_object_mut().unwrap().remove("requestKey");
     cases.push((missing, "requestKey is required"));
     cases.push((merge(valid.clone(), json!({"requestKey":"  "})), "requestKey is required"));
-    cases.push((merge(valid.clone(), json!({"actor":"worker"})), "actor must be human or planner"));
     cases.push((merge(valid.clone(), json!({"container":board.spec("Leafy")})), "Container must have no acceptance criteria"));
     cases.push((merge(valid.clone(), json!({"container":merge(board.container("Keyed"), json!({"key":"k"}))})), "cannot replace existing tasks"));
     cases.push((merge(valid.clone(), json!({"children":[]})), "Children are required"));
@@ -1048,7 +1032,7 @@ fn updates_cursor_returns_only_tasks_changed_after_the_sequence() {
     assert_eq!(board.engine.state.sequence, 3);
     assert_eq!(board.task(&a).changed, 3);
     assert_eq!(board.task(&b).changed, 2);
-    board.engine.remove(&b, Actor::Human).unwrap();
+    board.engine.remove(&b).unwrap();
     assert_eq!(board.engine.updates(None, Some(3), "")["ids"], json!([a]));
     assert!(board.engine.changed_since(None, Some(3)));
 }
@@ -1068,7 +1052,7 @@ fn updates_are_scoped_by_workspace_with_board_wide_changes_visible_everywhere() 
     assert_eq!(scoped["tasks"].as_array().unwrap().len(), 1);
     assert!(board.engine.updates(Some(&ws), Some(start), "")["tasks"].as_array().unwrap().is_empty());
     let paused = board.engine.state.sequence;
-    board.engine.control_as(true, None, Actor::Human, "pause").unwrap();
+    board.engine.control(true, None).unwrap();
     assert!(board.engine.changed_since(Some(&ws), Some(paused)));
     assert_eq!(board.engine.updates(Some(&ws), None, "")["paused"], true);
     let settings = board.engine.state.sequence;
@@ -1185,7 +1169,7 @@ fn relationship_plan_classifies_schema_three_tasks() {
     assert!(b.standalone);
     assert_eq!(b.dependencies, [Dependency { target: "a".into(), reason: Some(DependencyReason::Data) }]);
     let event = b.history.last().unwrap();
-    assert_eq!((event.kind.as_str(), event.actor), ("relationships_classified", Actor::Human));
+    assert_eq!(event.kind, "relationships_classified");
     assert_eq!(engine.state.waiting_reason(b).as_deref(), Some("Waiting for result from Legacy task"));
 }
 
@@ -1352,7 +1336,7 @@ fn only_implementation_runs_on_the_chosen_model() {
 }
 
 #[test]
-fn wipe_deletes_every_task_workspace_and_attempt_after_explicit_confirmation() {
+fn wipe_deletes_every_task_workspace_and_attempt() {
     let temp = crate::test_support::Temp::new();
     let mut engine = temp.engine();
     let ws = temp.dir("workspace");
@@ -1364,10 +1348,8 @@ fn wipe_deletes_every_task_workspace_and_attempt_after_explicit_confirmation() {
     engine.commit(state).unwrap();
     engine.create(json!({"title":"Task","outcome":"Done","cwd":ws,"acceptance":["Works"],"standalone":true})).unwrap();
     fs::create_dir_all(engine.attempt_path("old")).unwrap();
-    assert!(engine.wipe(json!({"actor":"human"})).unwrap_err().to_string().contains("wipe everything"));
-    assert!(engine.wipe(json!({"confirm":"wipe everything"})).unwrap_err().to_string().contains("explicit user"));
     assert_eq!(engine.state.tasks.len(), 1);
-    let report = engine.wipe(json!({"actor":"human","confirm":"wipe everything"})).unwrap();
+    let report = engine.wipe().unwrap();
     assert_eq!((report["deleted"]["tasks"].as_u64(), report["deleted"]["workspaces"].as_u64()), (Some(1), Some(1)));
     assert_eq!(report["errors"], json!([]));
     assert!(!ws.exists() && !engine.directory.join("attempts").exists());

@@ -1,5 +1,5 @@
 use crate::engine::{Engine, Task, covers, resolve_scope_path};
-use crate::{Result, history::Actor, lock, process::local_json, write};
+use crate::{Result, lock, process::local_json, write};
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
@@ -137,7 +137,6 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
         let mut body = String::new();
         request.as_reader().read_to_string(&mut body)?;
         let input: Value = serde_json::from_str(if body.is_empty() { "{}" } else { &body })?;
-        let reason = || input["reason"].as_str().ok_or("Control requires an explicit reason");
         match (method.as_str(), parts.as_slice()) {
             ("POST", ["", "api", "deployment"]) => crate::redeploy::enqueue(input, &engine.directory, port),
             ("POST", ["", "api", "deployment", "quiesce"]) => {
@@ -153,18 +152,18 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
                 *shutdown = true;
                 Ok(event)
             }
-            ("POST", ["", "api", "wipe"]) => engine.wipe(input),
+            ("POST", ["", "api", "wipe"]) => engine.wipe(),
             ("POST", ["", "api", "tasks"]) => engine.create(input),
             ("POST", ["", "api", "workspaces"]) => crate::workspace_prompts::create(engine, input, &crate::workspace_prompts::root()),
             ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input),
             ("PATCH", ["", "api", "tasks", id]) => engine.edit(id, input),
             ("POST", ["", "api", "tasks", id, "replan"]) => engine.request_replan(id, input),
-            ("DELETE", ["", "api", "tasks", id]) => engine.remove(id, Actor::api(&input)?).map(|()| json!({"ok":true})),
+            ("DELETE", ["", "api", "tasks", id]) => engine.remove(id).map(|()| json!({"ok":true})),
             ("PUT", ["", "api", "config"]) => engine.configure(input).map(|()| json!({"ok":true})),
             ("POST", ["", "api", "benchmark-runs"]) => engine.register_benchmark(input),
             ("POST", ["", "api", "benchmark-runs", id, "stop"]) => engine.stop_benchmark(id),
-            ("POST", ["", "api", action @ ("stop" | "resume")]) => engine.control_as(*action == "stop", None, Actor::api(&input)?, reason()?).map(|()| json!({"ok":true})),
-            ("POST", ["", "api", "tasks", id, action @ ("stop" | "resume")]) => engine.control_as(*action == "stop", Some(id), Actor::api(&input)?, reason()?).map(|()| json!({"ok":true})),
+            ("POST", ["", "api", action @ ("stop" | "resume")]) => engine.control(*action == "stop", None).map(|()| json!({"ok":true})),
+            ("POST", ["", "api", "tasks", id, action @ ("stop" | "resume")]) => engine.control(*action == "stop", Some(id)).map(|()| json!({"ok":true})),
             _ => Err("Unknown route".into()),
         }
     })();

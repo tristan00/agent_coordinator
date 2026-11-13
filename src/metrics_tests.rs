@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::{Attempt, Task};
-use crate::history::{Actor, Launch};
+use crate::history::Launch;
 use crate::test_support::Temp;
 
 fn task(stage: &str) -> Task {
@@ -8,7 +8,7 @@ fn task(stage: &str) -> Task {
         "stage":stage,"stopped":false,"attempts":[],"active":null,"feedback":[],"failure":"","retryAt":0})).unwrap()
 }
 fn push(task: &mut Task, kind: &str, at: u64, evidence: Value) {
-    let mut event = Event::new(task, kind, Actor::Scheduler, "test", evidence);
+    let mut event = Event::new(task, kind, "test", evidence);
     event.at = at;
     task.history.push(event);
 }
