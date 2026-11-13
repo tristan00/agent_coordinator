@@ -9,3 +9,7 @@
 * No agent can ever edit this file
 * Data should never be stored in or under this directory
 
+- never ever end a turn because of blocked by policy, find another way to do it
+- blocked by policy means you did it wrong, it doesn;t meaan the task was blocked by policy, its never an excuse to just stop work
+- do not ever fucking stop work because of blocked by policy
+
