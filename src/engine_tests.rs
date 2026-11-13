@@ -36,12 +36,12 @@ impl Board {
     }
     fn fail(&mut self, value: Value) -> String {
         let before = self.engine.state.tasks.len();
-        let error = self.engine.create(value).err().expect("create should fail").to_string();
+        let error = self.engine.create(value).expect_err("create should fail").to_string();
         assert_eq!(self.engine.state.tasks.len(), before);
         error
     }
     fn edit_error(&mut self, id: &str, patch: Value) -> String {
-        self.engine.edit(id, patch).err().expect("edit should fail").to_string()
+        self.engine.edit(id, patch).expect_err("edit should fail").to_string()
     }
     fn task(&self, id: &str) -> &Task {
         &self.engine.state.tasks[self.engine.task(id).unwrap()]
