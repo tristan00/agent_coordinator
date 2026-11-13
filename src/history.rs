@@ -2,7 +2,7 @@ use crate::{Result, now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 9;
 pub const METRIC_DEFINITION_VERSION: u32 = 9;
 pub const STRIKES: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,11 +37,47 @@ pub enum Updates {
     Poll,
     Events,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct WorkspaceSettings {
     pub limits: Limits,
     pub updates: Updates,
+    pub planner: Option<AgentCandidate>,
+    pub worker: Option<AgentCandidate>,
+    pub prompts: Option<crate::workspace_prompts::Selection>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCandidate {
+    SolLight,
+    #[serde(rename = "luna_6_high")]
+    Luna6High,
+    #[serde(rename = "sol_6_1_light")]
+    Sol61Light,
+    #[serde(rename = "sol_6_1_medium")]
+    Sol61Medium,
+}
+impl AgentCandidate {
+    pub fn model(self) -> &'static str {
+        match self { Self::SolLight => "gpt-6-sol", Self::Luna6High => "gpt-6-luna", Self::Sol61Light | Self::Sol61Medium => "gpt-6.1-sol" }
+    }
+    pub fn effort(self) -> &'static str {
+        match self { Self::SolLight | Self::Sol61Light => "low", Self::Luna6High => "high", Self::Sol61Medium => "medium" }
+    }
+    pub fn validate(self) -> Result<()> {
+        crate::require(self != Self::SolLight, "Workspace agents must be luna_6_high, sol_6_1_light or sol_6_1_medium")
+    }
+}
+pub fn agent_candidates() -> Value {
+    json!([AgentCandidate::Luna6High, AgentCandidate::Sol61Light, AgentCandidate::Sol61Medium]
+        .map(|candidate| json!({"candidate":candidate,"model":candidate.model(),"effort":candidate.effort()})))
+}
+impl WorkspaceSettings {
+    pub fn validate(&self) -> Result<()> {
+        self.limits.validate()?;
+        self.planner.ok_or("Workspace planner selection is required")?.validate()?;
+        self.worker.ok_or("Workspace worker selection is required")?.validate()
+    }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

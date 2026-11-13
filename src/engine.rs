@@ -145,7 +145,7 @@ impl Task {
         self.attributes.lane == Lane::Audit
     }
     fn workdir(&self) -> &Path {
-        self.workspace.as_deref().unwrap_or(Path::new(&self.cwd))
+        Path::new(&self.cwd)
     }
     fn reset_work(&mut self) {
         self.revision += 1;
@@ -394,6 +394,8 @@ impl Config {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
+    pub(crate) benchmark_runs: BTreeMap<PathBuf, crate::benchmark::WorkspaceRun>,
+    #[serde(default)]
     batches: std::collections::BTreeMap<String, Value>,
     #[serde(default, rename = "schemaVersion")]
     schema_version: Option<u32>,
@@ -431,13 +433,14 @@ impl State {
         chain
     }
     pub fn settings(&self, key: Option<&Path>) -> history::WorkspaceSettings {
-        key.and_then(|key| self.config.workspaces.get(key)).copied().unwrap_or_default()
+        key.and_then(|key| self.config.workspaces.get(key)).cloned().unwrap_or_default()
     }
     pub fn limits(&self, task: &Task) -> history::Limits {
         let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
         self.settings(key.as_deref()).limits
     }
     pub fn check_definition(&self, task: &Task) -> Result<()> {
+        require(!crate::benchmark::expired(self, task), "Benchmark workspace is closed")?;
         let limits = self.limits(task);
         require(!(task.title.is_empty() || task.outcome.is_empty() || task.cwd.trim().is_empty()), "Title, outcome and cwd are required")?;
         require(history::words(&task.title) <= limits.title_words, format!("Title exceeds {} words", limits.title_words))?;
@@ -542,8 +545,11 @@ impl State {
         require(!key.as_ref().is_some_and(String::is_empty), "Task key must not be blank")?;
         let cwd = input.cwd.clone().ok_or("cwd is required")?;
         let directory = workspace(Path::new(&cwd))?;
+        let run_directory = directory.clone();
+        let directory = self.benchmark_runs.iter().find(|(path, _)| directory.starts_with(path))
+            .map(|(_, run)| run.group.clone()).unwrap_or(directory);
         if let Some(key) = &key
-            && let Some(index) = self.tasks.iter().position(|task| task.key.as_ref() == Some(key) && task.workspace.as_ref() == Some(&directory))
+            && let Some(index) = self.tasks.iter().position(|task| task.key.as_ref() == Some(key) && task.workspace.as_ref() == Some(&directory) && (directory == run_directory || task.cwd == cwd))
         {
             let id = self.tasks[index].id.clone();
             self.revise(index, input, actor, "keyed_create")?;
@@ -554,6 +560,9 @@ impl State {
             json!({"id":id(),"title":"","outcome":"","cwd":cwd,"acceptance":[],"dependencies":[],"stage":"implementation","stopped":false,"attempts":[],"active":null,"feedback":[],"failure":"","retryAt":0,"key":key,"workspace":directory}),
         )?;
         input.apply(&mut task)?;
+        if let Some((_, run)) = self.benchmark_runs.iter().find(|(path, _)| task.workspace.as_ref().is_some_and(|cwd| cwd.starts_with(path))) {
+            task.workspace = Some(run.group.clone());
+        }
         self.check_definition(&task)?;
         self.check_relations(&task)?;
         let id = task.id.clone();
@@ -644,6 +653,9 @@ impl State {
         let previous = self.tasks[index].clone();
         let mut task = previous.clone();
         input.apply(&mut task)?;
+        if let Some((_, run)) = self.benchmark_runs.iter().find(|(path, _)| task.workspace.as_ref().is_some_and(|cwd| cwd.starts_with(path))) {
+            task.workspace = Some(run.group.clone());
+        }
         if task.parent != previous.parent
             && let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id))
         {
@@ -718,6 +730,12 @@ impl Engine {
         let file = directory.join("state.json");
         let mut state: State = if file.exists() {
             let mut raw: Value = read(&file)?;
+            if raw["schemaVersion"].as_u64().unwrap_or(0) < 7 {
+                for settings in raw["config"]["workspaces"].as_object_mut().into_iter().flat_map(|items| items.values_mut()) {
+                    settings["planner"] = json!("sol_light");
+                    settings["worker"] = json!("sol_light");
+                }
+            }
             if raw["schemaVersion"].as_u64().unwrap_or(0) < 4 {
                 for field in ["tasks", "archived"] {
                     for task in raw.get_mut(field).and_then(Value::as_array_mut).into_iter().flatten() {
@@ -742,6 +760,7 @@ impl Engine {
             let config =
                 Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), workspaces: BTreeMap::new(), limits: BTreeMap::new() };
             State {
+                benchmark_runs: BTreeMap::new(),
                 batches: Default::default(),
                 schema_version: Some(history::SCHEMA_VERSION),
                 paused: false,
@@ -944,8 +963,12 @@ impl Engine {
         config.workspaces = std::mem::take(&mut config.workspaces)
             .into_iter()
             .map(|(path, settings)| {
-                settings.limits.validate()?;
-                Ok((workspace(&path).map_err(|e| format!("Workspace {}: {e}", path.display()))?, settings))
+                let path = workspace(&path).map_err(|e| format!("Workspace {}: {e}", path.display()))?;
+                if self.state.config.workspaces.get(&path) != Some(&settings) {
+                    settings.validate()?;
+                    crate::workspace_prompts::verify(&path, &settings)?;
+                }
+                Ok((path, settings))
             })
             .collect::<Result<_>>()?;
         self.change(|state| {
@@ -1010,7 +1033,7 @@ impl Engine {
         process::command(std::env::current_exe()?.to_str().ok_or("Invalid executable path")?).arg("--supervise").arg(directory).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
         Ok(())
     }
-    fn request(&self, task: &Task, attempt_id: &str) -> Value {
+    fn request(&self, task: &Task, attempt_id: &str) -> Result<Value> {
         let stage = task.stage.as_str();
         let summary = |a: &Attempt| a.result.as_ref().map(|r| json!({"stage":a.stage,"status":r["status"],"summary":r["summary"],"findings":r["findings"],"criteria":r["criteria"]}));
         let dependencies: Vec<_> = task
@@ -1025,11 +1048,18 @@ impl Engine {
         let directory = self.attempt_path(attempt_id);
         let produced = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.stage == "implementation" && a.status() == Some("completed"));
         let home = produced.filter(|_| stage == "review").map_or_else(|| directory.clone(), |a| self.attempt_path(&a.id));
+        let settings = self.state.settings(task.workspace.as_deref());
+        settings.validate()?;
+        let worker = settings.worker.ok_or("Workspace worker selection is required")?;
+        let cwd = workspace(Path::new(&task.cwd))?;
+        let documents = self.state.benchmark_runs.keys().find(|path| cwd.starts_with(path)).map(PathBuf::as_path)
+            .or(task.workspace.as_deref()).ok_or("Workspace directory is required")?;
+        let protocol = crate::workspace_prompts::worker(documents, &settings)?;
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
-            "cwd":task.workdir(),"model":task.model,"effort":task.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
+            "cwd":task.workdir(),"model":worker.model(),"effort":worker.effort(),"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
             "languages":task.attributes.languages,"functions":task.attributes.functions,
             "writable":task.writable,"dependencies":task.dependencies,"after":task.after},
-            "feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
+            "worker":worker,"workerProtocol":protocol,"feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
             "readOnly":stage != "implementation" || task.read_only()});
         if stage == "review" {
             let implementation = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.stage == "implementation" && a.status() == Some("completed"));
@@ -1040,7 +1070,7 @@ impl Engine {
             request["legacyNotes"] = json!(task.refinements.iter().map(|r| history::clip(r, 60)).collect::<Vec<_>>());
             request["capabilities"] = json!(self.state.config.capabilities);
         }
-        request
+        Ok(request)
     }
     fn start(&mut self, index: usize) -> Result<()> {
         let task = &self.state.tasks[index];
@@ -1054,13 +1084,18 @@ impl Engine {
         if process::local_codex(registered) {
             command[0] = std::env::current_exe()?.to_string_lossy().into_owned();
         }
-        let settings = json!({"scratch":true,"acceptance":task.acceptance,"requested":{"model":task.model,"effort":task.effort},"needs":task.attributes.needs,
-            "registeredCommand":registered,"actualCommand":command,"stage":stage,"request":"request.json","revision":task.revision,
+        let worker = self.state.settings(task.workspace.as_deref()).worker.ok_or("Workspace worker selection is required")?;
+        if !process::local_codex(registered) {
+            require(command.iter().any(|arg| arg == "{model}") && command.iter().any(|arg| arg.contains("{effort}")), "Worker command requires explicit {model} and {effort} placeholders")?;
+        }
+        let actual_command: Vec<_> = command.iter().map(|arg| arg.replace("{model}", worker.model()).replace("{effort}", worker.effort())).collect();
+        let settings = json!({"scratch":true,"acceptance":task.acceptance,"requested":{"model":task.model,"effort":task.effort},"effective":{"worker":worker,"model":worker.model(),"effort":worker.effort()},"needs":task.attributes.needs,
+            "registeredCommand":registered,"actualCommand":actual_command,"stage":stage,"request":"request.json","revision":task.revision,
             "workspaceId":task.workspace,"cwd":task.workdir(),"writable":task.writable,
             "coordinatorVersion":env!("CARGO_PKG_VERSION"),"coordinatorBuild":crate::web::deployment()["digest"]});
         let attempt =
             Attempt { id: id(), revision: task.revision, stage: stage.clone(), started: now(), ended: None, result: None, error: None, evidence: AttemptEvidence { configuration: Some(settings), ..Default::default() } };
-        let mut request = self.request(task, &attempt.id);
+        let mut request = self.request(task, &attempt.id)?;
         request["command"] = json!(command);
         write(&self.attempt_path(&attempt.id).join("request.json"), &request)?;
         let attempt_id = attempt.id.clone();
@@ -1350,6 +1385,7 @@ impl Engine {
         self.launch(&id).or_else(|error| write(&exit, &json!({"error":error.to_string(),"ended":now()})))
     }
     pub fn tick(&mut self) -> Result<()> {
+        self.expire_benchmark_runs()?;
         let mut outcome = Ok(());
         for index in 0..self.state.tasks.len() {
             outcome = self.poll_attempt(index).and(outcome);

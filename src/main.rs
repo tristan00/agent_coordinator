@@ -1,4 +1,5 @@
 mod analytics;
+mod benchmark;
 mod engine;
 mod evidence;
 mod history;
@@ -7,6 +8,7 @@ mod process;
 mod redeploy;
 mod telemetry;
 mod web;
+mod workspace_prompts;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

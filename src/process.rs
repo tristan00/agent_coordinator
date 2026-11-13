@@ -195,7 +195,11 @@ pub fn worker() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let request: Value = serde_json::from_str(&input)?;
+    let selection: crate::history::AgentCandidate = serde_json::from_value(request.get("worker").cloned().ok_or("Explicit worker selection required")?)?;
+    selection.validate()?;
     let args: Vec<String> = serde_json::from_value(request["command"].clone())?;
+    crate::require(local_codex(&args) || (args.iter().any(|arg| arg == "{model}") && args.iter().any(|arg| arg.contains("{effort}"))), "Worker command requires explicit {model} and {effort} placeholders")?;
+    let args: Vec<_> = args.iter().map(|arg| arg.replace("{model}", selection.model()).replace("{effort}", selection.effort())).collect();
     let mut child = command(&args[0]).args(&args[1..]).stdin(Stdio::piped()).spawn()?;
     forward_input(&mut child, input.into_bytes());
     crate::require(child.wait()?.success(), "Worker command failed")?;
@@ -237,22 +241,26 @@ pub(crate) fn schema(stage: &str) -> Value {
 fn limit(request: &Value, key: &str) -> u64 {
     request["limits"][key].as_u64().or_else(|| crate::history::Limits::default().value()[key].as_u64()).unwrap_or_default()
 }
-fn rules(request: &Value) -> String {
-    format!(
-        "Follow AGENTS.md in task.cwd. Keep summary under {} words and at most {} findings of {} words. A denied command is not a reason to stop: use a different permitted method and continue. Never ask the user to act.",
+fn rules(request: &Value) -> Result<String> {
+    let protocol = request["workerProtocol"]["text"].as_str().ok_or("Workspace worker protocol is required")?;
+    crate::require((1..=200).contains(&protocol.split_whitespace().count()), "Workspace worker protocol must contain 1..200 words")?;
+    Ok(format!(
+        "{protocol}\nKeep summary under {} words and at most {} findings of {} words.",
         limit(request, "summaryWords"),
         limit(request, "findings"),
         limit(request, "findingWords")
-    )
+    ))
 }
 pub fn external() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
+    let selection: crate::history::AgentCandidate = serde_json::from_value(request.get("worker").cloned().ok_or("Explicit worker selection required")?)?;
+    selection.validate()?;
     let result = PathBuf::from(std::env::var("COORDINATOR_RESULT")?);
     let directory = result.parent().unwrap();
     let stage = request["stage"].as_str().unwrap_or("implementation");
     let schema_path = directory.join("schema.json");
     write(&schema_path, &schema(stage))?;
-    let prompt = format!("{}\n{}\nWhen finished, write one JSON object matching the schema at {} to {}.\n{request}", action(&request, stage), rules(&request), schema_path.display(), result.display());
+    let prompt = format!("{}\n{}\nWhen finished, write one JSON object matching the schema at {} to {}.\n{request}", action(&request, stage), rules(&request)?, schema_path.display(), result.display());
     std::fs::write(directory.join("prompt.md"), prompt)?;
     while read::<Value>(&result).is_err() {
         thread::sleep(Duration::from_secs(1));
@@ -288,26 +296,20 @@ pub fn codex() -> Result<()> {
     let stage = request["stage"].as_str().unwrap_or("implementation");
     let schema_path = directory.join("schema.json");
     write(&schema_path, &schema(stage))?;
-    let prompt = format!("{}\n{}\n{request}", action(&request, stage), rules(&request));
+    let prompt = format!("{}\n{}\n{request}", action(&request, stage), rules(&request)?);
     let program = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut cli = command(&program);
     let profile = std::env::var_os("USERPROFILE").map(PathBuf::from).filter(|path| path.is_absolute());
     cli.envs(profile.filter(|_| std::env::var_os("CODEX_HOME").is_none_or(|home| home.is_empty())).map(|path| ("CODEX_HOME", path.join(".codex"))));
     cli.env_remove("CODEX_WINDOWS_REGISTERED_CORE").arg("exec");
-    let implementing = stage == "implementation";
-    let model = request["task"]["model"].as_str().filter(|model| implementing && !model.trim().is_empty());
-    let effort = request["task"]["effort"].as_str().filter(|_| implementing).map(crate::history::effort).transpose()?;
-    if let Some(model) = model {
-        cli.args(["--model", model]);
-    }
-    if let Some(effort) = effort {
-        cli.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
-    }
+    let worker: crate::history::AgentCandidate = serde_json::from_value(request.get("worker").cloned().ok_or("Explicit worker selection required")?)?;
+    worker.validate()?;
+    let model = worker.model();
+    let effort = worker.effort();
+    cli.args(["--model", model, "-c", &format!("model_reasoning_effort=\"{effort}\"")]);
     let read_only = request["readOnly"] == true;
-    if let Some(scratch) = request["scratch"].as_str() {
-        if read_only {
-            cli.current_dir(scratch).args(["--cd", scratch]);
-        }
+    if let Some(scratch) = request["scratch"].as_str() && read_only {
+        cli.current_dir(scratch).args(["--cd", scratch]);
     }
     let events = std::fs::File::create(directory.join("events.jsonl"))?;
     let mut child = cli
@@ -326,8 +328,8 @@ pub fn codex() -> Result<()> {
         cli_version: None,
         model: None,
         effort: None,
-        forwarded_model: model.map(str::to_owned),
-        forwarded_effort: effort.map(str::to_owned),
+        forwarded_model: Some(model.to_owned()),
+        forwarded_effort: Some(effort.to_owned()),
         source: "codex_launch".into(),
     };
     let stderr = child.stderr.take().unwrap();

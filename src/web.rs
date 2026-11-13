@@ -154,11 +154,14 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
                 Ok(event)
             }
             ("POST", ["", "api", "tasks"]) => engine.create(input),
+            ("POST", ["", "api", "workspaces"]) => crate::workspace_prompts::create(engine, input, &crate::workspace_prompts::root()),
             ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input),
             ("PATCH", ["", "api", "tasks", id]) => engine.edit(id, input),
             ("POST", ["", "api", "tasks", id, "replan"]) => engine.request_replan(id, input),
             ("DELETE", ["", "api", "tasks", id]) => engine.remove(id, Actor::api(&input)?).map(|()| json!({"ok":true})),
             ("PUT", ["", "api", "config"]) => engine.configure(input).map(|()| json!({"ok":true})),
+            ("POST", ["", "api", "benchmark-runs"]) => engine.register_benchmark(input),
+            ("POST", ["", "api", "benchmark-runs", id, "stop"]) => engine.stop_benchmark(id),
             ("POST", ["", "api", action @ ("stop" | "resume")]) => engine.control_as(*action == "stop", None, Actor::api(&input)?, reason()?).map(|()| json!({"ok":true})),
             ("POST", ["", "api", "tasks", id, action @ ("stop" | "resume")]) => engine.control_as(*action == "stop", Some(id), Actor::api(&input)?, reason()?).map(|()| json!({"ok":true})),
             _ => Err("Unknown route".into()),
@@ -206,6 +209,7 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
             engine.updates(query.workspace.as_deref(), query.after, error)
         }
         ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
+        ["", "api", "prompt-candidates"] => crate::workspace_prompts::catalog(&crate::workspace_prompts::root())?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
         ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
         ["", "api", "state"] => {
