@@ -4,6 +4,7 @@ import '@xyflow/react/dist/style.css';
 import {relationLayout, hierarchyGeometry, placeLabels} from './edges';
 import {createSimulation, arrange, extend} from './layout';
 import {BorderBeam} from './Activity';
+import TaskName, {matchesTask, taskLabel, modelText} from './TaskName';
 
 const views = new Map();
 const legible = 0.6, margin = 24;
@@ -46,6 +47,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   const [positions, setPositions] = useState(view.current.positions);
   const [measurements, setMeasurements] = useState({});
   const [showDone, setShowDone] = useState(false);
+  const [showModels, setShowModels] = useState(false);
   const [collapsed, setCollapsed] = useState(new Set());
   const [query, setQuery] = useState('');
   const [inspected, setInspected] = useState(null);
@@ -63,7 +65,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     if (task.parent) children.set(task.parent, [...(children.get(task.parent) || []), task.id]);
   });
   const scope = new Set(tasks.map(task => task.id));
-  const eligible = new Set(tasks.filter(task => (showDone || task.stage !== 'done' || tasks.some(other => other.stage !== 'done' && (other.dependencies.some(d => target(d) === task.id) || other.after.includes(task.id)))) && task.title.toLowerCase().includes(query.toLowerCase())).map(task => task.id));
+  const eligible = new Set(tasks.filter(task => (showDone || task.stage !== 'done' || tasks.some(other => other.stage !== 'done' && (other.dependencies.some(d => target(d) === task.id) || other.after.includes(task.id)))) && matchesTask(task, query)).map(task => task.id));
   for (const id of [...eligible]) {
     const visited = new Set([id]);
     let parent = byId.get(id)?.parent;
@@ -179,11 +181,12 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     return {
       id: task.id, type: 'task', measured: measurements[task.id], position: established[task.id],
       className: `graph-task ${parent ? 'graph-parent' : ''} ${task.parent ? 'graph-subtask' : ''} ${task.blocked ? 'bad' : task.active && !task.stopped && activityEnabled ? 'live' : task.stage === 'done' ? 'good' : ''}`,
-      ariaLabel: `${parent ? 'Parent: ' : ''}${task.title}. ${task.status}. Press Enter or Space to inspect.`,
+      ariaLabel: `${parent ? 'Parent: ' : ''}${taskLabel(task)}. ${task.status}. Press Enter or Space to inspect.`,
       data: {active: !!task.active && !task.blocked && !task.stopped && activityEnabled, label: <>
         {parent && <span className="parent-label">Parent · {members.length} {members.length === 1 ? 'subtask' : 'subtasks'}</span>}
         {task.parent && <span className="subtask-label">Subtask</span>}
-        <strong>{task.title}</strong><span>{task.status} · {task.attributes.lane}</span>
+        <strong><TaskName task={task} /></strong><span>{task.status} · {task.attributes.lane}</span>
+        {showModels && !task.container && <span className="graph-model">Model: {modelText(task) || 'not run yet'}</span>}
         {parent && <><span>{members.length} direct children · {hidden} hidden</span>
           <button className="nodrag nopan" aria-label={`${collapsed.has(task.id) ? 'Expand' : 'Collapse'} ${task.title}`} aria-expanded={!collapsed.has(task.id)} onClick={event => {
             event.stopPropagation();
@@ -194,7 +197,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     };
   });
   const rectangles = nodes.map(n => ({id: n.id, parent: n.className.includes('graph-parent'), ...n.position, width: measurements[n.id]?.width || 220, height: measurements[n.id]?.height || 80}));
-  const endpoint = id => `${byId.get(id)?.title || 'Unavailable task'} [${id}]${ids.has(id) ? '' : ' (outside view)'}`;
+  const endpoint = id => `${byId.get(id) ? taskLabel(byId.get(id)) : 'Unavailable task'} [${id}]${ids.has(id) ? '' : ' (outside view)'}`;
   const moving = running || dragging;
   const geometryKey = JSON.stringify([rectangles, allTasks.map(t => [t.id, t.title, t.parent, t.dependencies, t.after, t.conflicts, t.related])]);
   const {edges, relationships} = useMemo(() => {
@@ -261,8 +264,9 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   const selectedRelation = relationships.find(edge => edge.id === inspected);
   return <>
     <div className="filters">
-      <input type="search" aria-label="Filter graph by title" placeholder="Filter graph by title" value={query} onChange={event => setQuery(event.target.value)} />
+      <input type="search" aria-label="Filter graph by ID or title" placeholder="Filter graph by ID or title" value={query} onChange={event => setQuery(event.target.value)} />
       <label className="check"><input type="checkbox" checked={showDone} onChange={event => setShowDone(event.target.checked)} /> Show finished tasks</label>
+      <label className="check"><input type="checkbox" checked={showModels} onChange={event => setShowModels(event.target.checked)} /> Show models</label>
       <button onClick={() => flow.current?.fitView({duration: 0})}>Fit graph</button>
       <button onClick={frameGraph}>Reset view</button>
       <button onClick={() => {stopLayout(); setEnabled(false); framed.current = false; persist({positions: {}, viewport: undefined}); setPositions({});}}>Arrange</button>

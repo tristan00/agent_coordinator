@@ -1382,3 +1382,71 @@ fn tasks_in_a_subfolder_belong_to_the_configured_workspace_that_contains_it() {
     assert!(engine.state.tasks.iter().filter(|t| t.cwd == child.to_string_lossy() || t.parent.is_some()).all(|t| t.workspace == Some(key.clone())), "{batch}");
     assert_eq!(engine.state.tasks.iter().filter(|t| t.parent.is_some()).count(), 1);
 }
+#[test]
+fn abbreviations_are_short_and_readable() {
+    for (name, expected) in [("benchmark_12", "B12"), ("agent_coordinator", "AC"), ("game_build", "GB"), ("workspace", "WOR"), ("myProject", "MP"), ("benchmark_123456", "B123"), ("v2_api", "V2A"), ("x", "X"), ("__", "W")] {
+        assert_eq!(abbreviation(Path::new("D:/root").join(name).as_path()), expected, "{name}");
+    }
+}
+#[test]
+fn short_ids_number_tasks_per_workspace() {
+    let mut board = Board::new();
+    let first = board.add("First");
+    let second = board.add("Second");
+    let other = board.temp.dir("benchmark_7");
+    let elsewhere = board.create(merge(board.spec("Elsewhere"), json!({"cwd":other})));
+    let container = board.create(board.container("Group"));
+    let child = board.create(board.child("Child", &container));
+    let short = |board: &Board, id: &str| board.task(id).short_id.clone().unwrap();
+    assert_eq!([short(&board, &first), short(&board, &second), short(&board, &elsewhere), short(&board, &container), short(&board, &child)], ["WOR-1", "WOR-2", "B7-1", "WOR-3", "WOR-4"]);
+    board.fail(board.with("Bad", json!({"shortId":"X-9"})));
+    board.fail(board.with("", json!({})));
+    let third = board.add("Third");
+    assert_eq!(short(&board, &third), "WOR-5");
+    board.engine.edit(&first, json!({"title":"Renamed first"})).unwrap();
+    assert_eq!(short(&board, &first), "WOR-1");
+    assert_eq!(board.engine.task_value(board.task(&first), false).unwrap()["shortId"], "WOR-1");
+    assert_eq!(board.task(&first).brief()["shortId"], "WOR-1");
+}
+#[test]
+fn colliding_abbreviations_get_distinct_ids() {
+    let mut state = Board::new().engine.state.clone();
+    let a = state.next_short_id(Path::new("D:/one/game_build"));
+    let b = state.next_short_id(Path::new("D:/two/game_build"));
+    let c = state.next_short_id(Path::new("D:/three/game_build"));
+    assert_eq!([a, b, c], ["GB-1", "GBA-1", "GBB-1"]);
+    assert_eq!(state.next_short_id(Path::new("D:/one/game_build")), "GB-2");
+}
+#[test]
+fn legacy_tasks_receive_short_ids_in_creation_order() {
+    let mut board = Board::new();
+    let ids: Vec<String> = ["A", "B", "C"].iter().map(|title| board.add(title)).collect();
+    let mut state = board.engine.state.clone();
+    state.tasks.reverse();
+    let mut retired = state.tasks.pop().unwrap();
+    retired.short_id = None;
+    state.archived.push(retired);
+    for task in &mut state.tasks {
+        task.short_id = None;
+    }
+    state.workspace_ids.clear();
+    state.assign_short_ids();
+    let find = |id: &str| state.tasks.iter().chain(&state.archived).find(|t| t.id == id).unwrap().short_id.clone().unwrap();
+    assert_eq!(ids.iter().map(|id| find(id)).collect::<Vec<_>>(), ["WOR-1", "WOR-2", "WOR-3"]);
+    assert_eq!(state.next_short_id(&board.engine.state.tasks[0].workspace.clone().unwrap()), "WOR-4");
+}
+#[test]
+fn task_value_lists_models_that_implemented_the_task() {
+    let mut board = Board::new();
+    let id = board.add("Modelled");
+    assert_eq!(board.engine.task_value(board.task(&id), false).unwrap()["models"], json!([]));
+    let index = board.engine.task(&id).unwrap();
+    board.mutate(move |state| {
+        let task = &mut state.tasks[index];
+        for (stage, model, effort) in [("implementation", "small", "low"), ("review", "large", "high"), ("implementation", "small", "low"), ("implementation", "medium", "high")] {
+            let evidence = AttemptEvidence { configuration: Some(json!({"effective":{"model":model,"effort":effort}})), ..Default::default() };
+            task.attempts.push(Attempt { id: super::id(), revision: task.revision, stage: stage.into(), started: now(), ended: Some(now()), result: None, error: None, evidence });
+        }
+    });
+    assert_eq!(board.engine.task_value(board.task(&id), false).unwrap()["models"], json!([{"model":"small","effort":"low"},{"model":"medium","effort":"high"}]));
+}

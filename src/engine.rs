@@ -78,6 +78,8 @@ impl Attempt {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
+    #[serde(default, rename = "shortId", skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
     #[serde(default)]
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,7 +204,7 @@ impl Task {
             json!({"stage":a.stage,"status":a.status(),"summary":result.map(|r| &r["summary"]),"findings":result.map(|r| &r["findings"]),"criteria":result.map(|r| &r["criteria"]),"error":a.error})
         });
         let tokens: u64 = self.attempts.iter().filter_map(|a| a.evidence.usage.as_ref()?.tokens()).sum();
-        json!({"id":self.id,"key":self.key,"title":self.title,"workspace":self.workspace,"parent":self.parent,"stage":self.stage,"status":self.status(),"container":self.container(),
+        json!({"id":self.id,"shortId":self.short_id,"key":self.key,"title":self.title,"workspace":self.workspace,"parent":self.parent,"stage":self.stage,"status":self.status(),"container":self.container(),
             "active":self.active.is_some(),"stopped":self.stopped,"blocked":self.blocked,"revision":self.revision,"waitingReason":self.recorded_wait,"strikes":self.strikes(),
             "feedback":self.feedback,"failure":self.failure,"attempts":self.attempts.len(),"tokens":tokens,"latest":latest})
     }
@@ -419,8 +421,83 @@ pub struct State {
     pub sequence: u64,
     #[serde(default)]
     changes: BTreeMap<PathBuf, u64>,
+    #[serde(default, rename = "workspaceIds", skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_ids: BTreeMap<PathBuf, WorkspaceId>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceId {
+    pub abbreviation: String,
+    pub next: u64,
+}
+pub fn abbreviation(directory: &Path) -> String {
+    let name = directory.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut words: Vec<String> = Vec::new();
+    let mut previous: Option<char> = None;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            let joined = previous.is_some_and(|p| p.is_ascii_alphanumeric() && p.is_ascii_digit() == c.is_ascii_digit() && !(p.is_ascii_lowercase() && c.is_ascii_uppercase()));
+            if !joined {
+                words.push(String::new());
+            }
+            words.last_mut().unwrap().push(c.to_ascii_uppercase());
+        }
+        previous = Some(c);
+    }
+    let base: String = match words.as_slice() {
+        [] => "W".into(),
+        [only] if !only.starts_with(|c: char| c.is_ascii_digit()) => only.chars().take(3).collect(),
+        _ => words.iter().map(|word| if word.starts_with(|c: char| c.is_ascii_digit()) { word.clone() } else { word[..1].to_owned() }).collect(),
+    };
+    base.chars().take(4).collect()
+}
+fn letters(mut n: u64) -> String {
+    let mut text = Vec::new();
+    loop {
+        text.push(b'A' + (n % 26) as u8);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    text.reverse();
+    String::from_utf8(text).unwrap()
 }
 impl State {
+    pub(crate) fn next_short_id(&mut self, directory: &Path) -> String {
+        if !self.workspace_ids.contains_key(directory) {
+            let base = abbreviation(directory);
+            let taken: HashSet<&str> = self.workspace_ids.values().map(|w| w.abbreviation.as_str()).collect();
+            let chosen = std::iter::once(base.clone())
+                .chain((0..).map(|n| {
+                    let suffix = letters(n);
+                    base.chars().take(4usize.saturating_sub(suffix.len())).chain(suffix.chars()).collect()
+                }))
+                .find(|candidate: &String| !taken.contains(candidate.as_str()))
+                .unwrap();
+            self.workspace_ids.insert(directory.to_path_buf(), WorkspaceId { abbreviation: chosen, next: 0 });
+        }
+        let entry = self.workspace_ids.get_mut(directory).unwrap();
+        entry.next += 1;
+        format!("{}-{}", entry.abbreviation, entry.next)
+    }
+    fn assign_short_ids(&mut self) {
+        let order = |id: &str| -> (u64, u64, u64) {
+            let parts: Vec<u64> = id.split('-').filter_map(|part| part.parse().ok()).collect();
+            (parts.first().copied().unwrap_or(0), parts.get(1).copied().unwrap_or(0), parts.get(2).copied().unwrap_or(0))
+        };
+        let mut missing: Vec<(bool, usize)> = (0..self.tasks.len())
+            .filter(|&i| self.tasks[i].short_id.is_none())
+            .map(|i| (false, i))
+            .chain((0..self.archived.len()).filter(|&i| self.archived[i].short_id.is_none()).map(|i| (true, i)))
+            .collect();
+        missing.sort_by_key(|&(archived, i)| order(&if archived { &self.archived[i] } else { &self.tasks[i] }.id));
+        for (archived, i) in missing {
+            let task = if archived { &self.archived[i] } else { &self.tasks[i] };
+            let directory = task.workspace.clone().unwrap_or_else(|| PathBuf::from(&task.cwd));
+            let short_id = self.next_short_id(&directory);
+            if archived { &mut self.archived[i] } else { &mut self.tasks[i] }.short_id = Some(short_id);
+        }
+    }
     pub fn index(&self, id: &str) -> Result<usize> {
         self.tasks.iter().position(|task| task.id == id).ok_or_else(|| format!("Task not found: {id}").into())
     }
@@ -595,6 +672,8 @@ impl State {
         if let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id)) {
             require(parent.stage != "done", "Cannot add work under a completed container")?;
         }
+        let directory = task.workspace.clone().unwrap_or_else(|| PathBuf::from(&task.cwd));
+        task.short_id = Some(self.next_short_id(&directory));
         let id = task.id.clone();
         for old in &supersedes {
             let index = self.index(old)?;
@@ -801,6 +880,7 @@ impl Engine {
                 config,
                 sequence: 0,
                 changes: BTreeMap::new(),
+                workspace_ids: BTreeMap::new(),
             }
         };
         require(!(state.schema_version > Some(history::SCHEMA_VERSION)), "State schema is newer than this coordinator")?;
@@ -846,6 +926,7 @@ impl Engine {
                 task.record_phase(&from, "migration");
             }
         }
+        state.assign_short_ids();
         state.schema_version = Some(history::SCHEMA_VERSION);
         write(&file, &state)?;
         Ok(Self { directory, state, pending_deploy: None, notices: Vec::new() })
@@ -916,6 +997,16 @@ impl Engine {
         value["waitingReason"] = json!(task.recorded_wait);
         value["strikes"] = json!(task.strikes());
         value["analytics"] = metrics::lifecycle(task);
+        let mut models: Vec<Value> = Vec::new();
+        for attempt in task.attempts.iter().filter(|a| a.stage == "implementation") {
+            let effective = attempt.evidence.configuration.as_ref().map(|c| &c["effective"]).filter(|e| e["model"].is_string());
+            if let Some(entry) = effective.map(|e| json!({"model":e["model"],"effort":e["effort"]}))
+                && !models.contains(&entry)
+            {
+                models.push(entry);
+            }
+        }
+        value["models"] = json!(models);
         Ok(value)
     }
     pub fn create(&mut self, input: Value) -> Result<Value> {

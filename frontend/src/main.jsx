@@ -2,6 +2,7 @@ import React, {useState, useEffect, useRef, useCallback, useMemo} from 'react';
 import {createRoot} from 'react-dom/client';
 import Graph from './Graph';
 import {BorderBeam, AnimatedCount} from './Activity';
+import TaskName, {matchesTask} from './TaskName';
 import './style.css';
 
 const readPreference = key => { try { return localStorage.getItem(key); } catch { return null; } };
@@ -112,14 +113,14 @@ function App() {
   const byId = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
   const workspaces = [...new Map([...Object.keys(state?.config?.workspaces || {}), ...tasks.map(workspaceOf)].filter(Boolean).map(path => [pathKey(path), path.replace(/^\\\\\?\\/, '')])).values()].sort();
   const scoped = tasks.filter(t => !workspace || pathKey(workspaceOf(t)) === pathKey(workspace));
-  const visible = scoped.filter(t => t.title.toLowerCase().includes(query.toLowerCase()) && Object.entries(filters).every(([key, value]) => !value || (key === 'lane' ? t.attributes.lane === value : value === 'uncategorized' ? !t.attributes[key]?.length : (t.attributes[key] || []).includes(value))));
+  const visible = scoped.filter(t => matchesTask(t, query) && Object.entries(filters).every(([key, value]) => !value || (key === 'lane' ? t.attributes.lane === value : value === 'uncategorized' ? !t.attributes[key]?.length : (t.attributes[key] || []).includes(value))));
   const go = p => { setPage(p); savePreference('coordinator.page', p); };
   const card = t => {
     const p = phase(t, state);
     return (
       <article className={`task ${p.tone}`} key={t.id}>
         {p.tone === 'live' && !offline && <BorderBeam />}
-        <button className="task-title" onClick={() => setSelected(t.id)}>{t.title}</button>
+        <button className="task-title" onClick={() => setSelected(t.id)}><TaskName task={t} /></button>
         <div className="chips"><span>Lane: {t.attributes.lane}</span><span>Languages: {categoryText(t.attributes, 'languages')}</span><span>Functions: {categoryText(t.attributes, 'functions')}</span><span>P{t.attributes.priority ?? 2}</span>{t.container && <span>container · {t.children.length}</span>}{t.parent && <span>child</span>}</div>
         <p className={`reason ${p.tone}`}>{p.text}</p>
       </article>
@@ -146,9 +147,9 @@ function App() {
         </header>
         {error && <p className="error" role="alert">{error}</p>}
         {state.error && <p className="error">Scheduler: {state.error}</p>}
-        {['Board', 'List'].includes(page) && <div className="filters"><input type="search" placeholder="Filter by title" value={query} onChange={e => setQuery(e.target.value)} />{Object.entries({...categoryLabels, lane: 'Lane', needs: 'Execution capability'}).map(([key, label]) => <label key={key}>{label}<select aria-label={`Filter ${label.toLowerCase()}`} value={filters[key]} onChange={e => setFilters(f => ({...f, [key]: e.target.value}))}><option value="">All</option>{key !== 'lane' && <option value="uncategorized">{key === 'needs' ? 'No capabilities required' : 'Uncategorized'}</option>}{(key === 'lane' ? LANES : key === 'needs' ? NEEDS : categoryOptions(state, key)).map(v => <option key={v} value={v}>{categoryName(v)}</option>)}</select></label>)}<button onClick={() => {setQuery(''); setFilters({languages: '', functions: '', lane: '', needs: ''});}}>Clear filters</button><span><AnimatedCount value={visible.length} /> tasks</span><small>All selected filters must match.</small></div>}
+        {['Board', 'List'].includes(page) && <div className="filters"><input type="search" placeholder="Filter by ID or title" value={query} onChange={e => setQuery(e.target.value)} />{Object.entries({...categoryLabels, lane: 'Lane', needs: 'Execution capability'}).map(([key, label]) => <label key={key}>{label}<select aria-label={`Filter ${label.toLowerCase()}`} value={filters[key]} onChange={e => setFilters(f => ({...f, [key]: e.target.value}))}><option value="">All</option>{key !== 'lane' && <option value="uncategorized">{key === 'needs' ? 'No capabilities required' : 'Uncategorized'}</option>}{(key === 'lane' ? LANES : key === 'needs' ? NEEDS : categoryOptions(state, key)).map(v => <option key={v} value={v}>{categoryName(v)}</option>)}</select></label>)}<button onClick={() => {setQuery(''); setFilters({languages: '', functions: '', lane: '', needs: ''});}}>Clear filters</button><span><AnimatedCount value={visible.length} /> tasks</span><small>All selected filters must match.</small></div>}
         {page === 'Board' && <div className="board page-enter">{STATUSES.map(s => <section key={s} className="column"><h2>{s} <AnimatedCount value={visible.filter(t => t.status === s).length} /></h2>{visible.filter(t => t.status === s).map(card)}</section>)}</div>}
-        {page === 'List' && <table className="list page-enter"><thead><tr><th>Task</th><th>Status</th><th>Lane</th><th>Languages</th><th>Functions</th><th>Execution capabilities</th><th>Blocked by</th><th>State</th></tr></thead><tbody>{visible.map(t => <tr key={t.id}><td><button className="link" onClick={() => setSelected(t.id)}>{t.title}</button></td><td>{t.status}</td><td>{t.attributes.lane}</td><td>{categoryText(t.attributes, 'languages')}</td><td>{categoryText(t.attributes, 'functions')}</td><td>{t.attributes.needs.join(', ') || 'none'}</td><td>{t.dependencies.map(d => byId[typeof d === 'string' ? d : d.target]?.title).filter(Boolean).join(', ')}</td><td className={`reason ${phase(t, state).tone}`}>{phase(t, state).text}</td></tr>)}</tbody></table>}
+        {page === 'List' && <table className="list page-enter"><thead><tr><th>Task</th><th>Status</th><th>Lane</th><th>Languages</th><th>Functions</th><th>Execution capabilities</th><th>Blocked by</th><th>State</th></tr></thead><tbody>{visible.map(t => <tr key={t.id}><td><button className="link" onClick={() => setSelected(t.id)}><TaskName task={t} /></button></td><td>{t.status}</td><td>{t.attributes.lane}</td><td>{categoryText(t.attributes, 'languages')}</td><td>{categoryText(t.attributes, 'functions')}</td><td>{t.attributes.needs.join(', ') || 'none'}</td><td>{t.dependencies.map(d => byId[typeof d === 'string' ? d : d.target]?.title).filter(Boolean).join(', ')}</td><td className={`reason ${phase(t, state).tone}`}>{phase(t, state).text}</td></tr>)}</tbody></table>}
         {page === 'Graph' && <Graph key={workspace} activityEnabled={!offline && !state.paused} workspace={workspace} tasks={scoped} allTasks={tasks} select={setSelected} />}
         {page === 'Analytics' && <Analytics workspace={workspace} select={setSelected} />}
         {page === 'Settings' && <Settings state={state} act={act} />}
@@ -166,7 +167,7 @@ function Detail({task: t, byId, state, close, select, act, edit}) {
   const link = relation => {
     const id = dependencyTarget(relation);
     const suffix = typeof relation === 'object' ? ` · ${reasons.includes(relation.reason) ? relation.reason.replaceAll('_', ' ') : `Unresolved reason${relation.reason ? `: ${relation.reason}` : ''}`}` : '';
-    return byId[id] ? <button key={id} className="link" onClick={() => select(id)}>{byId[id].title}{suffix}</button> : <span key={id}>Unavailable task: {id}{suffix}</span>;
+    return byId[id] ? <button key={id} className="link" onClick={() => select(id)}><TaskName task={byId[id]} />{suffix}</button> : <span key={id}>Unavailable task: {id}{suffix}</span>;
   };
   const all = Object.values(byId);
   const blocks = all.flatMap(task => task.dependencies.filter(d => dependencyTarget(d) === t.id).map(d => ({target: task.id, reason: d.reason})));
@@ -174,7 +175,7 @@ function Detail({task: t, byId, state, close, select, act, edit}) {
   const relations = [['Dependencies', t.dependencies.map(typed)], ['Required by', blocks], ['Runs after (ordering only)', t.after], ['Parent', t.parent ? [t.parent] : []], ['Children', children], ['Conflicts with', t.conflicts], ['Related', t.related]].filter(([, ids]) => ids.length);
   const control = t.stopped || t.blocked ? 'resume' : 'stop';
   return (
-    <Modal title={t.title} close={close}>
+    <Modal title={<TaskName task={t} />} close={close}>
       <div className="actions">
         <span className="pill">{t.status}</span><span>Stage {t.stage} · revision {t.revision}</span>
         {t.stage !== 'done' && <button onClick={() => act(`/api/tasks/${t.id}/${control}`)}>{control === 'resume' ? 'Resume' : 'Stop'}</button>}
