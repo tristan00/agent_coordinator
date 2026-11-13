@@ -130,10 +130,40 @@ pub fn enabled(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> BTr
 pub fn served(models: &Value, model: &str) -> bool {
     models["data"].as_array().is_some_and(|items| items.iter().any(|item| item["id"] == model))
 }
+#[cfg(not(test))]
+fn listed_models(endpoint: &str) -> Option<Value> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<BTreeMap<String, (Instant, Option<Value>)>> = Mutex::new(BTreeMap::new());
+    if let Some((_, models)) = CACHE.lock().unwrap().get(endpoint).filter(|(at, _)| at.elapsed() < Duration::from_secs(10)) {
+        return models.clone();
+    }
+    let output = crate::process::command("curl.exe").args(["-q", "-sS", "--max-time", "1", "--noproxy", "*", &format!("{}/models", endpoint.trim_end_matches('/'))]).output().ok();
+    let models = output.filter(|o| o.status.success()).and_then(|o| serde_json::from_slice(&o.stdout).ok());
+    CACHE.lock().unwrap().insert(endpoint.to_owned(), (Instant::now(), models.clone()));
+    models
+}
+#[cfg(test)]
+thread_local! {
+    pub static SERVED: std::cell::RefCell<BTreeMap<String, Value>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+#[cfg(test)]
+fn listed_models(endpoint: &str) -> Option<Value> {
+    SERVED.with(|served| served.borrow().get(endpoint).cloned())
+}
+#[cfg(test)]
+pub fn serve(endpoint: &str, models: &[&str]) {
+    SERVED.with(|served| served.borrow_mut().insert(endpoint.to_owned(), json!({"data":models.iter().map(|id| json!({"id":id})).collect::<Vec<_>>()})));
+}
 pub fn available(agent: &Agent) -> Option<bool> {
     let endpoint = agent.endpoint.as_deref().filter(|_| agent.provider == Provider::Local)?;
-    let output = crate::process::command("curl.exe").args(["-q", "-sS", "--max-time", "1", "--noproxy", "*", &format!("{}/models", endpoint.trim_end_matches('/'))]).output().ok()?;
-    Some(output.status.success() && serde_json::from_slice(&output.stdout).is_ok_and(|models: Value| served(&models, &agent.model)))
+    Some(listed_models(endpoint).is_some_and(|models| served(&models, &agent.model)))
+}
+pub fn require_served(id: &str, agent: &Agent) -> Result<()> {
+    require(
+        available(agent) != Some(false),
+        format!("Model {id} is not being served at {}; GET /api/agents shows which local models are available", agent.endpoint.as_deref().unwrap_or_default()),
+    )
 }
 pub fn listing(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> Value {
     let mut all = catalog();

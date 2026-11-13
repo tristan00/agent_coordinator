@@ -1258,7 +1258,12 @@ fn legacy_limits_are_adopted_into_workspace_settings() {
     load(&temp, &state).unwrap();
 }
 
+fn serve_local(models: &[&str]) {
+    crate::agents::serve("http://127.0.0.1:8120/v1", models);
+}
+
 fn model_board() -> Board {
+    serve_local(&["granite4.2-3b-fp8", "ministral3-3b", "phi4-mini", "qwen3-4b-2507-fp8", "qwen3-8b-fp8"]);
     let mut board = Board::new();
     let key = workspace(&board.ws).unwrap();
     board.mutate(move |state| {
@@ -1336,4 +1341,30 @@ fn patching_one_attribute_keeps_the_others() {
     assert_eq!(attributes.needs.len(), 1);
     board.engine.edit(&id, json!({"attributes":{"model":null}})).unwrap();
     assert_eq!((board.task(&id).attributes.model.as_deref(), board.task(&id).attributes.lane), (None, Lane::Data));
+}
+
+#[test]
+fn unserved_local_models_are_rejected_when_chosen() {
+    let mut board = model_board();
+    serve_local(&["qwen3-4b-2507-fp8"]);
+    let error = board.fail(board.with("Rename helper", json!({"attributes":{"model":"local_granite_3b"}})));
+    assert!(error.contains("not being served"), "{error}");
+    let id = board.create(board.with("Summarize", json!({"attributes":{"model":"local_qwen3_4b"}})));
+    assert!(board.edit_error(&id, json!({"attributes":{"model":"local_phi4_mini"}})).contains("not being served"));
+    board.create(board.with("Hosted choice", json!({"attributes":{"model":"sol_6_1_medium"}})));
+}
+
+#[test]
+fn a_model_that_stops_being_served_holds_dispatch_with_a_reason() {
+    let mut board = model_board();
+    let id = board.create(board.with("Summarize", json!({"attributes":{"model":"local_qwen3_4b"}})));
+    let plain = board.add("Default worker task");
+    assert_eq!(board.waiting(&id), None);
+    serve_local(&[]);
+    assert_eq!(board.waiting(&id).as_deref(), Some("Model local_qwen3_4b is not being served"));
+    assert_eq!(board.waiting(&plain), None);
+    board.engine.edit(&id, json!({"outcome":"A clearer outcome holds"})).unwrap();
+    assert!(board.edit_error(&id, json!({"attributes":{"model":"local_granite_3b"}})).contains("not being served"));
+    board.engine.edit(&id, json!({"attributes":{"model":null}})).unwrap();
+    assert_eq!(board.waiting(&id), None);
 }

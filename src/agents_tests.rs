@@ -117,5 +117,10 @@ fn served_models_are_read_from_the_openai_model_listing() {
     assert!(!served(&json!({"error":"x"}), "other"));
     let unreachable = Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: "m".into(), effort: None, endpoint: Some("http://127.0.0.1:9/v1".into()), retired: false, note: None };
     assert_eq!(available(&unreachable), Some(false));
+    assert!(require_served("unreachable", &unreachable).unwrap_err().to_string().contains("127.0.0.1:9"));
+    serve("http://127.0.0.1:9/v1", &["m"]);
+    assert_eq!(available(&unreachable), Some(true));
+    assert!(require_served("unreachable", &unreachable).is_ok());
     assert_eq!(available(&catalog()["sol_6_1_light"]), None);
+    assert!(require_served("sol_6_1_light", &catalog()["sol_6_1_light"]).is_ok());
 }

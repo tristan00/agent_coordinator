@@ -503,6 +503,14 @@ impl State {
         }
         Ok(())
     }
+    fn chosen_model(&self, task: &Task) -> Option<(String, crate::agents::Agent)> {
+        let model = task.attributes.model.as_deref()?;
+        let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
+        self.settings(key.as_deref()).task_agent(Some(model), self.family).ok()
+    }
+    fn check_served(&self, task: &Task) -> Result<()> {
+        self.chosen_model(task).map_or(Ok(()), |(id, agent)| crate::agents::require_served(&id, &agent))
+    }
     fn waiting_reason(&self, task: &Task) -> Option<String> {
         if !self.queued(task) {
             return None;
@@ -534,6 +542,11 @@ impl State {
             if task.conflicts.contains(&other.id) || other.conflicts.contains(&task.id) {
                 return Some(format!("Conflicts with running {}", other.title));
             }
+        }
+        if let Some((id, agent)) = self.chosen_model(task)
+            && crate::agents::available(&agent) == Some(false)
+        {
+            return Some(format!("Model {id} is not being served"));
         }
         (now() < task.retry_at).then(|| format!("Retry scheduled at {}", task.retry_at))
     }
@@ -587,6 +600,7 @@ impl State {
         if let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id)) {
             require(parent.stage != "done", "Cannot add work under a completed container")?;
         }
+        self.check_served(&task)?;
         let id = task.id.clone();
         for old in &supersedes {
             let index = self.index(old)?;
@@ -689,6 +703,9 @@ impl State {
         require(previous.active.is_none(), "Stop the task and wait for its worker to exit before editing")?;
         self.check_definition(&task)?;
         self.check_relations(&task)?;
+        if task.attributes.model != previous.attributes.model {
+            self.check_served(&task)?;
+        }
         let corrective = task.signature() != previous.signature() || (previous.stage == "replan" && !task.refinements.is_empty());
         if corrective {
             task.refinements.clear();
