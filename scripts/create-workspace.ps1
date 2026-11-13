@@ -26,11 +26,9 @@ function Get-WorkspaceKey([string]$Path) {
 $catalog = Invoke-RestMethod -Uri "$baseUrl/api/prompt-candidates" -TimeoutSec 15
 $eligible = @($catalog.agents.agents | Where-Object { $_.allowed })
 $agents = @($eligible | ForEach-Object { $_.id })
-$sampled = @($eligible | Where-Object { $_.agent.provider -ne 'local' } | ForEach-Object { $_.id })
-$planners = @($eligible | Where-Object { $_.planner -and $_.agent.provider -ne 'local' } | ForEach-Object { $_.id })
-if ($Planner -and $Planner -notin @($eligible | Where-Object { $_.planner } | ForEach-Object { $_.id })) { throw "Agent cannot plan: $Planner" }
-if (!$agents.Count) { throw 'Coordinator returned no eligible workspace agents' }
-if ((!$Planner -or !$Worker) -and !$sampled.Count) { throw 'No hosted agents are allowed for this launcher; pass -Planner and -Worker explicitly' }
+$plannerAgents = @($eligible | Where-Object { $_.planner } | ForEach-Object { $_.id })
+if (!$agents.Count) { throw 'Coordinator returned no eligible workspace agents; start it from Claude Code or Codex, or set AGENT_FAMILY' }
+if ($Planner -and $Planner -notin $plannerAgents) { throw "Agent cannot plan: $Planner" }
 if ($Planner -and $Planner -notin $agents) { throw "Ineligible planner: $Planner" }
 if ($Worker -and $Worker -notin $agents) { throw "Ineligible worker: $Worker" }
 $planners = @($catalog.project_planner | ForEach-Object { $_.candidate })
@@ -56,8 +54,8 @@ $created = foreach ($path in $paths) {
     $mode = if ($Updates) { $Updates } else { @('poll', 'events')[$random.Next(0, 2)] }
     $plannerPrompt = if ($ProjectPlanner) { $ProjectPlanner } else { $planners[$random.Next(0, $planners.Count)] }
     $workerPrompt = if ($WorkerProtocol) { $WorkerProtocol } else { $workers[$random.Next(0, $workers.Count)] }
-    $selectedPlanner = if ($Planner) { $Planner } else { $planners[$random.Next(0, $planners.Count)] }
-    $selectedWorker = if ($Worker) { $Worker } else { $sampled[$random.Next(0, $sampled.Count)] }
+    $selectedPlanner = if ($Planner) { $Planner } else { $plannerAgents[$random.Next(0, $plannerAgents.Count)] }
+    $selectedWorker = if ($Worker) { $Worker } else { $agents[$random.Next(0, $agents.Count)] }
     $body = @{ path = $path; project_planner = $plannerPrompt; worker_protocol = $workerPrompt;
         settings = @{ limits = $limits; updates = $mode; planner = $selectedPlanner; worker = $selectedWorker } }
     Invoke-RestMethod -Uri "$baseUrl/api/workspaces" -Method Post -ContentType 'application/json' -Body ($body | ConvertTo-Json -Depth 10) -TimeoutSec 15
