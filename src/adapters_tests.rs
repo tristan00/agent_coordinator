@@ -89,3 +89,21 @@ fn replies_are_parsed_from_the_outermost_json_object() {
     assert_eq!(json_object("x {\"a\":{\"b\":1}} y").unwrap(), json!({"a":{"b":1}}));
     assert!(json_object("} {").is_err());
 }
+
+#[test]
+fn claude_executable_is_found_as_exe_or_npm_shim_on_path() {
+    let root = Temp::new();
+    let (first, second) = (root.0.join("a"), root.0.join("b"));
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("claude.cmd"), "").unwrap();
+    let path = std::env::join_paths([&first, &second]).unwrap();
+    assert_eq!(executable("claude", Some(path.clone())), Some(second.join("claude.cmd")));
+    let shim = second.join("node_modules/@anthropic-ai/claude-code/bin");
+    std::fs::create_dir_all(&shim).unwrap();
+    std::fs::write(shim.join("claude.exe"), "").unwrap();
+    assert_eq!(executable("claude", Some(path.clone())), Some(shim.join("claude.exe")));
+    std::fs::write(first.join("claude.exe"), "").unwrap();
+    assert_eq!(executable("claude", Some(path)), Some(first.join("claude.exe")));
+    assert_eq!(executable("claude", None), None);
+}

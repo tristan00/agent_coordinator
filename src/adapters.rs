@@ -48,9 +48,14 @@ fn json_object(text: &str) -> Result<Value> {
     require(end > start, "Reply contains no JSON object")?;
     Ok(serde_json::from_str(&text[start..=end])?)
 }
+pub fn executable(name: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let found = std::env::split_paths(&path?).flat_map(|dir| ["exe", "cmd"].map(|ext| dir.join(format!("{name}.{ext}")))).find(|candidate| candidate.is_file())?;
+    let native = found.parent()?.join("node_modules/@anthropic-ai/claude-code/bin").join(format!("{name}.exe"));
+    Some(if found.extension().is_some_and(|e| e == "cmd") && native.is_file() { native } else { found })
+}
 pub fn claude(request: &Value, agent: &Agent) -> Result<()> {
     let (result, directory, stage) = attempt(request)?;
-    let program = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let program = std::env::var("CLAUDE_BIN").ok().or_else(|| executable("claude", std::env::var_os("PATH")).map(|p| p.to_string_lossy().into_owned())).ok_or("Claude Code executable not found on PATH")?;
     let mut cli = command(&program);
     for (name, _) in std::env::vars_os() {
         if hosted_claude_environment(&name.to_string_lossy()) {
