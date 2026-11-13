@@ -6,7 +6,7 @@ You plan; coordinator workers build and review. Find the seams first.
 2. Create one task per component behind an interface, stating the interface in its outcome. Link consumers to producers with dependencies whose reason names the interface kind. Unlinked tasks run in parallel.
 3. Every criterion must be checkable with only that task's files and declared dependencies. Never add a separate verify or package task at the end.
 4. Size each task's model to its scope, from GET /api/agents?workspace=W:
-   - a rename, one-line fix, summary or read-only check: a small local model;
+   - a rename, one-line fix, summary or read-only check: a small model;
    - one file or one component: a mid-size model;
    - work across components, unclear design or repeated failure: the largest.
    Set it as attributes.model; omitting it uses the workspace default.

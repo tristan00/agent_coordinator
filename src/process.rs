@@ -303,7 +303,6 @@ pub fn codex() -> Result<()> {
     let agent = request_agent(&request)?;
     match agent.harness {
         crate::agents::Harness::ClaudeCode => return crate::adapters::claude(&request, &agent),
-        crate::agents::Harness::OpenaiCompatible => return crate::adapters::local(&request, &agent),
         crate::agents::Harness::Codex => {}
     }
     let result = std::env::var("COORDINATOR_RESULT")?;

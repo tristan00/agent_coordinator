@@ -1258,12 +1258,7 @@ fn legacy_limits_are_adopted_into_workspace_settings() {
     load(&temp, &state).unwrap();
 }
 
-fn serve_local(models: &[&str]) {
-    crate::agents::serve("http://127.0.0.1:8120/v1", models);
-}
-
 fn model_board() -> Board {
-    serve_local(&["granite4.2-3b-fp8", "ministral3-3b", "phi4-mini", "qwen3-4b-2507-fp8", "qwen3-8b-fp8"]);
     let mut board = Board::new();
     let key = workspace(&board.ws).unwrap();
     board.mutate(move |state| {
@@ -1276,16 +1271,16 @@ fn model_board() -> Board {
 #[test]
 fn tasks_may_choose_an_enabled_model_and_default_to_the_workspace_worker() {
     let mut board = model_board();
-    let chosen = board.create(board.with("Rename helper", json!({"attributes":{"model":"local_granite_3b"}})));
+    let chosen = board.create(board.with("Rename helper", json!({"attributes":{"model":"sol_6_1_medium"}})));
     let plain = board.add("Plain task");
     let family = board.engine.state.family;
     let settings = board.engine.state.settings(board.task(&chosen).workspace.as_deref());
     let (id, agent) = settings.task_agent(board.task(&chosen).attributes.model.as_deref(), family).unwrap();
-    assert_eq!((id.as_str(), agent.model.as_str()), ("local_granite_3b", "granite4.2-3b-fp8"));
+    assert_eq!((id.as_str(), agent.model.as_str()), ("sol_6_1_medium", "gpt-6.1-sol"));
     let (id, agent) = settings.task_agent(board.task(&plain).attributes.model.as_deref(), family).unwrap();
     assert_eq!((id.as_str(), agent.model.as_str()), ("sol_6_1_light", "gpt-6.1-sol"));
     let saved = board.engine.task_value(board.task(&chosen), false).unwrap();
-    assert_eq!(saved["attributes"]["model"], "local_granite_3b");
+    assert_eq!(saved["attributes"]["model"], "sol_6_1_medium");
     assert!(board.engine.task_value(board.task(&plain), false).unwrap()["attributes"].get("model").is_none());
 }
 
@@ -1296,14 +1291,14 @@ fn task_models_must_be_enabled_for_the_family_and_workspace() {
     assert!(board.fail(board.with("Unknown", json!({"attributes":{"model":"no_such_model"}}))).contains("not enabled"));
     assert!(board.fail(board.with("Retired", json!({"attributes":{"model":"sol_light"}}))).contains("not enabled"));
     assert!(board.fail(board.with("Blank", json!({"attributes":{"model":" "}}))).contains("model"));
-    assert!(board.fail(board.with("Group", json!({"acceptance":[],"attributes":{"model":"local_qwen3_4b"}}))).contains("Containers run no worker"));
+    assert!(board.fail(board.with("Group", json!({"acceptance":[],"attributes":{"model":"luna_6_high"}}))).contains("Containers run no worker"));
     let key = workspace(&board.ws).unwrap();
     board.mutate(move |state| {
         let settings = state.config.workspaces.get_mut(&key).unwrap();
-        settings.agents = BTreeMap::from([("local_qwen3_4b".to_string(), crate::agents::catalog()["local_qwen3_4b"].clone())]);
+        settings.agents = BTreeMap::from([("luna_6_high".to_string(), crate::agents::catalog()["luna_6_high"].clone())]);
     });
-    assert!(board.fail(board.with("Not listed", json!({"attributes":{"model":"local_granite_3b"}}))).contains("not enabled"));
-    board.create(board.with("Listed", json!({"attributes":{"model":"local_qwen3_4b"}})));
+    assert!(board.fail(board.with("Not listed", json!({"attributes":{"model":"sol_6_1_medium"}}))).contains("not enabled"));
+    board.create(board.with("Listed", json!({"attributes":{"model":"luna_6_high"}})));
     board.create(board.with("Default by name", json!({"attributes":{"model":"sol_6_1_light"}})));
 }
 
@@ -1312,8 +1307,8 @@ fn editing_a_task_model_is_a_corrective_revision() {
     let mut board = model_board();
     let id = board.add("Summarize module");
     let revision = board.task(&id).revision;
-    board.engine.edit(&id, json!({"attributes":{"model":"local_qwen3_4b"}})).unwrap();
-    assert_eq!(board.task(&id).attributes.model.as_deref(), Some("local_qwen3_4b"));
+    board.engine.edit(&id, json!({"attributes":{"model":"luna_6_high"}})).unwrap();
+    assert_eq!(board.task(&id).attributes.model.as_deref(), Some("luna_6_high"));
     assert!(board.task(&id).revision >= revision);
     assert!(board.edit_error(&id, json!({"attributes":{"model":"claude_opus_5_5_medium"}})).contains("not enabled"));
 }
@@ -1324,62 +1319,34 @@ fn model_listing_reports_enabled_options_and_the_default() {
     let listed = board.engine.state.models(Some(&workspace(&board.ws).unwrap()));
     assert_eq!(listed["default"], "sol_6_1_light");
     let ids: Vec<_> = listed["agents"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap().to_owned()).collect();
-    assert!(ids.contains(&"local_granite_3b".to_string()) && ids.contains(&"sol_6_1_medium".to_string()));
+    assert!(ids.contains(&"luna_6_high".to_string()) && ids.contains(&"sol_6_1_medium".to_string()));
     assert!(!ids.iter().any(|id| id.starts_with("claude_") || id == "sol_light"));
     let hosted = listed["agents"].as_array().unwrap().iter().find(|a| a["id"] == "sol_6_1_light").unwrap();
-    assert_eq!((hosted["local"].as_bool(), hosted["available"].is_null()), (Some(false), true));
+    assert_eq!(hosted["model"], "gpt-6.1-sol");
 }
 
 #[test]
 fn patching_one_attribute_keeps_the_others() {
     let mut board = model_board();
     let id = board.create(board.with("Tune parser", json!({"attributes":{"lane":"data","size":"medium","needs":["network"],"priority":1}})));
-    board.engine.edit(&id, json!({"attributes":{"model":"local_qwen3_4b"}})).unwrap();
+    board.engine.edit(&id, json!({"attributes":{"model":"luna_6_high"}})).unwrap();
     let attributes = &board.task(&id).attributes;
     assert!(attributes.size == Size::Medium);
-    assert_eq!((attributes.lane, attributes.priority, attributes.model.as_deref()), (Lane::Data, Some(1), Some("local_qwen3_4b")));
+    assert_eq!((attributes.lane, attributes.priority, attributes.model.as_deref()), (Lane::Data, Some(1), Some("luna_6_high")));
     assert_eq!(attributes.needs.len(), 1);
     board.engine.edit(&id, json!({"attributes":{"model":null}})).unwrap();
     assert_eq!((board.task(&id).attributes.model.as_deref(), board.task(&id).attributes.lane), (None, Lane::Data));
 }
 
 #[test]
-fn unserved_local_models_are_rejected_when_chosen() {
-    let mut board = model_board();
-    serve_local(&["qwen3-4b-2507-fp8"]);
-    let error = board.fail(board.with("Rename helper", json!({"attributes":{"model":"local_granite_3b"}})));
-    assert!(error.contains("not being served"), "{error}");
-    let id = board.create(board.with("Summarize", json!({"attributes":{"model":"local_qwen3_4b"}})));
-    assert!(board.edit_error(&id, json!({"attributes":{"model":"local_phi4_mini"}})).contains("not being served"));
-    board.create(board.with("Hosted choice", json!({"attributes":{"model":"sol_6_1_medium"}})));
-}
-
-#[test]
-fn a_model_that_stops_being_served_holds_dispatch_with_a_reason() {
-    let mut board = model_board();
-    let id = board.create(board.with("Summarize", json!({"attributes":{"model":"local_qwen3_4b"}})));
-    let plain = board.add("Default worker task");
-    assert_eq!(board.waiting(&id), None);
-    serve_local(&[]);
-    assert_eq!(board.waiting(&id).as_deref(), Some("Model local_qwen3_4b is not being served"));
-    assert_eq!(board.waiting(&plain), None);
-    board.engine.edit(&id, json!({"outcome":"A clearer outcome holds"})).unwrap();
-    assert!(board.edit_error(&id, json!({"attributes":{"model":"local_granite_3b"}})).contains("not being served"));
-    board.engine.edit(&id, json!({"attributes":{"model":null}})).unwrap();
-    assert_eq!(board.waiting(&id), None);
-}
-
-#[test]
 fn only_implementation_runs_on_the_chosen_model() {
     let mut board = model_board();
-    let id = board.create(board.with("Summarize", json!({"attributes":{"model":"local_qwen3_4b"}})));
-    assert_eq!(board.task(&id).worker_model(), Some("local_qwen3_4b"));
+    let id = board.create(board.with("Summarize", json!({"attributes":{"model":"luna_6_high"}})));
+    assert_eq!(board.task(&id).worker_model(), Some("luna_6_high"));
     board.run(&id, outcome("completed", &["passed"]));
     assert_eq!(board.task(&id).stage, "review");
     assert_eq!(board.task(&id).worker_model(), None);
     let family = board.engine.state.family;
     let settings = board.engine.state.settings(board.task(&id).workspace.as_deref());
     assert_eq!(settings.task_agent(board.task(&id).worker_model(), family).unwrap().0, "sol_6_1_light");
-    serve_local(&[]);
-    assert_eq!(board.waiting(&id), None, "review does not wait for the implementation model");
 }

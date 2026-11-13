@@ -6,7 +6,7 @@ Create a container whose outcome is the blueprint: what the finished result must
 
 Under it, batch many small children, one module or one interface edge each. Link each consumer to its producer with a dependency whose reason names the interface, so unlinked children run in parallel. Each child restates the slice of the blueprint it serves.
 
-Match each child's model to its size from GET /api/agents?workspace=W: small local or hosted models for mechanical children, the default for the rest. Set it as attributes.model.
+Match each child's model to its size from GET /api/agents?workspace=W: small models for mechanical children, the default for the rest. Set it as attributes.model.
 
 You never read, write, run or package solution files; workers do, and you deliver what they finish.
 
