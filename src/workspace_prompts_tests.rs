@@ -2,17 +2,16 @@ use super::*;
 
 #[test]
 fn workspace_agents_are_explicit_and_preserve_exact_model_effort_pairs() {
-    let pairs = [("luna_6_high", "gpt-6-luna", "high"), ("sol_6_1_light", "gpt-6.1-sol", "low"), ("sol_6_1_medium", "gpt-6.1-sol", "medium")];
-    for (name, model, effort) in pairs {
-        let candidate: crate::history::AgentCandidate = serde_json::from_value(json!(name)).unwrap();
-        candidate.validate().unwrap();
-        assert_eq!((candidate.model(), candidate.effort()), (model, effort));
+    let family = Some(crate::agents::Family::Codex);
+    for (name, model, effort) in [("luna_6_high", "gpt-6-luna", "high"), ("sol_6_1_light", "gpt-6.1-sol", "low"), ("sol_6_1_medium", "gpt-6.1-sol", "medium")] {
+        let settings: WorkspaceSettings = serde_json::from_value(json!({"planner":name,"worker":name})).unwrap();
+        settings.validate(family).unwrap();
+        let agent = settings.agent("worker", family).unwrap();
+        assert_eq!((agent.model.as_str(), agent.effort()), (model, effort));
     }
-    let historical: crate::history::AgentCandidate = serde_json::from_value(json!("sol_light")).unwrap();
-    assert_eq!(historical.model(), "gpt-6-sol");
-    assert!(historical.validate().is_err());
-    assert!(WorkspaceSettings::default().validate().is_err());
-    assert_eq!(crate::history::agent_candidates().as_array().unwrap().len(), 3);
+    let historical: WorkspaceSettings = serde_json::from_value(json!({"planner":"sol_light","worker":"sol_light"})).unwrap();
+    assert!(historical.validate(family).is_err());
+    assert!(WorkspaceSettings::default().validate(family).is_err());
 }
 
 struct Fixture(PathBuf);

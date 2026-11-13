@@ -21,7 +21,7 @@ impl Engine {
         let group = workspace(Path::new(input["group"].as_str().ok_or("group required")?))?;
         require(path.starts_with(&group), "Run workspace must be within its group")?;
         let settings: WorkspaceSettings = serde_json::from_value(input["settings"].clone())?;
-        settings.validate()?;
+        settings.validate(self.state.family)?;
         crate::workspace_prompts::verify(&group, &settings)?;
         crate::workspace_prompts::verify(&path, &settings)?;
         let run = WorkspaceRun { id: input["run_id"].as_str().ok_or("run_id required")?.into(), group: group.clone(),

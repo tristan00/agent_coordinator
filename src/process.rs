@@ -37,7 +37,7 @@ pub fn local_json(port: u16, route: &str, body: Option<&Value>) -> Result<Value>
     Ok(value)
 }
 pub fn local_codex(args: &[String]) -> bool {
-    args.len() == 2 && matches!(args[1].as_str(), "--codex" | "--external") && Path::new(&args[0]).file_stem().is_some_and(|name| name.eq_ignore_ascii_case("agent-coordinator"))
+    args.len() == 2 && matches!(args[1].as_str(), "--codex" | "--agent" | "--external") && Path::new(&args[0]).file_stem().is_some_and(|name| name.eq_ignore_ascii_case("agent-coordinator"))
 }
 fn job_result(status: i32) -> Result<()> {
     if status == 0 { Err(std::io::Error::last_os_error().into()) } else { Ok(()) }
@@ -195,11 +195,10 @@ pub fn worker() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let request: Value = serde_json::from_str(&input)?;
-    let selection: crate::history::AgentCandidate = serde_json::from_value(request.get("worker").cloned().ok_or("Explicit worker selection required")?)?;
-    selection.validate()?;
+    let selection = request_agent(&request)?;
     let args: Vec<String> = serde_json::from_value(request["command"].clone())?;
     crate::require(local_codex(&args) || (args.iter().any(|arg| arg == "{model}") && args.iter().any(|arg| arg.contains("{effort}"))), "Worker command requires explicit {model} and {effort} placeholders")?;
-    let args: Vec<_> = args.iter().map(|arg| arg.replace("{model}", selection.model()).replace("{effort}", selection.effort())).collect();
+    let args: Vec<_> = args.iter().map(|arg| arg.replace("{model}", &selection.model).replace("{effort}", selection.effort())).collect();
     let mut child = command(&args[0]).args(&args[1..]).stdin(Stdio::piped()).spawn()?;
     forward_input(&mut child, input.into_bytes());
     crate::require(child.wait()?.success(), "Worker command failed")?;
@@ -253,8 +252,7 @@ fn rules(request: &Value) -> Result<String> {
 }
 pub fn external() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
-    let selection: crate::history::AgentCandidate = serde_json::from_value(request.get("worker").cloned().ok_or("Explicit worker selection required")?)?;
-    selection.validate()?;
+    request_agent(&request)?;
     let result = PathBuf::from(std::env::var("COORDINATOR_RESULT")?);
     let directory = result.parent().unwrap();
     let stage = request["stage"].as_str().unwrap_or("implementation");
@@ -289,8 +287,25 @@ fn action(request: &Value, stage: &str) -> String {
     }
     .into()
 }
+pub(crate) fn request_agent(request: &Value) -> Result<crate::agents::Agent> {
+    let agent: crate::agents::Agent = serde_json::from_value(request.get("agent").cloned().ok_or("Explicit worker agent required")?)?;
+    let recorded: Option<crate::agents::Family> = serde_json::from_value(request["family"].clone()).unwrap_or(None);
+    crate::require(agent.allowed(crate::agents::launcher().or(recorded)), "Worker agent is not allowed for the family that started this coordinator")?;
+    crate::require(!agent.retired, "Worker agent is retired")?;
+    Ok(agent)
+}
+pub(crate) fn prompt(request: &Value, stage: &str) -> Result<String> {
+    Ok(format!("{}
+{}", action(request, stage), rules(request)?))
+}
 pub fn codex() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
+    let agent = request_agent(&request)?;
+    match agent.harness {
+        crate::agents::Harness::ClaudeCode => return crate::adapters::claude(&request, &agent),
+        crate::agents::Harness::OpenaiCompatible => return crate::adapters::local(&request, &agent),
+        crate::agents::Harness::Codex => {}
+    }
     let result = std::env::var("COORDINATOR_RESULT")?;
     let directory = Path::new(&result).parent().unwrap();
     let stage = request["stage"].as_str().unwrap_or("implementation");
@@ -302,10 +317,8 @@ pub fn codex() -> Result<()> {
     let profile = std::env::var_os("USERPROFILE").map(PathBuf::from).filter(|path| path.is_absolute());
     cli.envs(profile.filter(|_| std::env::var_os("CODEX_HOME").is_none_or(|home| home.is_empty())).map(|path| ("CODEX_HOME", path.join(".codex"))));
     cli.env_remove("CODEX_WINDOWS_REGISTERED_CORE").arg("exec");
-    let worker: crate::history::AgentCandidate = serde_json::from_value(request.get("worker").cloned().ok_or("Explicit worker selection required")?)?;
-    worker.validate()?;
-    let model = worker.model();
-    let effort = worker.effort();
+    let model = agent.model.as_str();
+    let effort = agent.effort();
     cli.args(["--model", model, "-c", &format!("model_reasoning_effort=\"{effort}\"")]);
     let read_only = request["readOnly"] == true;
     if let Some(scratch) = request["scratch"].as_str() && read_only {

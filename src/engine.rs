@@ -393,6 +393,8 @@ impl Config {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) family: Option<crate::agents::Family>,
     #[serde(default)]
     pub(crate) benchmark_runs: BTreeMap<PathBuf, crate::benchmark::WorkspaceRun>,
     #[serde(default)]
@@ -760,6 +762,7 @@ impl Engine {
             let config =
                 Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), workspaces: BTreeMap::new(), limits: BTreeMap::new() };
             State {
+                family: None,
                 benchmark_runs: BTreeMap::new(),
                 batches: Default::default(),
                 schema_version: Some(history::SCHEMA_VERSION),
@@ -795,6 +798,7 @@ impl Engine {
         if state.config.replan.is_empty() {
             state.config.replan = state.config.implementation.clone();
         }
+        state.family = crate::agents::family(state.family);
         state.config.adopt_legacy_limits()?;
         for index in 0..state.tasks.len() {
             let task = &mut state.tasks[index];
@@ -965,7 +969,7 @@ impl Engine {
             .map(|(path, settings)| {
                 let path = workspace(&path).map_err(|e| format!("Workspace {}: {e}", path.display()))?;
                 if self.state.config.workspaces.get(&path) != Some(&settings) {
-                    settings.validate()?;
+                    settings.validate(self.state.family)?;
                     crate::workspace_prompts::verify(&path, &settings)?;
                 }
                 Ok((path, settings))
@@ -1049,17 +1053,18 @@ impl Engine {
         let produced = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.stage == "implementation" && a.status() == Some("completed"));
         let home = produced.filter(|_| stage == "review").map_or_else(|| directory.clone(), |a| self.attempt_path(&a.id));
         let settings = self.state.settings(task.workspace.as_deref());
-        settings.validate()?;
-        let worker = settings.worker.ok_or("Workspace worker selection is required")?;
+        settings.validate(self.state.family)?;
+        let agent = settings.agent("worker", self.state.family)?;
+        let worker = settings.worker.clone().unwrap_or_default();
         let cwd = workspace(Path::new(&task.cwd))?;
         let documents = self.state.benchmark_runs.keys().find(|path| cwd.starts_with(path)).map(PathBuf::as_path)
             .or(task.workspace.as_deref()).ok_or("Workspace directory is required")?;
         let protocol = crate::workspace_prompts::worker(documents, &settings)?;
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
-            "cwd":task.workdir(),"model":worker.model(),"effort":worker.effort(),"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
+            "cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
             "languages":task.attributes.languages,"functions":task.attributes.functions,
             "writable":task.writable,"dependencies":task.dependencies,"after":task.after},
-            "worker":worker,"workerProtocol":protocol,"feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
+            "worker":worker,"agent":agent,"family":self.state.family,"workerProtocol":protocol,"feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
             "readOnly":stage != "implementation" || task.read_only()});
         if stage == "review" {
             let implementation = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.stage == "implementation" && a.status() == Some("completed"));
@@ -1084,12 +1089,14 @@ impl Engine {
         if process::local_codex(registered) {
             command[0] = std::env::current_exe()?.to_string_lossy().into_owned();
         }
-        let worker = self.state.settings(task.workspace.as_deref()).worker.ok_or("Workspace worker selection is required")?;
+        let workspace_settings = self.state.settings(task.workspace.as_deref());
+        let agent = workspace_settings.agent("worker", self.state.family)?;
+        let worker = workspace_settings.worker.clone().unwrap_or_default();
         if !process::local_codex(registered) {
             require(command.iter().any(|arg| arg == "{model}") && command.iter().any(|arg| arg.contains("{effort}")), "Worker command requires explicit {model} and {effort} placeholders")?;
         }
-        let actual_command: Vec<_> = command.iter().map(|arg| arg.replace("{model}", worker.model()).replace("{effort}", worker.effort())).collect();
-        let settings = json!({"scratch":true,"acceptance":task.acceptance,"requested":{"model":task.model,"effort":task.effort},"effective":{"worker":worker,"model":worker.model(),"effort":worker.effort()},"needs":task.attributes.needs,
+        let actual_command: Vec<_> = command.iter().map(|arg| arg.replace("{model}", &agent.model).replace("{effort}", agent.effort())).collect();
+        let settings = json!({"scratch":true,"acceptance":task.acceptance,"requested":{"model":task.model,"effort":task.effort},"effective":{"worker":worker,"agent":agent,"family":self.state.family,"model":agent.model,"effort":agent.effort},"needs":task.attributes.needs,
             "registeredCommand":registered,"actualCommand":actual_command,"stage":stage,"request":"request.json","revision":task.revision,
             "workspaceId":task.workspace,"cwd":task.workdir(),"writable":task.writable,
             "coordinatorVersion":env!("CARGO_PKG_VERSION"),"coordinatorBuild":crate::web::deployment()["digest"]});

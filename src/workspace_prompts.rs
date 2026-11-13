@@ -42,7 +42,7 @@ fn candidate(root: &Path, role: &str, selected: &str) -> Result<(Document, Strin
     Ok((Document { candidate: selected.into(), sha256: digest(&text) }, text))
 }
 pub fn catalog(root: &Path) -> Result<Value> {
-    let mut result = json!({"directory":root,"max_words":200,"invalid":[],"agents":crate::history::agent_candidates()});
+    let mut result = json!({"directory":root,"max_words":200,"invalid":[],"agents":crate::agents::listing(&Default::default(), crate::agents::launcher())});
     for (role, _) in DOCUMENTS {
         let mut entries = Vec::new();
         fs::create_dir_all(root.join(role))?;
@@ -85,7 +85,7 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     let target = parent.join(path.file_name().ok_or("Workspace name required")?);
     require(!engine.state.config.workspaces.contains_key(&target), "Workspace already configured")?;
     let mut settings: WorkspaceSettings = serde_json::from_value(input["settings"].clone())?;
-    settings.validate()?;
+    settings.validate(engine.state.family)?;
     let (planner, planner_text) = candidate(root, "project_planner", input["project_planner"].as_str().ok_or("project_planner candidate required")?)?;
     let (worker, worker_text) = candidate(root, "worker_protocol", input["worker_protocol"].as_str().ok_or("worker_protocol candidate required")?)?;
     settings.prompts = Some(Selection { project_planner: planner, worker_protocol: worker });

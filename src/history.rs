@@ -42,41 +42,21 @@ pub enum Updates {
 pub struct WorkspaceSettings {
     pub limits: Limits,
     pub updates: Updates,
-    pub planner: Option<AgentCandidate>,
-    pub worker: Option<AgentCandidate>,
+    pub planner: Option<String>,
+    pub worker: Option<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub agents: std::collections::BTreeMap<String, crate::agents::Agent>,
     pub prompts: Option<crate::workspace_prompts::Selection>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentCandidate {
-    SolLight,
-    #[serde(rename = "luna_6_high")]
-    Luna6High,
-    #[serde(rename = "sol_6_1_light")]
-    Sol61Light,
-    #[serde(rename = "sol_6_1_medium")]
-    Sol61Medium,
-}
-impl AgentCandidate {
-    pub fn model(self) -> &'static str {
-        match self { Self::SolLight => "gpt-6-sol", Self::Luna6High => "gpt-6-luna", Self::Sol61Light | Self::Sol61Medium => "gpt-6.1-sol" }
-    }
-    pub fn effort(self) -> &'static str {
-        match self { Self::SolLight | Self::Sol61Light => "low", Self::Luna6High => "high", Self::Sol61Medium => "medium" }
-    }
-    pub fn validate(self) -> Result<()> {
-        crate::require(self != Self::SolLight, "Workspace agents must be luna_6_high, sol_6_1_light or sol_6_1_medium")
-    }
-}
-pub fn agent_candidates() -> Value {
-    json!([AgentCandidate::Luna6High, AgentCandidate::Sol61Light, AgentCandidate::Sol61Medium]
-        .map(|candidate| json!({"candidate":candidate,"model":candidate.model(),"effort":candidate.effort()})))
-}
 impl WorkspaceSettings {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, family: Option<crate::agents::Family>) -> Result<()> {
         self.limits.validate()?;
-        self.planner.ok_or("Workspace planner selection is required")?.validate()?;
-        self.worker.ok_or("Workspace worker selection is required")?.validate()
+        self.agent("planner", family)?;
+        self.agent("worker", family).map(drop)
+    }
+    pub fn agent(&self, role: &str, family: Option<crate::agents::Family>) -> Result<crate::agents::Agent> {
+        let id = if role == "planner" { &self.planner } else { &self.worker };
+        crate::agents::resolve(&self.agents, id.as_deref().ok_or(format!("Workspace {role} selection is required"))?, family)
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
