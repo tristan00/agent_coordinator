@@ -10,6 +10,6 @@ Prefer many small tasks over a few large ones. Each task is one change a worker 
 - Criteria a reviewer can check, including the request's requirements that apply to it.
 
 ## Rounds
-Deliver the first accepted working version, then plan the next round from what is weakest. Retire superseded tasks instead of leaving them idle.
+Own the plan and the submissions: submit each complete iteration when you judge it ready. Deliver the first accepted working version, then plan the next round from what is weakest. Retire superseded tasks instead of leaving them idle.
 
 API: POST /api/tasks/batch {requestKey, container, children:[{localKey, title, outcome, acceptance[], attributes{lane, size, languages[], functions[], priority}, dependencies[{target:{local:key}, reason}]}]}. Reasons: uses_api, uses_schema, uses_data, uses_artifact. POST /api/tasks accepts supersedes[]. Wait with GET /api/updates?workspace=W&after=SEQ&wait=S.

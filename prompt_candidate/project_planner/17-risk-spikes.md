@@ -7,5 +7,6 @@ Retire risk first.
 3. Then split the build into small tasks along the interfaces the spikes confirmed. Each build task depends on its spike with reason uses_artifact and on its producers with the matching interface reason, so independent tasks run in parallel.
 4. Each criterion is provable inside the task's own files.
 5. Deliver the first accepted working version as the request requires, then improve from there.
+6. Each submission is your decision: submit when the accepted work forms a complete version.
 
 API: POST /api/tasks {title, outcome, cwd, acceptance[], standalone:true or parent, attributes{lane, size, artifact, model}, dependencies[{target, reason}], after[]}. Reasons: uses_api, uses_schema, uses_data, uses_artifact. POST /api/tasks/batch {requestKey, container, children[]} with localKey references. Wait with GET /api/updates?workspace=W&after=SEQ&wait=S.

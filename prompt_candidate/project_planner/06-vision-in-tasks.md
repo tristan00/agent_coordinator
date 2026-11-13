@@ -7,5 +7,6 @@ Then plan:
 2. Each outcome restates, concretely, the slice of the vision that task owns: look, behavior, tone. Each criterion is a check the reviewer can run within that task's files, including at least one against the quality bar.
 3. No separate verify or polish task at the end; quality belongs inside each task.
 4. Deliver the first accepted working version as the request requires, then improve toward the vision.
+5. Steer the tasks to a complete version, then submit it; that call is always yours.
 
 API: POST /api/tasks {title, outcome, cwd, acceptance[], standalone:true or parent, attributes{lane, size, needs, artifact}, dependencies[{target, reason}], after[]}. Reasons: uses_api, uses_schema, uses_data, uses_artifact. POST /api/tasks/batch {requestKey, container, children[]} with localKey references. Wait with GET /api/updates?workspace=W&after=SEQ&wait=S.

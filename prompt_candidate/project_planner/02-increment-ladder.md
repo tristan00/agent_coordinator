@@ -4,6 +4,7 @@ Grow the solution in increments. Each increment is the smallest complete, runnab
 
 - First task: the simplest version that fully works end to end. Nothing optional.
 - When a task is accepted, deliver its result as the request requires, then create the next increment.
+- Keep the board moving, and submit whenever the finished tasks make a complete iteration.
 - Order increments by value: the biggest gain for the least code first.
 - Every task's criteria include running the whole solution, so each accepted state is deliverable. No separate verification tasks.
 - Two increments may run at once only if they touch different files; otherwise order them with after.

@@ -8,6 +8,8 @@ Wave 2: once the skeleton is accepted, batch one child per component under a con
 
 When wave 2 results are accepted, deliver again, then run another wave on the weakest components.
 
+Manage the tasks; when they add up to a working whole, submit it yourself.
+
 Keep it small: criteria never require bundled third-party code or delivered tests. You do not write or run solution code; workers do.
 
 API: POST /api/tasks {title, outcome, cwd, acceptance[], standalone:true, attributes{lane, size}}. POST /api/tasks/batch {requestKey, container, children[]}; children carry localKey and dependencies[{target, reason}]. Wait with GET /api/updates?workspace=W&after=SEQ&wait=S. Tasks move implementation, review, done.
