@@ -49,17 +49,17 @@ fn catalog_keeps_existing_codex_selections_exact() {
 
 #[test]
 fn workspace_definitions_override_the_catalog_and_are_validated() {
-    let custom = Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: "tiny".into(), effort: None, endpoint: Some("http://127.0.0.1:9999/v1".into()), retired: false, note: None };
+    let custom = Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: "tiny".into(), effort: None, endpoint: Some("http://127.0.0.1:9999/v1".into()), retired: false, note: None, worker_only: false };
     let mut defined = BTreeMap::from([("tiny".to_string(), custom.clone())]);
     assert_eq!(resolve(&defined, "tiny", None).unwrap(), custom);
     defined.get_mut("tiny").unwrap().endpoint = Some("https://example.com/v1".into());
     assert!(resolve(&defined, "tiny", None).is_err());
     defined.get_mut("tiny").unwrap().endpoint = None;
     assert!(resolve(&defined, "tiny", None).is_err());
-    let crossed = Agent { provider: Provider::Openai, harness: Harness::ClaudeCode, model: "gpt".into(), effort: None, endpoint: None, retired: false, note: None };
+    let crossed = Agent { provider: Provider::Openai, harness: Harness::ClaudeCode, model: "gpt".into(), effort: None, endpoint: None, retired: false, note: None, worker_only: false };
     defined.insert("crossed".into(), crossed);
     assert!(resolve(&defined, "crossed", Some(Family::Claude)).unwrap_err().to_string().contains("own vendor"));
-    let blank = Agent { provider: Provider::Anthropic, harness: Harness::ClaudeCode, model: " ".into(), effort: None, endpoint: None, retired: false, note: None };
+    let blank = Agent { provider: Provider::Anthropic, harness: Harness::ClaudeCode, model: " ".into(), effort: None, endpoint: None, retired: false, note: None, worker_only: false };
     defined.insert("blank".into(), blank);
     assert!(resolve(&defined, "blank", Some(Family::Claude)).is_err());
 }
@@ -115,7 +115,7 @@ fn served_models_are_read_from_the_openai_model_listing() {
     assert!(served(&models, "qwen3-4b-2507-fp8"));
     assert!(!served(&models, "granite4.2-3b-fp8"));
     assert!(!served(&json!({"error":"x"}), "other"));
-    let unreachable = Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: "m".into(), effort: None, endpoint: Some("http://127.0.0.1:9/v1".into()), retired: false, note: None };
+    let unreachable = Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: "m".into(), effort: None, endpoint: Some("http://127.0.0.1:9/v1".into()), retired: false, note: None, worker_only: false };
     assert_eq!(available(&unreachable), Some(false));
     assert!(require_served("unreachable", &unreachable).unwrap_err().to_string().contains("127.0.0.1:9"));
     serve("http://127.0.0.1:9/v1", &["m"]);
@@ -123,4 +123,17 @@ fn served_models_are_read_from_the_openai_model_listing() {
     assert!(require_served("unreachable", &unreachable).is_ok());
     assert_eq!(available(&catalog()["sol_6_1_light"]), None);
     assert!(require_served("sol_6_1_light", &catalog()["sol_6_1_light"]).is_ok());
+}
+
+#[test]
+fn luna_is_a_worker_only_agent() {
+    let family = Some(Family::Codex);
+    let settings = |planner: &str, worker: &str| -> crate::history::WorkspaceSettings { serde_json::from_value(json!({"planner":planner,"worker":worker})).unwrap() };
+    assert!(settings("luna_6_high", "sol_6_1_light").validate(family).unwrap_err().to_string().contains("only be a worker"));
+    settings("sol_6_1_light", "luna_6_high").validate(family).unwrap();
+    let listed = listing(&BTreeMap::new(), family);
+    let luna = listed["agents"].as_array().unwrap().iter().find(|a| a["id"] == "luna_6_high").unwrap();
+    assert_eq!((luna["planner"].as_bool(), luna["agent"]["workerOnly"].as_bool()), (Some(false), Some(true)));
+    let roundtrip: Agent = serde_json::from_value(serde_json::to_value(&catalog()["luna_6_high"]).unwrap()).unwrap();
+    assert!(roundtrip.worker_only);
 }

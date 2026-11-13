@@ -51,7 +51,7 @@ pub struct WorkspaceSettings {
 impl WorkspaceSettings {
     pub fn validate(&self, family: Option<crate::agents::Family>) -> Result<()> {
         self.limits.validate()?;
-        self.agent("planner", family)?;
+        crate::require(!self.agent("planner", family)?.worker_only, format!("Agent {} can only be a worker", self.planner.as_deref().unwrap_or_default()))?;
         self.agent("worker", family).map(drop)
     }
     pub fn task_agent(&self, requested: Option<&str>, family: Option<crate::agents::Family>) -> Result<(String, crate::agents::Agent)> {

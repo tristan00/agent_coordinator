@@ -38,6 +38,8 @@ pub struct Agent {
     pub retired: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_only: bool,
 }
 impl Agent {
     pub fn effort(&self) -> &str {
@@ -64,16 +66,16 @@ pub fn local_endpoint(url: &str) -> bool {
     ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"].iter().any(|prefix| url.starts_with(prefix))
 }
 fn hosted(provider: Provider, harness: Harness, model: &str, effort: &str, retired: bool, note: &str) -> Agent {
-    Agent { provider, harness, model: model.into(), effort: Some(effort.into()), endpoint: None, retired, note: Some(note.into()) }
+    Agent { provider, harness, model: model.into(), effort: Some(effort.into()), endpoint: None, retired, note: Some(note.into()), worker_only: false }
 }
 fn local(model: &str, note: &str) -> Agent {
-    Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: model.into(), effort: None, endpoint: Some("http://127.0.0.1:8120/v1".into()), retired: false, note: Some(note.into()) }
+    Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: model.into(), effort: None, endpoint: Some("http://127.0.0.1:8120/v1".into()), retired: false, note: Some(note.into()), worker_only: false }
 }
 pub fn catalog() -> BTreeMap<String, Agent> {
     use {Harness::*, Provider::*};
     BTreeMap::from([
         ("sol_light".into(), hosted(Openai, Codex, "gpt-6-sol", "low", true, "Retired")),
-        ("luna_6_high".into(), hosted(Openai, Codex, "gpt-6-luna", "high", false, "Hosted, largest, high reasoning; hardest design and debugging")),
+        ("luna_6_high".into(), Agent { worker_only: true, ..hosted(Openai, Codex, "gpt-6-luna", "high", false, "Hosted, largest, high reasoning; hardest design and debugging") }),
         ("sol_6_1_light".into(), hosted(Openai, Codex, "gpt-6.1-sol", "low", false, "Hosted, mid size, low reasoning; routine implementation")),
         ("sol_6_1_medium".into(), hosted(Openai, Codex, "gpt-6.1-sol", "medium", false, "Hosted, mid size, medium reasoning; multi-file features")),
         ("claude_haiku_5_5_low".into(), hosted(Anthropic, ClaudeCode, "claude-haiku-5-5", "low", false, "Hosted, small, fast; routine edits, summaries, checks")),
@@ -168,7 +170,7 @@ pub fn require_served(id: &str, agent: &Agent) -> Result<()> {
 pub fn listing(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> Value {
     let mut all = catalog();
     all.extend(defined.clone());
-    json!({"family":family,"agents":all.into_iter().filter(|(_, a)| !a.retired).map(|(id, a)| json!({"id":id,"allowed":a.allowed(family),"agent":a})).collect::<Vec<_>>()})
+    json!({"family":family,"agents":all.into_iter().filter(|(_, a)| !a.retired).map(|(id, a)| json!({"id":id,"allowed":a.allowed(family),"planner":!a.worker_only,"agent":a})).collect::<Vec<_>>()})
 }
 #[cfg(test)]
 #[path = "agents_tests.rs"]
