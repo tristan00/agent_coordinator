@@ -1,7 +1,6 @@
 mod adapters;
 mod agents;
 mod analytics;
-mod benchmark;
 mod engine;
 mod evidence;
 mod history;

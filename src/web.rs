@@ -160,8 +160,6 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
             ("POST", ["", "api", "tasks", id, "replan"]) => engine.request_replan(id, input),
             ("DELETE", ["", "api", "tasks", id]) => engine.remove(id).map(|()| json!({"ok":true})),
             ("PUT", ["", "api", "config"]) => engine.configure(input).map(|()| json!({"ok":true})),
-            ("POST", ["", "api", "benchmark-runs"]) => engine.register_benchmark(input),
-            ("POST", ["", "api", "benchmark-runs", id, "stop"]) => engine.stop_benchmark(id),
             ("POST", ["", "api", action @ ("stop" | "resume")]) => engine.control(*action == "stop", None).map(|()| json!({"ok":true})),
             ("POST", ["", "api", "tasks", id, action @ ("stop" | "resume")]) => engine.control(*action == "stop", Some(id)).map(|()| json!({"ok":true})),
             _ => Err("Unknown route".into()),

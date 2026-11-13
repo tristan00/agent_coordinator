@@ -403,8 +403,6 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) family: Option<crate::agents::Family>,
     #[serde(default)]
-    pub(crate) benchmark_runs: BTreeMap<PathBuf, crate::benchmark::WorkspaceRun>,
-    #[serde(default)]
     batches: std::collections::BTreeMap<String, Value>,
     #[serde(default, rename = "schemaVersion")]
     schema_version: Option<u32>,
@@ -441,6 +439,9 @@ impl State {
         }
         chain
     }
+    fn owning_workspace(&self, directory: PathBuf) -> PathBuf {
+        self.config.workspaces.keys().filter(|path| directory.starts_with(path)).max_by_key(|path| path.components().count()).cloned().unwrap_or(directory)
+    }
     pub fn settings(&self, key: Option<&Path>) -> history::WorkspaceSettings {
         key.and_then(|key| self.config.workspaces.get(key)).cloned().unwrap_or_default()
     }
@@ -457,7 +458,6 @@ impl State {
         self.settings(key.as_deref()).limits
     }
     pub fn check_definition(&self, task: &Task) -> Result<()> {
-        require(!crate::benchmark::expired(self, task), "Benchmark workspace is closed")?;
         let limits = self.limits(task);
         require(!(task.title.is_empty() || task.outcome.is_empty() || task.cwd.trim().is_empty()), "Title, outcome and cwd are required")?;
         require(history::words(&task.title) <= limits.title_words, format!("Title exceeds {} words", limits.title_words))?;
@@ -567,8 +567,7 @@ impl State {
         let cwd = input.cwd.clone().ok_or("cwd is required")?;
         let directory = workspace(Path::new(&cwd))?;
         let run_directory = directory.clone();
-        let directory = self.benchmark_runs.iter().find(|(path, _)| directory.starts_with(path))
-            .map(|(_, run)| run.group.clone()).unwrap_or(directory);
+        let directory = self.owning_workspace(directory);
         if let Some(key) = &key
             && let Some(index) = self.tasks.iter().position(|task| task.key.as_ref() == Some(key) && task.workspace.as_ref() == Some(&directory) && (directory == run_directory || task.cwd == cwd))
         {
@@ -581,9 +580,7 @@ impl State {
             json!({"id":id(),"title":"","outcome":"","cwd":cwd,"acceptance":[],"dependencies":[],"stage":"implementation","stopped":false,"attempts":[],"active":null,"feedback":[],"failure":"","retryAt":0,"key":key,"workspace":directory}),
         )?;
         input.apply(&mut task)?;
-        if let Some((_, run)) = self.benchmark_runs.iter().find(|(path, _)| task.workspace.as_ref().is_some_and(|cwd| cwd.starts_with(path))) {
-            task.workspace = Some(run.group.clone());
-        }
+        task.workspace = task.workspace.take().map(|directory| self.owning_workspace(directory));
         self.check_definition(&task)?;
         self.check_relations(&task)?;
         if let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id)) {
@@ -677,9 +674,7 @@ impl State {
         let previous = self.tasks[index].clone();
         let mut task = previous.clone();
         input.apply(&mut task)?;
-        if let Some((_, run)) = self.benchmark_runs.iter().find(|(path, _)| task.workspace.as_ref().is_some_and(|cwd| cwd.starts_with(path))) {
-            task.workspace = Some(run.group.clone());
-        }
+        task.workspace = task.workspace.take().map(|directory| self.owning_workspace(directory));
         if task.parent != previous.parent
             && let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id))
         {
@@ -787,7 +782,6 @@ impl Engine {
                 Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), workspaces: BTreeMap::new(), limits: BTreeMap::new() };
             State {
                 family: None,
-                benchmark_runs: BTreeMap::new(),
                 batches: Default::default(),
                 schema_version: Some(history::SCHEMA_VERSION),
                 paused: false,
@@ -989,7 +983,7 @@ impl Engine {
         }
         let source = Path::new(option_env!("COORDINATOR_SOURCE_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"))).canonicalize()?;
         let data = self.directory.canonicalize()?;
-        let directories: std::collections::BTreeSet<PathBuf> = self.state.config.workspaces.keys().chain(self.state.benchmark_runs.keys()).cloned().collect();
+        let directories: std::collections::BTreeSet<PathBuf> = self.state.config.workspaces.keys().cloned().collect();
         let (mut removed, mut errors) = (Vec::new(), Vec::new());
         for path in &directories {
             let Ok(resolved) = path.canonicalize() else { continue };
@@ -1009,13 +1003,12 @@ impl Engine {
             errors.push(format!("{}: {error}", attempts.display()));
         }
         let state = &self.state;
-        let deleted = json!({"tasks":state.tasks.len(),"archived":state.archived.len(),"workspaces":state.config.workspaces.len(),"benchmarkRuns":state.benchmark_runs.len(),"batches":state.batches.len(),"stoppedWorkers":active.len()});
+        let deleted = json!({"tasks":state.tasks.len(),"archived":state.archived.len(),"workspaces":state.config.workspaces.len(),"batches":state.batches.len(),"stoppedWorkers":active.len()});
         let mut state = self.state.clone();
         state.tasks.clear();
         state.archived.clear();
         state.controls.clear();
         state.batches.clear();
-        state.benchmark_runs.clear();
         state.changes.clear();
         state.config.workspaces.clear();
         state.config.limits.clear();
@@ -1116,9 +1109,7 @@ impl Engine {
         let settings = self.state.settings(task.workspace.as_deref());
         settings.validate(self.state.family)?;
         let (worker, agent) = settings.task_agent(task.worker_model(), self.state.family)?;
-        let cwd = workspace(Path::new(&task.cwd))?;
-        let documents = self.state.benchmark_runs.keys().find(|path| cwd.starts_with(path)).map(PathBuf::as_path)
-            .or(task.workspace.as_deref()).ok_or("Workspace directory is required")?;
+        let documents = task.workspace.as_deref().ok_or("Workspace directory is required")?;
         let protocol = crate::workspace_prompts::worker(documents, &settings)?;
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
             "cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
@@ -1451,7 +1442,6 @@ impl Engine {
         self.launch(&id).or_else(|error| write(&exit, &json!({"error":error.to_string(),"ended":now()})))
     }
     pub fn tick(&mut self) -> Result<()> {
-        self.expire_benchmark_runs()?;
         let mut outcome = Ok(());
         for index in 0..self.state.tasks.len() {
             outcome = self.poll_attempt(index).and(outcome);

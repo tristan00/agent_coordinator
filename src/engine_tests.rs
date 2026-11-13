@@ -1357,3 +1357,24 @@ fn wipe_deletes_every_task_workspace_and_attempt() {
     let reloaded = Engine::new(engine.directory.clone()).unwrap();
     assert!(reloaded.state.tasks.is_empty() && reloaded.state.config.workspaces.is_empty());
 }
+
+#[test]
+fn tasks_in_a_subfolder_belong_to_the_configured_workspace_that_contains_it() {
+    let temp = crate::test_support::Temp::new();
+    let mut engine = temp.engine();
+    let ws = temp.dir("workspace");
+    let child = temp.dir("workspace/maze_game");
+    let outside = temp.dir("elsewhere");
+    let key = workspace(&ws).unwrap();
+    let settings: history::WorkspaceSettings = serde_json::from_value(json!({"planner":"sol_6_1_medium","worker":"sol_6_1_light"})).unwrap();
+    let mut state = engine.state.clone();
+    state.config.workspaces.insert(key.clone(), settings);
+    engine.commit(state).unwrap();
+    let inside = engine.create(json!({"title":"Inside","outcome":"Done","cwd":child,"acceptance":["Works"],"standalone":true})).unwrap();
+    let other = engine.create(json!({"title":"Outside","outcome":"Done","cwd":outside,"acceptance":["Works"],"standalone":true})).unwrap();
+    let find = |id: &Value| engine.state.tasks.iter().find(|t| t.id == id["id"].as_str().unwrap()).unwrap().workspace.clone();
+    assert_eq!(find(&inside), Some(key.clone()));
+    assert_eq!(find(&other), Some(workspace(&outside).unwrap()));
+    let task = engine.state.tasks.iter().find(|t| t.id == inside["id"].as_str().unwrap()).unwrap();
+    assert_eq!(engine.state.settings(task.workspace.as_deref()).worker.as_deref(), Some("sol_6_1_light"));
+}
