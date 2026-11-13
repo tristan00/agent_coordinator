@@ -1257,3 +1257,70 @@ fn legacy_limits_are_adopted_into_workspace_settings() {
     state["config"]["workspaces"] = keyed(&ws, json!({"limits":{"criteria":1}}));
     load(&temp, &state).unwrap();
 }
+
+fn model_board() -> Board {
+    let mut board = Board::new();
+    let key = workspace(&board.ws).unwrap();
+    board.mutate(move |state| {
+        let settings: history::WorkspaceSettings = serde_json::from_value(json!({"planner":"sol_6_1_medium","worker":"sol_6_1_light"})).unwrap();
+        state.config.workspaces.insert(key, settings);
+    });
+    board
+}
+
+#[test]
+fn tasks_may_choose_an_enabled_model_and_default_to_the_workspace_worker() {
+    let mut board = model_board();
+    let chosen = board.create(board.with("Rename helper", json!({"attributes":{"model":"local_granite_3b"}})));
+    let plain = board.add("Plain task");
+    let family = board.engine.state.family;
+    let settings = board.engine.state.settings(board.task(&chosen).workspace.as_deref());
+    let (id, agent) = settings.task_agent(board.task(&chosen).attributes.model.as_deref(), family).unwrap();
+    assert_eq!((id.as_str(), agent.model.as_str()), ("local_granite_3b", "granite4.2-3b-fp8"));
+    let (id, agent) = settings.task_agent(board.task(&plain).attributes.model.as_deref(), family).unwrap();
+    assert_eq!((id.as_str(), agent.model.as_str()), ("sol_6_1_light", "gpt-6.1-sol"));
+    let saved = board.engine.task_value(board.task(&chosen), false).unwrap();
+    assert_eq!(saved["attributes"]["model"], "local_granite_3b");
+    assert!(board.engine.task_value(board.task(&plain), false).unwrap()["attributes"].get("model").is_none());
+}
+
+#[test]
+fn task_models_must_be_enabled_for_the_family_and_workspace() {
+    let mut board = model_board();
+    assert!(board.fail(board.with("Crossed", json!({"attributes":{"model":"claude_haiku_5_5_low"}}))).contains("not enabled"));
+    assert!(board.fail(board.with("Unknown", json!({"attributes":{"model":"no_such_model"}}))).contains("not enabled"));
+    assert!(board.fail(board.with("Retired", json!({"attributes":{"model":"sol_light"}}))).contains("not enabled"));
+    assert!(board.fail(board.with("Blank", json!({"attributes":{"model":" "}}))).contains("model"));
+    assert!(board.fail(board.with("Group", json!({"acceptance":[],"attributes":{"model":"local_qwen3_4b"}}))).contains("Containers run no worker"));
+    let key = workspace(&board.ws).unwrap();
+    board.mutate(move |state| {
+        let settings = state.config.workspaces.get_mut(&key).unwrap();
+        settings.agents = BTreeMap::from([("local_qwen3_4b".to_string(), crate::agents::catalog()["local_qwen3_4b"].clone())]);
+    });
+    assert!(board.fail(board.with("Not listed", json!({"attributes":{"model":"local_granite_3b"}}))).contains("not enabled"));
+    board.create(board.with("Listed", json!({"attributes":{"model":"local_qwen3_4b"}})));
+    board.create(board.with("Default by name", json!({"attributes":{"model":"sol_6_1_light"}})));
+}
+
+#[test]
+fn editing_a_task_model_is_a_corrective_revision() {
+    let mut board = model_board();
+    let id = board.add("Summarize module");
+    let revision = board.task(&id).revision;
+    board.engine.edit(&id, json!({"attributes":{"model":"local_qwen3_4b"}})).unwrap();
+    assert_eq!(board.task(&id).attributes.model.as_deref(), Some("local_qwen3_4b"));
+    assert!(board.task(&id).revision >= revision);
+    assert!(board.edit_error(&id, json!({"attributes":{"model":"claude_opus_5_5_medium"}})).contains("not enabled"));
+}
+
+#[test]
+fn model_listing_reports_enabled_options_and_the_default() {
+    let board = model_board();
+    let listed = board.engine.state.models(Some(&workspace(&board.ws).unwrap()));
+    assert_eq!(listed["default"], "sol_6_1_light");
+    let ids: Vec<_> = listed["agents"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap().to_owned()).collect();
+    assert!(ids.contains(&"local_granite_3b".to_string()) && ids.contains(&"sol_6_1_medium".to_string()));
+    assert!(!ids.iter().any(|id| id.starts_with("claude_") || id == "sol_light"));
+    let hosted = listed["agents"].as_array().unwrap().iter().find(|a| a["id"] == "sol_6_1_light").unwrap();
+    assert_eq!((hosted["local"].as_bool(), hosted["available"].is_null()), (Some(false), true));
+}

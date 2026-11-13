@@ -49,17 +49,17 @@ fn catalog_keeps_existing_codex_selections_exact() {
 
 #[test]
 fn workspace_definitions_override_the_catalog_and_are_validated() {
-    let custom = Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: "tiny".into(), effort: None, endpoint: Some("http://127.0.0.1:9999/v1".into()), retired: false };
+    let custom = Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: "tiny".into(), effort: None, endpoint: Some("http://127.0.0.1:9999/v1".into()), retired: false, note: None };
     let mut defined = BTreeMap::from([("tiny".to_string(), custom.clone())]);
     assert_eq!(resolve(&defined, "tiny", None).unwrap(), custom);
     defined.get_mut("tiny").unwrap().endpoint = Some("https://example.com/v1".into());
     assert!(resolve(&defined, "tiny", None).is_err());
     defined.get_mut("tiny").unwrap().endpoint = None;
     assert!(resolve(&defined, "tiny", None).is_err());
-    let crossed = Agent { provider: Provider::Openai, harness: Harness::ClaudeCode, model: "gpt".into(), effort: None, endpoint: None, retired: false };
+    let crossed = Agent { provider: Provider::Openai, harness: Harness::ClaudeCode, model: "gpt".into(), effort: None, endpoint: None, retired: false, note: None };
     defined.insert("crossed".into(), crossed);
     assert!(resolve(&defined, "crossed", Some(Family::Claude)).unwrap_err().to_string().contains("own vendor"));
-    let blank = Agent { provider: Provider::Anthropic, harness: Harness::ClaudeCode, model: " ".into(), effort: None, endpoint: None, retired: false };
+    let blank = Agent { provider: Provider::Anthropic, harness: Harness::ClaudeCode, model: " ".into(), effort: None, endpoint: None, retired: false, note: None };
     defined.insert("blank".into(), blank);
     assert!(resolve(&defined, "blank", Some(Family::Claude)).is_err());
 }
@@ -88,4 +88,34 @@ fn local_endpoints_must_be_loopback_http() {
     assert!(local_endpoint("http://localhost:11434/v1"));
     assert!(!local_endpoint("http://10.0.0.2:8120/v1"));
     assert!(!local_endpoint("https://127.0.0.1:8120/v1"));
+}
+
+#[test]
+fn enabled_lists_workspace_definitions_or_the_family_catalog() {
+    let all = enabled(&BTreeMap::new(), Some(Family::Claude));
+    assert!(all.contains_key("claude_haiku_5_5_low") && all.contains_key("local_granite_3b"));
+    assert!(!all.contains_key("sol_6_1_light") && !all.contains_key("sol_light"));
+    let defined = BTreeMap::from([("local_qwen3_4b".to_string(), catalog()["local_qwen3_4b"].clone()), ("sol_6_1_light".to_string(), catalog()["sol_6_1_light"].clone())]);
+    let listed = enabled(&defined, Some(Family::Claude));
+    assert_eq!(listed.keys().collect::<Vec<_>>(), ["local_qwen3_4b"]);
+}
+
+#[test]
+fn local_catalog_models_fit_the_forty_percent_gpu_budget_notes() {
+    for (id, agent) in catalog().into_iter().filter(|(_, a)| a.provider == Provider::Local) {
+        let gigabytes: f64 = agent.note.as_deref().unwrap().split("about ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+        assert!(gigabytes <= 12.8 * 0.75, "{id} weights leave too little cache inside 40% of a 32 GB GPU");
+        assert_eq!(agent.endpoint.as_deref(), Some("http://127.0.0.1:8120/v1"));
+    }
+}
+
+#[test]
+fn served_models_are_read_from_the_openai_model_listing() {
+    let models = json!({"object":"list","data":[{"id":"qwen3-4b-2507-fp8"},{"id":"other"}]});
+    assert!(served(&models, "qwen3-4b-2507-fp8"));
+    assert!(!served(&models, "granite4.2-3b-fp8"));
+    assert!(!served(&json!({"error":"x"}), "other"));
+    let unreachable = Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: "m".into(), effort: None, endpoint: Some("http://127.0.0.1:9/v1".into()), retired: false, note: None };
+    assert_eq!(available(&unreachable), Some(false));
+    assert_eq!(available(&catalog()["sol_6_1_light"]), None);
 }

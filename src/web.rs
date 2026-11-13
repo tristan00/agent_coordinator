@@ -208,6 +208,7 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
             let query = update_query(full)?;
             engine.updates(query.workspace.as_deref(), query.after, error)
         }
+        ["", "api", "agents"] => engine.state.models(update_query(full)?.workspace.as_deref()),
         ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
         ["", "api", "prompt-candidates"] => crate::workspace_prompts::catalog(&crate::workspace_prompts::root())?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),

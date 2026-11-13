@@ -36,6 +36,8 @@ pub struct Agent {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retired: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 impl Agent {
     pub fn effort(&self) -> &str {
@@ -61,25 +63,28 @@ impl Agent {
 pub fn local_endpoint(url: &str) -> bool {
     ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"].iter().any(|prefix| url.starts_with(prefix))
 }
-fn hosted(provider: Provider, harness: Harness, model: &str, effort: &str, retired: bool) -> Agent {
-    Agent { provider, harness, model: model.into(), effort: Some(effort.into()), endpoint: None, retired }
+fn hosted(provider: Provider, harness: Harness, model: &str, effort: &str, retired: bool, note: &str) -> Agent {
+    Agent { provider, harness, model: model.into(), effort: Some(effort.into()), endpoint: None, retired, note: Some(note.into()) }
 }
-fn local(model: &str) -> Agent {
-    Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: model.into(), effort: None, endpoint: Some("http://127.0.0.1:8120/v1".into()), retired: false }
+fn local(model: &str, note: &str) -> Agent {
+    Agent { provider: Provider::Local, harness: Harness::OpenaiCompatible, model: model.into(), effort: None, endpoint: Some("http://127.0.0.1:8120/v1".into()), retired: false, note: Some(note.into()) }
 }
 pub fn catalog() -> BTreeMap<String, Agent> {
     use {Harness::*, Provider::*};
     BTreeMap::from([
-        ("sol_light".into(), hosted(Openai, Codex, "gpt-6-sol", "low", true)),
-        ("luna_6_high".into(), hosted(Openai, Codex, "gpt-6-luna", "high", false)),
-        ("sol_6_1_light".into(), hosted(Openai, Codex, "gpt-6.1-sol", "low", false)),
-        ("sol_6_1_medium".into(), hosted(Openai, Codex, "gpt-6.1-sol", "medium", false)),
-        ("claude_haiku_5_5_low".into(), hosted(Anthropic, ClaudeCode, "claude-haiku-5-5", "low", false)),
-        ("claude_sonnet_5_5_low".into(), hosted(Anthropic, ClaudeCode, "claude-sonnet-5-5", "low", false)),
-        ("claude_sonnet_5_5_medium".into(), hosted(Anthropic, ClaudeCode, "claude-sonnet-5-5", "medium", false)),
-        ("claude_opus_5_5_medium".into(), hosted(Anthropic, ClaudeCode, "claude-opus-5-5", "medium", false)),
-        ("local_qwen3_4b".into(), local("qwen3-4b-2507-fp8")),
-        ("local_qwen3_8b".into(), local("qwen3-8b-fp8")),
+        ("sol_light".into(), hosted(Openai, Codex, "gpt-6-sol", "low", true, "Retired")),
+        ("luna_6_high".into(), hosted(Openai, Codex, "gpt-6-luna", "high", false, "Hosted, largest, high reasoning; hardest design and debugging")),
+        ("sol_6_1_light".into(), hosted(Openai, Codex, "gpt-6.1-sol", "low", false, "Hosted, mid size, low reasoning; routine implementation")),
+        ("sol_6_1_medium".into(), hosted(Openai, Codex, "gpt-6.1-sol", "medium", false, "Hosted, mid size, medium reasoning; multi-file features")),
+        ("claude_haiku_5_5_low".into(), hosted(Anthropic, ClaudeCode, "claude-haiku-5-5", "low", false, "Hosted, small, fast; routine edits, summaries, checks")),
+        ("claude_sonnet_5_5_low".into(), hosted(Anthropic, ClaudeCode, "claude-sonnet-5-5", "low", false, "Hosted, mid size, low effort; routine implementation")),
+        ("claude_sonnet_5_5_medium".into(), hosted(Anthropic, ClaudeCode, "claude-sonnet-5-5", "medium", false, "Hosted, mid size, medium effort; multi-file features")),
+        ("claude_opus_5_5_medium".into(), hosted(Anthropic, ClaudeCode, "claude-opus-5-5", "medium", false, "Hosted, largest; hardest design and debugging")),
+        ("local_granite_3b".into(), local("granite4.2-3b-fp8", "Local 3B, about 4 GB; one-line edits, renames, short summaries")),
+        ("local_ministral_3b".into(), local("ministral3-3b", "Local 3B, about 7 GB; short summaries and simple checks")),
+        ("local_phi4_mini".into(), local("phi4-mini", "Local 3.8B, about 8 GB; small single-file edits")),
+        ("local_qwen3_4b".into(), local("qwen3-4b-2507-fp8", "Local 4B, about 5 GB; small single-file edits and summaries")),
+        ("local_qwen3_8b".into(), local("qwen3-8b-fp8", "Local 8B, about 9 GB; small features in one or two files")),
     ])
 }
 pub fn detect(variable: impl Fn(&str) -> Option<String>) -> Option<Family> {
@@ -117,6 +122,18 @@ pub fn resolve(defined: &BTreeMap<String, Agent>, id: &str, family: Option<Famil
         format!("Agent {id} is not allowed when the coordinator was started by {}; only {} and local agents are enabled", family.map_or("an undetected launcher".into(), |f| json!(f).as_str().unwrap().to_owned()), family.map_or("no hosted", |f| if f == Family::Claude { "Claude" } else { "Codex" })),
     )?;
     Ok(agent)
+}
+pub fn enabled(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> BTreeMap<String, Agent> {
+    let source = if defined.is_empty() { catalog() } else { defined.clone() };
+    source.into_iter().filter(|(_, agent)| !agent.retired && agent.validate().is_ok() && agent.allowed(family)).collect()
+}
+pub fn served(models: &Value, model: &str) -> bool {
+    models["data"].as_array().is_some_and(|items| items.iter().any(|item| item["id"] == model))
+}
+pub fn available(agent: &Agent) -> Option<bool> {
+    let endpoint = agent.endpoint.as_deref().filter(|_| agent.provider == Provider::Local)?;
+    let output = crate::process::command("curl.exe").args(["-q", "-sS", "--max-time", "1", "--noproxy", "*", &format!("{}/models", endpoint.trim_end_matches('/'))]).output().ok()?;
+    Some(output.status.success() && serde_json::from_slice(&output.stdout).is_ok_and(|models: Value| served(&models, &agent.model)))
 }
 pub fn listing(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> Value {
     let mut all = catalog();

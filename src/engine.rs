@@ -437,6 +437,14 @@ impl State {
     pub fn settings(&self, key: Option<&Path>) -> history::WorkspaceSettings {
         key.and_then(|key| self.config.workspaces.get(key)).cloned().unwrap_or_default()
     }
+    pub fn models(&self, key: Option<&Path>) -> Value {
+        let settings = self.settings(key);
+        let agents: Vec<_> = crate::agents::enabled(&settings.agents, self.family)
+            .into_iter()
+            .map(|(id, agent)| json!({"id":id,"provider":agent.provider,"model":agent.model,"effort":agent.effort,"local":agent.provider == crate::agents::Provider::Local,"note":agent.note,"available":crate::agents::available(&agent)}))
+            .collect();
+        json!({"family":self.family,"default":settings.worker,"agents":agents,"usage":"Set attributes.model to an id to choose a task's worker; omit it to use the default."})
+    }
     pub fn limits(&self, task: &Task) -> history::Limits {
         let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
         self.settings(key.as_deref()).limits
@@ -453,6 +461,11 @@ impl State {
         require(!(task.attributes.size == Size::Large && !task.container()), "Large work must be a container with child tasks")?;
         require(!(task.container() && task.attributes.artifact != Artifact::None), "Containers produce no artifact; children do")?;
         task.attributes.validate()?;
+        if let Some(model) = task.attributes.model.as_deref() {
+            require(!task.container(), "Containers run no worker; set model on their children")?;
+            let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
+            self.settings(key.as_deref()).task_agent(Some(model), self.family)?;
+        }
         task.effort.as_deref().map(history::effort).transpose()?;
         let missing: Vec<_> = task.attributes.needs.iter().filter(|need| !self.config.capabilities.contains(need)).collect();
         require(missing.is_empty(), format!("No worker provides {}; choose a verification the workers can run", serde_json::to_string(&missing)?))?;
@@ -1059,8 +1072,7 @@ impl Engine {
         let home = produced.filter(|_| stage == "review").map_or_else(|| directory.clone(), |a| self.attempt_path(&a.id));
         let settings = self.state.settings(task.workspace.as_deref());
         settings.validate(self.state.family)?;
-        let agent = settings.agent("worker", self.state.family)?;
-        let worker = settings.worker.clone().unwrap_or_default();
+        let (worker, agent) = settings.task_agent(task.attributes.model.as_deref(), self.state.family)?;
         let cwd = workspace(Path::new(&task.cwd))?;
         let documents = self.state.benchmark_runs.keys().find(|path| cwd.starts_with(path)).map(PathBuf::as_path)
             .or(task.workspace.as_deref()).ok_or("Workspace directory is required")?;
@@ -1095,8 +1107,7 @@ impl Engine {
             command[0] = std::env::current_exe()?.to_string_lossy().into_owned();
         }
         let workspace_settings = self.state.settings(task.workspace.as_deref());
-        let agent = workspace_settings.agent("worker", self.state.family)?;
-        let worker = workspace_settings.worker.clone().unwrap_or_default();
+        let (worker, agent) = workspace_settings.task_agent(task.attributes.model.as_deref(), self.state.family)?;
         if !process::local_codex(registered) {
             require(command.iter().any(|arg| arg == "{model}") && command.iter().any(|arg| arg.contains("{effort}")), "Worker command requires explicit {model} and {effort} placeholders")?;
         }

@@ -54,6 +54,16 @@ impl WorkspaceSettings {
         self.agent("planner", family)?;
         self.agent("worker", family).map(drop)
     }
+    pub fn task_agent(&self, requested: Option<&str>, family: Option<crate::agents::Family>) -> Result<(String, crate::agents::Agent)> {
+        let id = match requested {
+            Some(id) => id,
+            None => self.worker.as_deref().ok_or("Workspace worker selection is required")?,
+        };
+        if requested.is_some() && requested != self.worker.as_deref() {
+            crate::require(crate::agents::enabled(&self.agents, family).contains_key(id), format!("Model {id} is not enabled for this workspace; GET /api/agents lists the options"))?;
+        }
+        Ok((id.to_owned(), crate::agents::resolve(&self.agents, id, family)?))
+    }
     pub fn agent(&self, role: &str, family: Option<crate::agents::Family>) -> Result<crate::agents::Agent> {
         let id = if role == "planner" { &self.planner } else { &self.worker };
         crate::agents::resolve(&self.agents, id.as_deref().ok_or(format!("Workspace {role} selection is required"))?, family)
@@ -128,16 +138,19 @@ pub struct Attributes {
     pub size: Size,
     pub artifact: Artifact,
     pub deploy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 impl Attributes {
-    pub const FIELDS: [&'static str; 8] = ["lane", "needs", "languages", "functions", "priority", "size", "artifact", "deploy"];
+    pub const FIELDS: [&'static str; 9] = ["lane", "needs", "languages", "functions", "priority", "size", "artifact", "deploy", "model"];
     pub fn priority(&self) -> u8 {
         self.priority.unwrap_or(2)
     }
     pub fn validate(&self) -> Result<()> {
         crate::require(self.languages.iter().all(|v| LANGUAGES.contains(&v.as_str())) && self.functions.iter().all(|v| FUNCTIONS.contains(&v.as_str())), "Unknown classification")?;
         crate::require(self.priority.is_none_or(|p| p <= 3), "Priority must be 0 (highest) to 3")?;
-        crate::require(!(self.deploy && self.artifact != Artifact::Candidate), "deploy requires artifact candidate")
+        crate::require(!(self.deploy && self.artifact != Artifact::Candidate), "deploy requires artifact candidate")?;
+        crate::require(self.model.as_deref().is_none_or(|m| !m.trim().is_empty()), "model must name an enabled agent")
     }
 }
 pub fn effort(value: &str) -> Result<&str> {
