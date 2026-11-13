@@ -66,7 +66,7 @@ pub fn catalog() -> BTreeMap<String, Agent> {
         ("luna_6_high".into(), Agent { worker_only: true, ..hosted(Openai, Codex, "gpt-6-luna", "high", false, "Hosted, largest, high reasoning; hardest design and debugging") }),
         ("sol_6_1_light".into(), hosted(Openai, Codex, "gpt-6.1-sol", "low", false, "Hosted, mid size, low reasoning; routine implementation")),
         ("sol_6_1_medium".into(), hosted(Openai, Codex, "gpt-6.1-sol", "medium", false, "Hosted, mid size, medium reasoning; multi-file features")),
-        ("claude_haiku_5_5_low".into(), hosted(Anthropic, ClaudeCode, "claude-haiku-5-5", "low", false, "Hosted, small, fast; routine edits, summaries, checks")),
+        ("claude_haiku_5_5_low".into(), Agent { worker_only: true, ..hosted(Anthropic, ClaudeCode, "claude-haiku-5-5", "low", false, "Hosted, small, fast; routine edits, summaries, checks") }),
         ("claude_sonnet_5_5_low".into(), hosted(Anthropic, ClaudeCode, "claude-sonnet-5-5", "low", false, "Hosted, mid size, low effort; routine implementation")),
         ("claude_sonnet_5_5_medium".into(), hosted(Anthropic, ClaudeCode, "claude-sonnet-5-5", "medium", false, "Hosted, mid size, medium effort; multi-file features")),
         ("claude_opus_5_5_medium".into(), hosted(Anthropic, ClaudeCode, "claude-opus-5-5", "medium", false, "Hosted, largest; hardest design and debugging")),

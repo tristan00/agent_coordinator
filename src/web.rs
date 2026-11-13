@@ -58,6 +58,9 @@ struct UpdateQuery {
     after: Option<u64>,
     wait: u64,
 }
+fn schema_hint(error: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error + Send + Sync> {
+    format!("{error}. Allowed values and this workspace's limits: GET /api/task-schema?workspace=W").into()
+}
 fn update_query(url: &str) -> Result<UpdateQuery> {
     let mut query = UpdateQuery { workspace: None, after: None, wait: 0 };
     for pair in url.split_once('?').map_or("", |(_, query)| query).split('&').filter(|pair| !pair.is_empty()) {
@@ -153,10 +156,10 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
                 Ok(event)
             }
             ("POST", ["", "api", "wipe"]) => engine.wipe(),
-            ("POST", ["", "api", "tasks"]) => engine.create(input),
+            ("POST", ["", "api", "tasks"]) => engine.create(input).map_err(schema_hint),
             ("POST", ["", "api", "workspaces"]) => crate::workspace_prompts::create(engine, input, &crate::workspace_prompts::root()),
             ("POST", ["", "api", "workspaces", "generate"]) => crate::workspace_prompts::generate(engine, input, &crate::workspace_prompts::root()),
-            ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input),
+            ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input).map_err(schema_hint),
             ("PATCH", ["", "api", "tasks", id]) => engine.edit(id, input),
             ("POST", ["", "api", "tasks", id, "replan"]) => engine.request_replan(id, input),
             ("DELETE", ["", "api", "tasks", id]) => engine.remove(id).map(|()| json!({"ok":true})),
@@ -208,6 +211,8 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
             engine.updates(query.workspace.as_deref(), query.after, error)
         }
         ["", "api", "agents"] => engine.state.models(update_query(full)?.workspace.as_deref()),
+        ["", "api", "tasks"] => engine.scoped_tasks(update_query(full)?.workspace.as_deref())?,
+        ["", "api", "task-schema"] => engine.state.task_schema(update_query(full)?.workspace.as_deref()),
         ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
         ["", "api", "prompt-candidates"] => crate::workspace_prompts::catalog(&crate::workspace_prompts::root())?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),

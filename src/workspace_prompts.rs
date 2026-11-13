@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::{Component, Path, PathBuf}};
 
 pub const DOCUMENTS: [(&str, &str); 2] = [("project_planner", "PROJECT_PLANNER.md"), ("worker_protocol", "WORKER_PROTOCOL.md")];
+pub const LIMITS_FILE: &str = "LIMITS.json";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
@@ -93,6 +94,7 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     let result = (|| {
         fs::write(target.join("PROJECT_PLANNER.md"), planner_text)?;
         fs::write(target.join("WORKER_PROTOCOL.md"), worker_text)?;
+        fs::write(target.join(LIMITS_FILE), serde_json::to_vec_pretty(&settings.limits)?)?;
         verify(&target, &settings)?;
         let path = workspace(&target)?;
         let mut state = engine.state.clone();
@@ -102,7 +104,7 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
         Ok(json!({"workspace":path,"settings":settings}))
     })();
     if result.is_err() {
-        for (_, filename) in DOCUMENTS { let _ = fs::remove_file(target.join(filename)); }
+        for filename in DOCUMENTS.map(|(_, filename)| filename).into_iter().chain([LIMITS_FILE]) { let _ = fs::remove_file(target.join(filename)); }
         let _ = fs::remove_dir(&target);
     }
     result

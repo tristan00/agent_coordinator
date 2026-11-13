@@ -207,12 +207,12 @@ pub fn worker() -> Result<()> {
 pub(crate) fn schema(stage: &str) -> Value {
     let text = json!({"type":"string"});
     let list = json!({"type":"array","items":{"type":"string"}});
-    let lane = json!({"type":"string","enum":["code","ui","data","docs","audit","cleanup"]});
-    let needs = json!({"type":"array","items":{"type":"string","enum":["network","browser","process","gpu"]}});
+    let lane = json!({"type":"string","enum":crate::history::LANES});
+    let needs = json!({"type":"array","items":{"type":"string","enum":crate::history::NEEDS}});
     let size = json!({"type":"string","enum":["small","medium"]});
     let languages = json!({"type":"array","items":{"type":"string","enum":crate::history::LANGUAGES}});
     let functions = json!({"type":"array","items":{"type":"string","enum":crate::history::FUNCTIONS}});
-    let artifact = json!({"type":"string","enum":["none","candidate","report"]});
+    let artifact = json!({"type":"string","enum":crate::history::ARTIFACTS});
     let object = |properties: Value| {
         let required: Vec<String> = properties.as_object().unwrap().keys().cloned().collect();
         json!({"type":"object","additionalProperties":false,"properties":properties,"required":required})

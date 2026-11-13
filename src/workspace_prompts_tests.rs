@@ -64,7 +64,9 @@ fn creation_copies_both_selections_and_freezes_their_hashes() {
     let result = create(&mut engine, fixture.input("first"), &fixture.0).unwrap();
     let directory = PathBuf::from(result["workspace"].as_str().unwrap());
     let settings: WorkspaceSettings = serde_json::from_value(result["settings"].clone()).unwrap();
-    assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+    let limits: serde_json::Value = serde_json::from_slice(&fs::read(directory.join(LIMITS_FILE)).unwrap()).unwrap();
+    assert_eq!(limits, serde_json::to_value(&settings.limits).unwrap());
     assert_eq!(worker(&directory, &settings).unwrap()["text"], "Worker candidate unique instructions.");
     assert_eq!(engine.state.config.workspaces[&directory], settings);
     fs::write(fixture.0.join("worker_protocol/selected.md"), "new ".repeat(200)).unwrap();

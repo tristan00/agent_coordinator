@@ -79,7 +79,14 @@ pub enum Lane {
     Docs,
     Audit,
     Cleanup,
+    Test,
+    Build,
+    Research,
 }
+pub const LANES: [&str; 9] = ["code", "ui", "data", "docs", "audit", "cleanup", "test", "build", "research"];
+pub const SIZES: [&str; 3] = ["small", "medium", "large"];
+pub const NEEDS: [&str; 4] = ["network", "browser", "process", "gpu"];
+pub const ARTIFACTS: [&str; 3] = ["none", "candidate", "report"];
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Need {

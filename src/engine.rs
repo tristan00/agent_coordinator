@@ -439,11 +439,20 @@ impl State {
         }
         chain
     }
-    fn owning_workspace(&self, directory: PathBuf) -> PathBuf {
+    pub(crate) fn owning_workspace(&self, directory: PathBuf) -> PathBuf {
         self.config.workspaces.keys().filter(|path| directory.starts_with(path)).max_by_key(|path| path.components().count()).cloned().unwrap_or(directory)
     }
     pub fn settings(&self, key: Option<&Path>) -> history::WorkspaceSettings {
-        key.and_then(|key| self.config.workspaces.get(key)).cloned().unwrap_or_default()
+        key.and_then(|key| self.config.workspaces.get(&self.owning_workspace(key.to_path_buf()))).cloned().unwrap_or_default()
+    }
+    pub fn in_scope(&self, task: &Task, key: Option<&Path>) -> bool {
+        key.is_none_or(|key| {
+            task.workspace.as_deref() == Some(self.owning_workspace(key.to_path_buf()).as_path()) && workspace(Path::new(&task.cwd)).is_ok_and(|cwd| cwd.starts_with(key))
+        })
+    }
+    pub fn task_schema(&self, key: Option<&Path>) -> Value {
+        json!({"lanes":history::LANES,"laneNotes":{"audit":"Read-only: inspects and reports, never edits files"},"sizes":history::SIZES,"needs":history::NEEDS,"artifacts":history::ARTIFACTS,
+            "priority":"0 (highest) to 3; omitted means 2","dependencyReasons":DEPENDENCY_REASONS,"classifications":history::classification_schema(),"limits":self.settings(key).limits.value()})
     }
     pub fn models(&self, key: Option<&Path>) -> Value {
         let settings = self.settings(key);
@@ -880,10 +889,15 @@ impl Engine {
         Ok(value)
     }
     pub fn changed_since(&self, key: Option<&Path>, after: Option<u64>) -> bool {
-        after.is_none_or(|after| key.map_or(self.state.sequence > after, |key| [key, Path::new("")].into_iter().any(|key| self.state.changes.get(key).is_some_and(|at| *at > after))))
+        let owner = key.map(|key| self.state.owning_workspace(key.to_path_buf()));
+        after.is_none_or(|after| owner.as_deref().map_or(self.state.sequence > after, |key| [key, Path::new("")].into_iter().any(|key| self.state.changes.get(key).is_some_and(|at| *at > after))))
+    }
+    pub fn scoped_tasks(&self, key: Option<&Path>) -> Result<Value> {
+        let tasks = self.state.tasks.iter().filter(|task| self.state.in_scope(task, key)).map(|task| self.task_value(task, false)).collect::<Result<Vec<_>>>()?;
+        Ok(json!({"tasks":tasks}))
     }
     pub fn updates(&self, key: Option<&Path>, after: Option<u64>, error: &str) -> Value {
-        let scoped: Vec<&Task> = self.state.tasks.iter().filter(|task| key.is_none_or(|key| task.workspace.as_deref() == Some(key))).collect();
+        let scoped: Vec<&Task> = self.state.tasks.iter().filter(|task| self.state.in_scope(task, key)).collect();
         json!({"sequence":self.state.sequence,"updates":self.state.settings(key).updates,"paused":self.state.paused,"holdUntil":self.state.hold_until,"error":error,
             "ids":scoped.iter().map(|task| &task.id).collect::<Vec<_>>(),
             "tasks":scoped.iter().filter(|task| after.is_none_or(|after| task.changed > after)).map(|task| task.brief()).collect::<Vec<_>>()})
