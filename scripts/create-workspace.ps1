@@ -48,12 +48,16 @@ $paths = foreach ($item in $Workspace) {
     $known[$key] = $true
     $path
 }
+$plannerDeck = @($planners | Sort-Object { $random.Next() })
+$workerDeck = @($workers | Sort-Object { $random.Next() })
+$index = 0
 $created = foreach ($path in $paths) {
     $limits = [ordered]@{}
     foreach ($entry in $ranges.GetEnumerator()) { $limits[$entry.Key] = $random.Next($entry.Value[0], $entry.Value[1] + 1) }
     $mode = if ($Updates) { $Updates } else { @('poll', 'events')[$random.Next(0, 2)] }
-    $plannerPrompt = if ($ProjectPlanner) { $ProjectPlanner } else { $planners[$random.Next(0, $planners.Count)] }
-    $workerPrompt = if ($WorkerProtocol) { $WorkerProtocol } else { $workers[$random.Next(0, $workers.Count)] }
+    $plannerPrompt = if ($ProjectPlanner) { $ProjectPlanner } else { $plannerDeck[$index % $plannerDeck.Count] }
+    $workerPrompt = if ($WorkerProtocol) { $WorkerProtocol } else { $workerDeck[$index % $workerDeck.Count] }
+    $index++
     $selectedPlanner = if ($Planner) { $Planner } else { $plannerAgents[$random.Next(0, $plannerAgents.Count)] }
     $selectedWorker = if ($Worker) { $Worker } else { $agents[$random.Next(0, $agents.Count)] }
     $body = @{ path = $path; project_planner = $plannerPrompt; worker_protocol = $workerPrompt;
