@@ -982,6 +982,55 @@ impl Engine {
         })
         .map(drop)
     }
+    pub fn wipe(&mut self, input: Value) -> Result<Value> {
+        require(input["confirm"] == "wipe everything", "Send {\"actor\":\"human\",\"confirm\":\"wipe everything\"}; this permanently deletes every task, workspace directory, attempt, batch and benchmark run with no backup")?;
+        require(Actor::api(&input)? == Actor::Human, "Only an explicit user action can wipe the coordinator")?;
+        let active: Vec<String> = self.state.tasks.iter().filter_map(|t| t.active.clone()).collect();
+        for id in &active {
+            self.signal_stop(id)?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while active.iter().any(|id| self.attempt_path(id).exists() && lock(&self.attempt_path(id).join("lock")).is_err()) {
+            require(std::time::Instant::now() < deadline, "Workers are still exiting; send the wipe again")?;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let source = Path::new(option_env!("COORDINATOR_SOURCE_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"))).canonicalize()?;
+        let data = self.directory.canonicalize()?;
+        let directories: std::collections::BTreeSet<PathBuf> = self.state.config.workspaces.keys().chain(self.state.benchmark_runs.keys()).cloned().collect();
+        let (mut removed, mut errors) = (Vec::new(), Vec::new());
+        for path in &directories {
+            let Ok(resolved) = path.canonicalize() else { continue };
+            if resolved.parent().is_none() || source.starts_with(&resolved) || resolved.starts_with(&source) || data.starts_with(&resolved) || resolved.starts_with(&data) {
+                errors.push(format!("Refused to delete {}", path.display()));
+                continue;
+            }
+            match fs::remove_dir_all(&resolved) {
+                Ok(()) => removed.push(path.clone()),
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            }
+        }
+        let attempts = self.directory.join("attempts");
+        if attempts.exists()
+            && let Err(error) = fs::remove_dir_all(&attempts)
+        {
+            errors.push(format!("{}: {error}", attempts.display()));
+        }
+        let state = &self.state;
+        let deleted = json!({"tasks":state.tasks.len(),"archived":state.archived.len(),"workspaces":state.config.workspaces.len(),"benchmarkRuns":state.benchmark_runs.len(),"batches":state.batches.len(),"stoppedWorkers":active.len()});
+        let mut state = self.state.clone();
+        state.tasks.clear();
+        state.archived.clear();
+        state.controls.clear();
+        state.batches.clear();
+        state.benchmark_runs.clear();
+        state.changes.clear();
+        state.config.workspaces.clear();
+        state.config.limits.clear();
+        state.paused = false;
+        state.hold_until = 0;
+        self.commit(state)?;
+        Ok(json!({"deleted":deleted,"removedDirectories":removed,"errors":errors}))
+    }
     pub fn configure(&mut self, value: Value) -> Result<()> {
         let mut config: Config = serde_json::from_value(value)?;
         if config.replan.is_empty() {

@@ -153,6 +153,7 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
                 *shutdown = true;
                 Ok(event)
             }
+            ("POST", ["", "api", "wipe"]) => engine.wipe(input),
             ("POST", ["", "api", "tasks"]) => engine.create(input),
             ("POST", ["", "api", "workspaces"]) => crate::workspace_prompts::create(engine, input, &crate::workspace_prompts::root()),
             ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input),

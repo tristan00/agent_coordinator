@@ -1350,3 +1350,28 @@ fn only_implementation_runs_on_the_chosen_model() {
     let settings = board.engine.state.settings(board.task(&id).workspace.as_deref());
     assert_eq!(settings.task_agent(board.task(&id).worker_model(), family).unwrap().0, "sol_6_1_light");
 }
+
+#[test]
+fn wipe_deletes_every_task_workspace_and_attempt_after_explicit_confirmation() {
+    let temp = crate::test_support::Temp::new();
+    let mut engine = temp.engine();
+    let ws = temp.dir("workspace");
+    fs::write(ws.join("keep.txt"), "x").unwrap();
+    let key = workspace(&ws).unwrap();
+    let settings: history::WorkspaceSettings = serde_json::from_value(json!({"planner":"sol_6_1_medium","worker":"sol_6_1_light"})).unwrap();
+    let mut state = engine.state.clone();
+    state.config.workspaces.insert(key.clone(), settings);
+    engine.commit(state).unwrap();
+    engine.create(json!({"title":"Task","outcome":"Done","cwd":ws,"acceptance":["Works"],"standalone":true})).unwrap();
+    fs::create_dir_all(engine.attempt_path("old")).unwrap();
+    assert!(engine.wipe(json!({"actor":"human"})).unwrap_err().to_string().contains("wipe everything"));
+    assert!(engine.wipe(json!({"confirm":"wipe everything"})).unwrap_err().to_string().contains("explicit user"));
+    assert_eq!(engine.state.tasks.len(), 1);
+    let report = engine.wipe(json!({"actor":"human","confirm":"wipe everything"})).unwrap();
+    assert_eq!((report["deleted"]["tasks"].as_u64(), report["deleted"]["workspaces"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(report["errors"], json!([]));
+    assert!(!ws.exists() && !engine.directory.join("attempts").exists());
+    assert!(engine.state.tasks.is_empty() && engine.state.config.workspaces.is_empty());
+    let reloaded = Engine::new(engine.directory.clone()).unwrap();
+    assert!(reloaded.state.tasks.is_empty() && reloaded.state.config.workspaces.is_empty());
+}
