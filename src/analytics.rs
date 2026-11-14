@@ -21,6 +21,20 @@ fn features(state: &State, task: &Task) -> Value {
         "role":task.attributes.role,"size":task.attributes.size,"priority":task.attributes.priority(),"needs":task.attributes.needs,"artifact":task.attributes.artifact,
         "criteria":task.acceptance.len(),"relations":relations,"container":task.container(),"children":state.children(&task.id).count(),"words":task.definition_words()})
 }
+fn label(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) if items.is_empty() => "none".into(),
+        Value::Array(items) => items.iter().map(label).collect::<Vec<_>>().join(", "),
+        Value::Null => "none".into(),
+        other => other.to_string(),
+    }
+}
+fn within(path: &Value, scope: &Value) -> bool {
+    let key = |value: &Value| value.as_str().unwrap_or_default().replace('\\', "/").trim_start_matches("//?/").trim_end_matches('/').to_lowercase();
+    let (path, scope) = (key(path), key(scope));
+    !scope.is_empty() && (path == scope || path.starts_with(&format!("{scope}/")))
+}
 fn outcomes(task: &Task) -> Value {
     let count = |stage: &str, status: Option<&str>| task.attempts.iter().filter(|a| a.stage == stage && status.is_none_or(|s| a.status() == Some(s))).count();
     let first = task.attempts.iter().filter(|a| a.result.is_some()).take(2).filter_map(|a| a.status()).collect::<Vec<_>>();
@@ -39,14 +53,14 @@ pub fn report(state: &State, input: Value) -> Result<Value> {
     for task in state.tasks.iter().chain(&state.archived) {
         let features = features(state, task);
         let outcomes = outcomes(task);
-        if !window(outcomes["timing"]["createdAt"].as_u64()) || !query.filters.iter().all(|(key, value)| &features[key] == value) {
+        if !window(outcomes["timing"]["createdAt"].as_u64()) || !query.filters.iter().all(|(key, value)| if key == "workspace" { within(&features[key], value) } else { &features[key] == value }) {
             continue;
         }
         rows.push(json!({"id":task.id,"title":task.title,"features":features,"outcomes":outcomes}));
     }
     let mut groups = BTreeMap::<String, Vec<&Value>>::new();
     for row in &rows {
-        let key = query.group_by.as_ref().map_or("all".into(), |g| row["features"][g].to_string());
+        let key = query.group_by.as_ref().map_or("all".into(), |g| label(&row["features"][g]));
         groups.entry(key).or_default().push(row);
     }
     let mean = |rows: &[&Value], path: &str| {

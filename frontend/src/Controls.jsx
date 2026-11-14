@@ -1,9 +1,9 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {ChevronDown, Filter, FolderTree, Search, SlidersHorizontal, X, Check, Palette} from 'lucide-react';
 import {AnimatedCount} from './Activity';
-import {FIELDS, FIELD, GROUPS} from './fields';
+import {FIELDS, FIELD, GROUPS, pathKey, within} from './fields';
 
-export function Popover({label, icon: Icon, badge, children, align = 'left', className = ''}) {
+export function Popover({label, ariaLabel, icon: Icon, badge, children, align = 'left', className = ''}) {
   const [open, setOpen] = useState(false);
   const root = useRef(null);
   useEffect(() => {
@@ -18,7 +18,7 @@ export function Popover({label, icon: Icon, badge, children, align = 'left', cla
     <button type="button" className={`tool ${open ? 'on' : ''}`} aria-expanded={open} aria-haspopup="dialog" onClick={() => setOpen(o => !o)}>
       {Icon && <Icon size={15} aria-hidden="true" />}<span>{label}</span>{badge ? <span className="tool-badge">{badge}</span> : null}<ChevronDown size={14} aria-hidden="true" className="caret" />
     </button>
-    {open && <div className={`popover-panel ${align}`} role="dialog" aria-label={label}>{typeof children === 'function' ? children(() => setOpen(false)) : children}</div>}
+    {open && <div className={`popover-panel ${align}`} role="dialog" aria-label={ariaLabel || label}>{typeof children === 'function' ? children(() => setOpen(false)) : children}</div>}
   </div>;
 }
 
@@ -47,15 +47,44 @@ function AddFilter({tasks, filters, add}) {
   </Popover>;
 }
 
-export function ScopeBar({workspaces, workspace, setWorkspace, query, setQuery, filters, setFilters, tasks, count, total, showFilters = true}) {
+const segments = path => path.split(/[\\/]/).filter(Boolean);
+
+function WorkspacePicker({workspaces, workspace, setWorkspace, tasks, names = {}}) {
+  const [needle, setNeedle] = useState('');
+  const short = useMemo(() => new Map(Object.entries(names).map(([path, name]) => [pathKey(path), name])), [names]);
+  const entries = useMemo(() => {
+    const tally = new Map();
+    workspaces.forEach(path => tally.set(segments(path).at(-1), (tally.get(segments(path).at(-1)) || 0) + 1));
+    return workspaces.map(path => ({path, name: short.get(pathKey(path)), label: segments(path).slice(tally.get(segments(path).at(-1)) > 1 ? -2 : -1).join('/')}))
+      .sort((a, b) => a.label.localeCompare(b.label, undefined, {numeric: true}));
+  }, [workspaces, short]);
+  const count = path => tasks.filter(t => within(t.workspace ?? t.cwd, path)).length;
+  const current = entries.find(e => pathKey(e.path) === pathKey(workspace));
+  const term = needle.trim().toLowerCase();
+  const shown = entries.filter(e => !term || `${e.name || ''} ${e.label}`.toLowerCase().includes(term));
+  const chip = name => name && <span className="task-id ws-id">{name}</span>;
+  const item = (entry, close) => {
+    const on = entry ? pathKey(entry.path) === pathKey(workspace) : !workspace;
+    return <button type="button" className={`picker-item ${on ? 'on' : ''}`} aria-pressed={on} title={entry?.path || 'All workspaces'} onClick={() => {setWorkspace(entry?.path || ''); setNeedle(''); close();}}>
+      <span className="check-mark">{on && <Check size={13} aria-hidden="true" />}</span>{entry && chip(entry.name)}<span className="ws-name">{entry ? entry.label : 'All workspaces'}</span><small>{entry ? count(entry.path) : tasks.length}</small>
+    </button>;
+  };
+  return <Popover className="workspace-picker" label={current ? <>{chip(current.name)}{current.label}</> : 'All workspaces'} ariaLabel="Workspace" icon={FolderTree}>
+    {close => <div className="picker ws-picker">
+      {entries.length > 8 && <label className="picker-search"><Search size={14} aria-hidden="true" /><input autoFocus placeholder="Find workspace…" aria-label="Search workspaces" value={needle} onChange={e => setNeedle(e.target.value)} /></label>}
+      <ul className="picker-list">
+        {!term && <li>{item(null, close)}</li>}
+        {shown.map(entry => <li key={entry.path}>{item(entry, close)}</li>)}
+      </ul>
+      {!shown.length && <p className="muted picker-empty">No matching workspaces</p>}
+    </div>}
+  </Popover>;
+}
+
+export function ScopeBar({workspaces, workspace, setWorkspace, allTasks, workspaceNames, query, setQuery, filters, setFilters, tasks, count, total, showFilters = true}) {
   const toggle = (field, value) => setFilters(list => list.some(f => f.field === field && f.value === value) ? list.filter(f => !(f.field === field && f.value === value)) : [...list, {field, value}]);
-  const short = path => path.split(/[\\/]/).filter(Boolean).slice(-2).join('/');
   return <div className="scopebar" role="search">
-    <label className="scope-workspace" title={workspace || 'All workspaces'}><FolderTree size={15} aria-hidden="true" />
-      <select aria-label="Workspace" value={workspaces.find(path => path.toLowerCase() === workspace.toLowerCase()) || ''} onChange={e => setWorkspace(e.target.value)}>
-        <option value="">All workspaces</option>{workspaces.map(w => <option key={w} value={w}>{short(w)}</option>)}
-      </select>
-    </label>
+    <WorkspacePicker workspaces={workspaces} workspace={workspace} setWorkspace={setWorkspace} tasks={allTasks || tasks} names={workspaceNames} />
     {showFilters && <>
       <label className="scope-search"><Search size={15} aria-hidden="true" /><input type="search" aria-label="Search tasks by ID or title" placeholder="Search ID or title" value={query} onChange={e => setQuery(e.target.value)} /></label>
       <AddFilter tasks={tasks} filters={filters} add={toggle} />

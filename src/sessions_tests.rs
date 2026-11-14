@@ -31,13 +31,14 @@ fn run_planner(engine: &Engine, id: &str) {
 fn a_session_copies_the_workspace_runs_the_planner_and_delivers_on_completion() {
     let temp = Temp::new();
     let (mut engine, source) = setup(&temp, "mkdir submission & echo built> submission\\app.txt & echo raw> data.csv");
-    let case = temp.path().join("case");
+    let case = source.join("case");
     let output = temp.path().join("out");
     let created = create(&mut engine, json!({"workspace":source,"directory":case,"request":"Build it","output":output,"deliverable":"submission"})).unwrap();
     let id = created["id"].as_str().unwrap().to_owned();
     assert_eq!(created["status"], "running");
     assert_eq!(fs::read_dir(&case).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>(), ["LIMITS.json"]);
-    assert!(engine.state.config.workspaces.contains_key(&workspace(&case).unwrap()));
+    assert!(!engine.state.config.workspaces.contains_key(&workspace(&case).unwrap()));
+    assert_eq!(engine.state.owning_workspace(workspace(&case).unwrap()), workspace(&source).unwrap());
     let request: Value = read(&engine.state.sessions[&id].requests[0].run.join("request.json")).unwrap();
     let prompt = request["prompt"].as_str().unwrap();
     assert!(prompt.contains("Request:\nBuild it") && prompt.contains("Planner instructions:\n") && !prompt.contains("Limits"));
@@ -57,7 +58,7 @@ fn a_session_copies_the_workspace_runs_the_planner_and_delivers_on_completion() 
 fn the_session_stays_open_while_tasks_can_still_run_and_follow_ups_resume_it() {
     let temp = Temp::new();
     let (mut engine, source) = setup(&temp, "mkdir submission & echo v> submission\\v.txt");
-    let case = temp.path().join("case");
+    let case = source.join("case");
     let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First","output":temp.path().join("out"),"deliverable":"submission"})).unwrap()["id"].as_str().unwrap().to_owned();
     engine.create(json!({"title":"Pending work","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();
     run_planner(&engine, &id);
@@ -79,7 +80,7 @@ fn the_session_stays_open_while_tasks_can_still_run_and_follow_ups_resume_it() {
 fn deliveries_copy_snapshots_and_stop_ends_the_session() {
     let temp = Temp::new();
     let (mut engine, source) = setup(&temp, "exit 0");
-    let case = temp.path().join("case");
+    let case = source.join("case");
     let output = temp.path().join("out");
     let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"Work","output":output,"deliverable":"submission"})).unwrap()["id"].as_str().unwrap().to_owned();
     assert!(deliver_now(&mut engine, &id).unwrap_err().to_string().contains("does not exist yet"));
@@ -103,7 +104,8 @@ fn requests_are_validated_before_anything_starts() {
     assert!(create(&mut engine, json!({"workspace":source,"request":" ","output":out})).is_err());
     assert!(create(&mut engine, json!({"workspace":source,"request":"x","output":out,"deliverable":"../up"})).is_err());
     assert!(create(&mut engine, json!({"workspace":source,"request":"x","output":out,"callback":"http://example.com/x"})).is_err());
-    let busy = temp.dir("busy");
+    let busy = temp.dir("config/busy");
+    assert!(create(&mut engine, json!({"workspace":source,"directory":temp.path().join("outside"),"request":"x","output":out})).unwrap_err().to_string().contains("inside the workspace"));
     fs::write(busy.join("file.txt"), "x").unwrap();
     assert!(create(&mut engine, json!({"workspace":source,"directory":busy,"request":"x","output":out})).unwrap_err().to_string().contains("new or empty"));
     assert!(engine.state.sessions.is_empty());
@@ -115,8 +117,8 @@ fn a_silent_callback_receiver_never_blocks_the_tick() {
     let (mut engine, source) = setup(&temp, "exit 0");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let callback = format!("http://127.0.0.1:{}/hook", listener.local_addr().unwrap().port());
-    let id = create(&mut engine, json!({"workspace":source,"directory":temp.path().join("case"),"request":"Work","output":temp.path().join("out"),"callback":callback})).unwrap()["id"].as_str().unwrap().to_owned();
-    fs::create_dir_all(temp.path().join("case").join("submission")).unwrap();
+    let id = create(&mut engine, json!({"workspace":source,"directory":source.join("case"),"request":"Work","output":temp.path().join("out"),"callback":callback})).unwrap()["id"].as_str().unwrap().to_owned();
+    fs::create_dir_all(source.join("case").join("submission")).unwrap();
     engine.change(|state| {
         state.sessions.get_mut(&id).unwrap().deliverable = "submission".into();
         Ok(Value::Null)

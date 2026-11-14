@@ -65,9 +65,11 @@ fn report_groups_by_feature_and_filters_rows() {
     let (_temp, engine) = board();
     let grouped = report(&engine.state, json!({"groupBy":"role"})).unwrap();
     let keys: Vec<_> = grouped["groups"].as_object().unwrap().keys().cloned().collect();
-    assert_eq!(keys, ["\"docs\"", "\"worker\""]);
-    assert_eq!(grouped["groups"]["\"worker\""]["tasks"], 3);
-    assert_eq!(grouped["groups"]["\"docs\""]["firstPass"], json!({"n":0,"mean":null}));
+    assert_eq!(keys, ["docs", "worker"]);
+    assert_eq!(grouped["groups"]["worker"]["tasks"], 3);
+    assert_eq!(grouped["groups"]["docs"]["firstPass"], json!({"n":0,"mean":null}));
+    let needs = report(&engine.state, json!({"groupBy":"needs"})).unwrap();
+    assert_eq!(needs["groups"].as_object().unwrap().keys().collect::<Vec<_>>(), ["none"]);
     let containers = report(&engine.state, json!({"groupBy":"container"})).unwrap();
     assert_eq!(containers["groups"]["true"]["tasks"], 1);
     let filtered = report(&engine.state, json!({"filters":{"role":"docs"}})).unwrap();
@@ -100,4 +102,16 @@ fn report_rejects_unknown_groups_and_fields() {
     for group in GROUPS {
         report(&engine.state, json!({"groupBy":group})).unwrap();
     }
+}
+
+#[test]
+fn a_workspace_filter_includes_tasks_in_nested_workspaces() {
+    let (temp, mut engine) = board();
+    let nested = temp.dir("ws/game_build");
+    create(&mut engine, &nested, "Nested", json!({}));
+    let scope = temp.path().join("ws").to_string_lossy().replace('\\', "/").to_uppercase();
+    let titles = |filter: Value| -> Vec<String> { report(&engine.state, json!({"filters":{"workspace":filter}})).unwrap()["tasks"].as_array().unwrap().iter().map(|r| r["title"].as_str().unwrap().to_owned()).collect() };
+    assert_eq!(titles(json!(scope)).len(), 5);
+    assert_eq!(titles(json!(nested.to_string_lossy())), ["Nested"]);
+    assert!(titles(json!(format!("{scope}_other"))).is_empty());
 }

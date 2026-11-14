@@ -52,7 +52,7 @@ impl WorkspaceSettings {
     pub fn validate(&self, family: Option<crate::agents::Family>) -> Result<()> {
         self.limits.validate()?;
         crate::require(!self.agent("planner", family)?.worker_only, format!("Agent {} can only be a worker", self.planner.as_deref().unwrap_or_default()))?;
-        self.agent("worker", family).map(drop)
+        crate::require(!self.agent("worker", family)?.planner_only, format!("Agent {} can only be a planner", self.worker.as_deref().unwrap_or_default()))
     }
     pub fn task_agent(&self, requested: Option<&str>, family: Option<crate::agents::Family>) -> Result<(String, crate::agents::Agent)> {
         let id = match requested {
@@ -62,7 +62,9 @@ impl WorkspaceSettings {
         if requested.is_some() && requested != self.worker.as_deref() {
             crate::require(crate::agents::enabled(&self.agents, family).contains_key(id), format!("Model {id} is not enabled for this workspace; GET /api/agents lists the options"))?;
         }
-        Ok((id.to_owned(), crate::agents::resolve(&self.agents, id, family)?))
+        let agent = crate::agents::resolve(&self.agents, id, family)?;
+        crate::require(!agent.planner_only, format!("Agent {id} can only be a planner"))?;
+        Ok((id.to_owned(), agent))
     }
     pub fn agent(&self, role: &str, family: Option<crate::agents::Family>) -> Result<crate::agents::Agent> {
         let id = if role == "planner" { &self.planner } else { &self.worker };

@@ -48,14 +48,14 @@ fn catalog_keeps_existing_codex_selections_exact() {
 
 #[test]
 fn workspace_definitions_override_the_catalog_and_are_validated() {
-    let custom = Agent { provider: Provider::Anthropic, harness: Harness::ClaudeCode, model: "tiny".into(), effort: Some("low".into()), retired: false, note: None, worker_only: false };
+    let custom = Agent { provider: Provider::Anthropic, harness: Harness::ClaudeCode, model: "tiny".into(), effort: Some("low".into()), retired: false, note: None, worker_only: false, planner_only: false };
     let mut defined = BTreeMap::from([("tiny".to_string(), custom.clone())]);
     assert_eq!(resolve(&defined, "tiny", Some(Family::Claude)).unwrap(), custom);
     assert!(resolve(&defined, "tiny", Some(Family::Codex)).is_err());
-    let crossed = Agent { provider: Provider::Openai, harness: Harness::ClaudeCode, model: "gpt".into(), effort: None, retired: false, note: None, worker_only: false };
+    let crossed = Agent { provider: Provider::Openai, harness: Harness::ClaudeCode, model: "gpt".into(), effort: None, retired: false, note: None, worker_only: false, planner_only: false };
     defined.insert("crossed".into(), crossed);
     assert!(resolve(&defined, "crossed", Some(Family::Claude)).unwrap_err().to_string().contains("own vendor"));
-    let blank = Agent { provider: Provider::Anthropic, harness: Harness::ClaudeCode, model: " ".into(), effort: None, retired: false, note: None, worker_only: false };
+    let blank = Agent { provider: Provider::Anthropic, harness: Harness::ClaudeCode, model: " ".into(), effort: None, retired: false, note: None, worker_only: false, planner_only: false };
     defined.insert("blank".into(), blank);
     assert!(resolve(&defined, "blank", Some(Family::Claude)).is_err());
 }
@@ -99,4 +99,16 @@ fn luna_is_a_worker_only_agent() {
     assert_eq!((luna["planner"].as_bool(), luna["agent"]["workerOnly"].as_bool()), (Some(false), Some(true)));
     let roundtrip: Agent = serde_json::from_value(serde_json::to_value(&catalog()["luna_6_high"]).unwrap()).unwrap();
     assert!(roundtrip.worker_only);
+}
+
+#[test]
+fn opus_is_a_planner_only_agent() {
+    let family = Some(Family::Claude);
+    let settings = |planner: &str, worker: &str| -> crate::history::WorkspaceSettings { serde_json::from_value(json!({"planner":planner,"worker":worker})).unwrap() };
+    settings("claude_opus_5_5_medium", "claude_sonnet_5_5_low").validate(family).unwrap();
+    assert!(settings("claude_sonnet_5_5_low", "claude_opus_5_5_medium").validate(family).unwrap_err().to_string().contains("only be a planner"));
+    assert!(settings("claude_sonnet_5_5_low", "claude_sonnet_5_5_low").task_agent(Some("claude_opus_5_5_medium"), family).unwrap_err().to_string().contains("only be a planner"));
+    let listed = listing(&BTreeMap::new(), family);
+    let opus = listed["agents"].as_array().unwrap().iter().find(|a| a["id"] == "claude_opus_5_5_medium").unwrap();
+    assert_eq!((opus["planner"].as_bool(), opus["worker"].as_bool()), (Some(true), Some(false)));
 }

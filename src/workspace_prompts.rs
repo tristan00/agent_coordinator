@@ -6,8 +6,18 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::{Component, Path, PathBuf}};
 
 pub const LIMITS_FILE: &str = "LIMITS.json";
+/// Prompt kinds chosen by a task's stage rather than its role.
+pub const STAGE_KINDS: [(&str, &str); 2] = [("review", "reviewer"), ("replan", "replanner")];
 pub fn kinds() -> Vec<&'static str> {
-    ["project_planner", "worker_protocol"].into_iter().chain(crate::history::ROLES.into_iter().filter(|role| *role != "worker")).collect()
+    ["project_planner", "worker_protocol"]
+        .into_iter()
+        .chain(crate::history::ROLES.into_iter().filter(|role| *role != "worker"))
+        .chain(STAGE_KINDS.map(|(_, kind)| kind))
+        .collect()
+}
+/// Every kind a workspace must select besides the planner and worker_protocol prompts.
+pub fn role_kinds() -> Vec<&'static str> {
+    kinds().into_iter().skip(2).collect()
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,9 +95,10 @@ pub fn verify(root: &Path, settings: &WorkspaceSettings) -> Result<()> {
 pub fn planner(root: &Path, settings: &WorkspaceSettings) -> Result<String> {
     Ok(selected(root, settings, "project_planner")?.1)
 }
-pub fn worker(root: &Path, settings: &WorkspaceSettings, role: Role) -> Result<Value> {
+pub fn worker(root: &Path, settings: &WorkspaceSettings, role: Role, stage: &str) -> Result<Value> {
+    let staged = STAGE_KINDS.iter().find(|(name, _)| *name == stage).map(|(_, kind)| *kind);
     let own = settings.prompts.as_ref().is_some_and(|p| p.roles.contains_key(role.name()));
-    let kind = if own { role.name() } else { "worker_protocol" };
+    let kind = staged.unwrap_or(if own { role.name() } else { "worker_protocol" });
     let (document, text) = selected(root, settings, kind)?;
     Ok(json!({"role":kind,"candidate":document.candidate,"sha256":document.sha256,"text":text}))
 }
@@ -105,8 +116,11 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     let (worker, worker_text) = candidate(root, "worker_protocol", input["worker_protocol"].as_str().ok_or("worker_protocol candidate required")?)?;
     let mut roles = BTreeMap::new();
     for (role, selected) in input["roles"].as_object().into_iter().flatten() {
-        require(kinds().contains(&role.as_str()) && role != "project_planner" && role != "worker_protocol", format!("Unknown role {role}"))?;
+        require(role_kinds().contains(&role.as_str()), format!("Unknown role {role}"))?;
         roles.insert(role.clone(), candidate(root, role, selected.as_str().ok_or("Role prompt candidates must be filenames")?)?.0);
+    }
+    for (_, kind) in STAGE_KINDS {
+        require(roles.contains_key(kind), format!("A {kind} prompt candidate is required"))?;
     }
     settings.prompts = Some(Selection { project_planner: planner, worker_protocol: worker, roles });
     let _ = (planner_text, worker_text);
@@ -117,6 +131,7 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
         let mut state = engine.state.clone();
         require(!state.config.workspaces.contains_key(&path), "Workspace already configured")?;
         state.config.workspaces.insert(path.clone(), settings.clone());
+        state.short_name(&path);
         engine.commit(state)?;
         Ok(json!({"workspace":path,"settings":settings}))
     })();
@@ -155,7 +170,7 @@ pub fn generate(engine: &mut Engine, input: Value, root: &Path) -> Result<Value>
     let seed = input["seed"].as_u64().unwrap_or_else(|| crate::now() ^ (u64::from(std::process::id()) << 40));
     let mut random = Random(seed);
     let agents = crate::agents::enabled(&Default::default(), engine.state.family);
-    let workers: Vec<String> = agents.keys().cloned().collect();
+    let workers: Vec<String> = agents.iter().filter(|(_, agent)| !agent.planner_only).map(|(id, _)| id.clone()).collect();
     let planners: Vec<String> = agents.iter().filter(|(_, agent)| !agent.worker_only).map(|(id, _)| id.clone()).collect();
     require(!planners.is_empty(), "No agents are enabled for this launcher family; start the coordinator from Claude Code or Codex, or set AGENT_FAMILY")?;
     let listed = catalog(root)?;
@@ -165,7 +180,7 @@ pub fn generate(engine: &mut Engine, input: Value, root: &Path) -> Result<Value>
         Ok(random.shuffled(names))
     };
     let (planner_prompts, worker_prompts) = (deck("project_planner", &mut random)?, deck("worker_protocol", &mut random)?);
-    let role_prompts: Vec<(&str, Vec<String>)> = kinds().into_iter().skip(2).filter_map(|role| deck(role, &mut random).ok().map(|names| (role, names))).collect();
+    let role_prompts: Vec<(&str, Vec<String>)> = role_kinds().into_iter().map(|role| deck(role, &mut random).map(|names| (role, names))).collect::<Result<_>>()?;
     let mut created = Vec::new();
     for (index, path) in paths.iter().enumerate() {
         let limits: serde_json::Map<String, Value> = LIMIT_RANGES.iter().map(|(key, low, high)| (key.to_string(), json!(low + random.next() % (high - low + 1)))).collect();

@@ -4,12 +4,22 @@
 .spacer { flex: 1; }
 
 .scopebar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0 14px; padding: 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); position: sticky; top: 60px; z-index: 2; }
-.scope-workspace, .scope-search { display: inline-flex; align-items: center; gap: 6px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--muted); }
-.scope-workspace select, .scope-search input { border: 0; background: transparent; padding: 6px 0; outline: none; color: var(--fg); }
-.scope-workspace select { max-width: 260px; width: auto; }
-.scope-search { flex: 0 1 280px; }
-.scope-search input { width: 100%; }
-.scope-workspace:focus-within, .scope-search:focus-within { border-color: var(--accent); }
+.scope-search { display: inline-flex; align-items: center; gap: 6px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--muted); flex: 0 1 280px; }
+.scope-search input { border: 0; background: transparent; padding: 6px 0; outline: none; color: var(--fg); width: 100%; }
+.scope-search:focus-within { border-color: var(--accent); }
+.workspace-picker > .tool { max-width: 320px; color: var(--fg); }
+.workspace-picker > .tool > span:not(.tool-badge) { overflow: hidden; text-overflow: ellipsis; }
+.workspace-picker > .tool > svg:first-child { color: var(--muted); flex: none; }
+.ws-picker { width: min(340px, 86vw); gap: 2px; color: var(--fg); box-sizing: border-box; }
+.ws-picker * { box-sizing: border-box; min-width: 0; }
+.workspace-picker .popover-panel { overflow-x: hidden; }
+.ws-picker .picker-item { color: var(--fg); }
+.ws-picker .picker-item small { font-variant-numeric: tabular-nums; }
+.ws-picker .picker-item.on { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.ws-picker .picker-item.on:hover { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+.ws-id { margin-right: 0; flex: none; color: var(--fg); background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.workspace-picker > .tool .ws-id { margin-right: 6px; }
+.ws-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scope-count { margin-left: auto; color: var(--muted); font-size: 13px; white-space: nowrap; }
 .chips-row { display: contents; }
 .filter-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 9px; border-radius: 99px; background: color-mix(in srgb, var(--accent) 18%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); font-size: 12px; animation: chip-in 160ms ease-out; }

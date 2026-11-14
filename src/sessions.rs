@@ -93,6 +93,7 @@ pub fn create(engine: &mut Engine, input: Value) -> Result<Value> {
         Some(path) => {
             let path = PathBuf::from(path);
             require(path.is_absolute(), "directory must be absolute")?;
+            require(path.ancestors().find(|a| a.exists()).is_some_and(|a| a.canonicalize().is_ok_and(|a| a.starts_with(&source))), "directory must be inside the workspace")?;
             require(!path.exists() || fs::read_dir(&path)?.next().is_none(), "directory must be new or empty")?;
             fs::create_dir_all(&path)?;
             fs::write(path.join(crate::workspace_prompts::LIMITS_FILE), serde_json::to_vec_pretty(&settings.limits)?)?;
@@ -104,7 +105,6 @@ pub fn create(engine: &mut Engine, input: Value) -> Result<Value> {
     let id = id();
     let session = Session { id: id.clone(), workspace: directory.clone(), output, deliverable: deliverable.to_string_lossy().replace('\\', "/"), callback, status: "running".into(), requests: Vec::new(), deliveries: 0, conversation: None, outbox: Vec::new(), retry_at: 0, created: now() };
     engine.change(|state| {
-        state.config.workspaces.entry(directory.clone()).or_insert(settings);
         state.sessions.insert(id.clone(), session);
         Ok(Value::Null)
     })?;

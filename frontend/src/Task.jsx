@@ -6,6 +6,7 @@ import {attemptMs, categoryName, compact, duration, failed, leadMs, phase, token
 
 const ROLE_HUE = {worker: 220, analytics: 190, 'backend-code': 222, 'ui-code': 280, design: 320, optimization: 30, test: 140, docs: 40, data: 160, audit: 12};
 const roleStyle = role => ({'--tag-hue': ROLE_HUE[role] ?? 220});
+export const RoleTag = ({role}) => <span className="tag role" style={roleStyle(role)}>{role}</span>;
 const target = d => typeof d === 'string' ? d : d.target;
 const ago = ms => {
   if (!ms) return '';

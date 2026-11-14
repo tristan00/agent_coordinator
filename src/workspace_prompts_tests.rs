@@ -19,17 +19,22 @@ impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("workspace-prompts-{}", crate::engine::id()));
         fs::create_dir_all(path.join("project_planner")).unwrap();
-        fs::create_dir_all(path.join("worker_protocol")).unwrap();
+        for kind in kinds() {
+            fs::create_dir_all(path.join(kind)).unwrap();
+        }
         Self(path)
     }
     fn engine(&self) -> Engine { Engine::new(self.0.join("board")).unwrap() }
     fn input(&self, name: &str) -> Value {
-        json!({"path":self.0.join(name),"project_planner":"selected.md","worker_protocol":"selected.md",
+        json!({"path":self.0.join(name),"project_planner":"selected.md","worker_protocol":"selected.md","roles":role_kinds().into_iter().map(|kind| (kind.to_owned(), json!("selected.md"))).collect::<serde_json::Map<_, _>>(),
             "settings":{"planner":"sol_6_1_light","worker":"sol_6_1_light"}})
     }
     fn candidates(&self) {
         fs::write(self.0.join("project_planner/selected.md"), "Planner candidate unique instructions.").unwrap();
         fs::write(self.0.join("worker_protocol/selected.md"), "Worker candidate unique instructions.").unwrap();
+        for kind in role_kinds() {
+            fs::write(self.0.join(kind).join("selected.md"), format!("{kind} candidate unique instructions.")).unwrap();
+        }
     }
 }
 impl Drop for Fixture {
@@ -64,13 +69,15 @@ fn creation_keeps_the_workspace_empty_and_freezes_selection_hashes() {
     let result = create(&mut engine, fixture.input("first"), &fixture.0).unwrap();
     let directory = PathBuf::from(result["workspace"].as_str().unwrap());
     let settings: WorkspaceSettings = serde_json::from_value(result["settings"].clone()).unwrap();
+    assert_eq!(engine.state.workspace_ids[&directory].abbreviation, "FIR");
+    assert_eq!(engine.state.workspace_ids[&directory].next, 0);
     assert_eq!(fs::read_dir(&directory).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>(), [LIMITS_FILE]);
-    assert_eq!(worker(&fixture.0, &settings, crate::history::Role::Worker).unwrap()["text"], "Worker candidate unique instructions.");
+    assert_eq!(worker(&fixture.0, &settings, crate::history::Role::Worker, "implementation").unwrap()["text"], "Worker candidate unique instructions.");
     assert!(!planner(&fixture.0, &settings).unwrap().is_empty());
     assert_eq!(engine.state.config.workspaces[&directory], settings);
     verify(&fixture.0, &settings).unwrap();
     fs::write(fixture.0.join("worker_protocol/selected.md"), "new ".repeat(200)).unwrap();
-    assert!(worker(&fixture.0, &settings, crate::history::Role::Worker).unwrap_err().to_string().contains("changed since the workspace selected it"));
+    assert!(worker(&fixture.0, &settings, crate::history::Role::Worker, "implementation").unwrap_err().to_string().contains("changed since the workspace selected it"));
     let second = create(&mut engine, fixture.input("second"), &fixture.0).unwrap();
     assert_ne!(result["settings"]["prompts"]["worker_protocol"]["sha256"], second["settings"]["prompts"]["worker_protocol"]["sha256"]);
     assert!(create(&mut engine, fixture.input("first"), &fixture.0).is_err());
@@ -84,8 +91,7 @@ fn generation_deals_every_prompt_before_repeating_and_is_reproducible_by_seed() 
     for index in 0..3 {
         fs::write(fixture.0.join(format!("project_planner/p{index}.md")), format!("Planner candidate {index}.")).unwrap();
         fs::write(fixture.0.join(format!("worker_protocol/w{index}.md")), format!("Worker candidate {index}.")).unwrap();
-        for role in ["ui-code", "audit"] {
-            fs::create_dir_all(fixture.0.join(role)).unwrap();
+        for role in role_kinds() {
             fs::write(fixture.0.join(format!("{role}/r{index}.md")), format!("{role} candidate {index}.")).unwrap();
         }
     }
@@ -98,9 +104,11 @@ fn generation_deals_every_prompt_before_repeating_and_is_reproducible_by_seed() 
     let pick = |result: &Value, role: &str| -> Vec<String> { result["workspaces"].as_array().unwrap().iter().map(|w| w["settings"]["prompts"][role]["candidate"].as_str().unwrap().to_owned()).collect() };
     let roles = |result: &Value, role: &str| -> Vec<String> { result["workspaces"].as_array().unwrap().iter().map(|w| w["settings"]["prompts"]["roles"][role]["candidate"].as_str().unwrap().to_owned()).collect() };
     for workspace in first["workspaces"].as_array().unwrap() {
-        assert_eq!(workspace["settings"]["prompts"]["roles"].as_object().unwrap().keys().collect::<Vec<_>>(), ["audit", "ui-code"]);
+        let mut expected = role_kinds();
+        expected.sort();
+        assert_eq!(workspace["settings"]["prompts"]["roles"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), expected);
     }
-    for role in ["ui-code", "audit"] {
+    for role in role_kinds() {
         let names = roles(&first, role);
         assert_eq!(names[..3].iter().collect::<std::collections::BTreeSet<_>>().len(), 3, "{role}: {names:?}");
         assert_eq!(names[..3], names[3..]);
@@ -129,13 +137,13 @@ fn roles_use_their_own_prompt_and_fall_back_to_the_worker_protocol() {
     fs::write(fixture.0.join("ui-code/visual.md"), "Build interfaces people enjoy.").unwrap();
     let mut engine = fixture.engine();
     let mut input = fixture.input("roles");
-    input["roles"] = json!({"ui-code":"visual.md"});
+    input["roles"] = json!({"ui-code":"visual.md","reviewer":"selected.md","replanner":"selected.md"});
     let result = create(&mut engine, input, &fixture.0).unwrap();
     let settings: WorkspaceSettings = serde_json::from_value(result["settings"].clone()).unwrap();
-    let ui = worker(&fixture.0, &settings, crate::history::Role::UiCode).unwrap();
+    let ui = worker(&fixture.0, &settings, crate::history::Role::UiCode, "implementation").unwrap();
     assert_eq!((ui["role"].as_str(), ui["text"].as_str()), (Some("ui-code"), Some("Build interfaces people enjoy.")));
     for role in [crate::history::Role::Worker, crate::history::Role::BackendCode, crate::history::Role::Audit] {
-        assert_eq!(worker(&fixture.0, &settings, role).unwrap()["role"], "worker_protocol");
+        assert_eq!(worker(&fixture.0, &settings, role, "implementation").unwrap()["role"], "worker_protocol");
     }
     let mut unknown = fixture.input("unknown-role");
     unknown["roles"] = json!({"marketing":"visual.md"});
@@ -143,10 +151,31 @@ fn roles_use_their_own_prompt_and_fall_back_to_the_worker_protocol() {
 }
 
 #[test]
-fn the_shipped_catalog_has_three_valid_prompts_for_every_kind() {
+fn the_shipped_catalog_lists_every_prompt_candidate() {
     let listed = catalog(&root()).unwrap();
     assert_eq!(listed["invalid"], json!([]));
     for kind in kinds() {
-        assert_eq!(listed[kind].as_array().unwrap().len(), 3, "{kind}");
+        assert_eq!(listed[kind].as_array().unwrap().len(), if kind == "project_planner" { 7 } else { 3 }, "{kind}");
+    }
+}
+
+#[test]
+fn review_and_replan_stages_use_their_own_prompts_instead_of_the_task_role() {
+    let fixture = Fixture::new();
+    fixture.candidates();
+    fs::create_dir_all(fixture.0.join("ui-code")).unwrap();
+    fs::write(fixture.0.join("ui-code/selected.md"), "Build interfaces people enjoy.").unwrap();
+    let mut engine = fixture.engine();
+    let mut input = fixture.input("staged");
+    input["roles"]["ui-code"] = json!("selected.md");
+    let settings: WorkspaceSettings = serde_json::from_value(create(&mut engine, input, &fixture.0).unwrap()["settings"].clone()).unwrap();
+    let pick = |role, stage: &str| worker(&fixture.0, &settings, role, stage).unwrap()["role"].as_str().unwrap().to_owned();
+    use crate::history::Role::{UiCode, Worker};
+    assert_eq!([pick(UiCode, "implementation"), pick(UiCode, "review"), pick(UiCode, "replan")], ["ui-code", "reviewer", "replanner"]);
+    assert_eq!([pick(Worker, "implementation"), pick(Worker, "review"), pick(Worker, "replan")], ["worker_protocol", "reviewer", "replanner"]);
+    for kind in ["reviewer", "replanner"] {
+        let mut missing = fixture.input(&format!("no-{kind}"));
+        missing["roles"].as_object_mut().unwrap().remove(kind);
+        assert!(create(&mut engine, missing, &fixture.0).unwrap_err().to_string().contains(kind));
     }
 }

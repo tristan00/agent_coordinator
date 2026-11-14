@@ -1353,7 +1353,7 @@ fn wipe_deletes_every_task_workspace_and_attempt() {
     assert_eq!((report["deleted"]["tasks"].as_u64(), report["deleted"]["workspaces"].as_u64()), (Some(1), Some(1)));
     assert_eq!(report["errors"], json!([]));
     assert!(!ws.exists() && !engine.directory.join("attempts").exists());
-    assert!(engine.state.tasks.is_empty() && engine.state.config.workspaces.is_empty());
+    assert!(engine.state.tasks.is_empty() && engine.state.config.workspaces.is_empty() && engine.state.workspace_ids.is_empty());
     let reloaded = Engine::new(engine.directory.clone()).unwrap();
     assert!(reloaded.state.tasks.is_empty() && reloaded.state.config.workspaces.is_empty());
 }
@@ -1376,6 +1376,7 @@ fn tasks_in_a_subfolder_belong_to_the_configured_workspace_that_contains_it() {
     assert_eq!(find(&inside), Some(key.clone()));
     assert_eq!(find(&other), Some(workspace(&outside).unwrap()));
     let task = engine.state.tasks.iter().find(|t| t.id == inside["id"].as_str().unwrap()).unwrap();
+    assert_eq!(task.short_id.as_deref(), Some("WOR-1"));
     assert_eq!(engine.state.settings(task.workspace.as_deref()).worker.as_deref(), Some("sol_6_1_light"));
     let batch = engine.create_batch(json!({"requestKey":"sub-1","container":{"title":"Group","outcome":"Done","cwd":child,"acceptance":[],"standalone":true},
         "children":[{"localKey":"a","title":"Child","outcome":"Done","acceptance":["Works"]}]})).unwrap();
@@ -1434,6 +1435,9 @@ fn legacy_tasks_receive_short_ids_in_creation_order() {
     let find = |id: &str| state.tasks.iter().chain(&state.archived).find(|t| t.id == id).unwrap().short_id.clone().unwrap();
     assert_eq!(ids.iter().map(|id| find(id)).collect::<Vec<_>>(), ["WOR-1", "WOR-2", "WOR-3"]);
     assert_eq!(state.next_short_id(&board.engine.state.tasks[0].workspace.clone().unwrap()), "WOR-4");
+    state.config.workspaces.insert(PathBuf::from("D:/w/benchmark_7"), Default::default());
+    state.assign_short_ids();
+    assert_eq!((state.workspace_ids[Path::new("D:/w/benchmark_7")].abbreviation.as_str(), state.workspace_ids[Path::new("D:/w/benchmark_7")].next), ("B7", 0));
 }
 #[test]
 fn task_value_lists_models_that_implemented_the_task() {

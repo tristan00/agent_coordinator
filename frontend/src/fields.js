@@ -20,7 +20,9 @@ export const leadMs = (t, now = Date.now()) => t.analytics?.leadMs ?? (t.analyti
 export const waitMs = t => t.analytics?.intervals?.milliseconds ? sum(Object.values(t.analytics.intervals.milliseconds)) : null;
 export const tokens = t => sum((t.attempts || []).map(a => a.evidence?.usage?.totalTokens || 0));
 export const failed = a => !!a.error || (a.ended && a.result && a.result.status !== 'completed');
-export const workspaceName = t => (t.workspace || t.cwd || '').replace(/^\\\\\?\\/, '').split(/[\\/]/).filter(Boolean).slice(-2).join('/');
+export const pathKey = p => (p || '').replace(/^\\\\\?\\/, '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+export const within = (path, scope) => { const p = pathKey(path), s = pathKey(scope); return p === s || p.startsWith(`${s}/`); };
+export const workspaceName = t => t.shortId ? t.shortId.replace(/-\d+$/, '') : (t.workspace || t.cwd || '').replace(/^\\\\\?\\/, '').split(/[\\/]/).filter(Boolean).at(-1) || '';
 
 export function phase(t, paused) {
   if (t.blocked) return {text: `Needs decision: ${t.failure}`, tone: 'bad'};

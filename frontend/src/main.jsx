@@ -4,8 +4,8 @@ import Graph from './Graph';
 import {AnimatedCount} from './Activity';
 import TaskName, {matchesTask} from './TaskName';
 import {ScopeBar, usePreference} from './Controls';
-import {TaskCard, Detail} from './Task';
-import {phase, matches, categoryName} from './fields';
+import {TaskCard, Detail, RoleTag} from './Task';
+import {phase, matches, categoryName, pathKey, within} from './fields';
 import './style.css';
 import './redesign.css';
 
@@ -21,7 +21,6 @@ const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 const PAGES = ['Board', 'List', 'Graph', 'Analytics', 'Settings'];
 const words = text => (text || '').trim().split(/\s+/).filter(Boolean).length;
 const workspaceOf = t => t.workspace ?? t.cwd;
-const pathKey = p => (p || '').replace(/^\\\\\?\\/, '').replace(/[\\/]+$/, '').toLowerCase();
 const limitsFor = (state, path) => ({...state.versions.limits, ...(Object.entries(state.config.workspaces || {}).find(([k]) => pathKey(k) === pathKey(path))?.[1]?.limits || {})});
 const dependencyReasons = state => state.versions.dependencyReasons || ['uses_artifact', 'uses_api', 'uses_schema', 'uses_data'];
 const dependencyTarget = d => typeof d === 'string' ? d : d.target;
@@ -107,7 +106,7 @@ function App() {
   const tasks = state?.tasks || [];
   const byId = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
   const workspaces = [...new Map([...Object.keys(state?.config?.workspaces || {}), ...tasks.map(workspaceOf)].filter(Boolean).map(path => [pathKey(path), path.replace(/^\\\\\?\\/, '')])).values()].sort();
-  const scoped = tasks.filter(t => !workspace || pathKey(workspaceOf(t)) === pathKey(workspace));
+  const scoped = tasks.filter(t => !workspace || within(workspaceOf(t), workspace));
   const visible = scoped.filter(t => matchesTask(t, query) && matches(t, filters));
   const chooseWorkspace = value => {setWorkspace(value); savePreference('coordinator.workspace', value);};
   const go = p => { setPage(p); savePreference('coordinator.page', p); };
@@ -135,11 +134,11 @@ function App() {
         </header>
         {error && <p className="error" role="alert">{error}</p>}
         {state.error && <p className="error">Scheduler: {state.error}</p>}
-        {page !== 'Settings' && <ScopeBar workspaces={workspaces} workspace={workspaces.find(path => pathKey(path) === pathKey(workspace)) || ''} setWorkspace={chooseWorkspace} query={query} setQuery={setQuery} filters={filters} setFilters={setFilters} tasks={scoped} count={visible.length} total={scoped.length} showFilters={page !== 'Analytics'} />}
+        {page !== 'Settings' && <ScopeBar workspaces={workspaces} workspace={workspaces.find(path => pathKey(path) === pathKey(workspace)) || ''} setWorkspace={chooseWorkspace} allTasks={tasks} workspaceNames={state.workspaceIds} query={query} setQuery={setQuery} filters={filters} setFilters={setFilters} tasks={scoped} count={visible.length} total={scoped.length} showFilters={page !== 'Analytics'} />}
         {page === 'Board' && <div className="board page-enter">{STATUSES.map(column)}</div>}
         {page === 'List' && <table className="list page-enter"><thead><tr><th>Task</th><th>Status</th><th>Role</th><th>Languages</th><th>Functions</th><th>Execution capabilities</th><th>Blocked by</th><th>State</th></tr></thead><tbody>{visible.map(t => <tr key={t.id}><td><button className="link" onClick={() => setSelected(t.id)}><TaskName task={t} /></button></td><td>{t.status}</td><td>{t.attributes.role}</td><td>{categoryText(t.attributes, 'languages')}</td><td>{categoryText(t.attributes, 'functions')}</td><td>{t.attributes.needs.join(', ') || 'none'}</td><td>{t.dependencies.map(d => byId[typeof d === 'string' ? d : d.target]?.title).filter(Boolean).join(', ')}</td><td className={`reason ${phase(t, state.paused).tone}`}>{phase(t, state.paused).text}</td></tr>)}</tbody></table>}
         {page === 'Graph' && <Graph key={workspace} activityEnabled={!offline && !state.paused} workspace={workspace} tasks={visible} allTasks={tasks} select={setSelected} />}
-        {page === 'Analytics' && <Analytics workspace={workspace} select={setSelected} />}
+        {page === 'Analytics' && <Analytics workspace={workspace} select={setSelected} names={state.workspaceIds} />}
         {page === 'Settings' && <Settings state={state} act={act} />}
       </main>
       {selected && byId[selected] && <Detail task={byId[selected]} byId={byId} paused={state.paused} wordLimit={limitsFor(state, workspaceOf(byId[selected])).words} reasons={dependencyReasons(state)} close={() => setSelected(null)} select={setSelected} act={act} edit={t => { setSelected(null); setEditor({task: t}); }} />}
@@ -166,7 +165,7 @@ function Editor({task, tasks, state, workspace, close}) {
   const total = words(form.title) + words(form.outcome) + form.acceptance.reduce((n, c) => n + words(c), 0);
   const limits = limitsFor(state, form.cwd);
   const rows = Array.from({length: Math.max(limits.criteria, form.acceptance.length)}, (_, i) => form.acceptance[i] || '');
-  const others = tasks.filter(t => t.id !== task?.id && (!workspace || workspaceOf(t) === workspace));
+  const others = tasks.filter(t => t.id !== task?.id && (!workspace || within(workspaceOf(t), workspace)));
   const pick = key => (
     <label>{{dependencies: 'Blocked by (needs result)', after: 'Runs after (ordering only)', conflicts: 'Never runs alongside', related: 'Related'}[key]}
       <select aria-label={{after: 'Runs after (ordering only)', conflicts: 'Never runs alongside', related: 'Related'}[key]} multiple value={form[key]} onChange={e => set(key, [...e.target.selectedOptions].map(o => o.value))}>{others.map(t => <option key={t.id} value={t.id}>{t.title}</option>)}</select>
@@ -292,7 +291,19 @@ function GroupEditor({tasks, state, workspace, close}) {
   </form></Modal>;
 }
 
-function Analytics({workspace, select}) {
+function groupLabel(group, key, names) {
+  if (group === 'role') return <RoleTag role={key} />;
+  if (group === 'container') return key === 'true' ? 'Containers' : 'Tasks';
+  if (group === 'priority') return `P${key}`;
+  if (group === 'size' || group === 'artifact' || group === 'needs') return key.split(', ').map(categoryName).join(', ');
+  if (group === 'workspace') {
+    const name = Object.entries(names || {}).find(([path]) => pathKey(path) === pathKey(key))?.[1];
+    return <span title={key.replace(/^\\\\\?\\/, '')}>{name && <span className="task-id">{name}</span>}{key.replace(/^\\\\\?\\/, '').split(/[\\/]/).filter(Boolean).at(-1)}</span>;
+  }
+  return key;
+}
+
+function Analytics({workspace, select, names}) {
   const [group, setGroup] = useState('role');
   const [report, setReport] = useState(null);
   const [error, setError] = useState('');
@@ -305,7 +316,7 @@ function Analytics({workspace, select}) {
       <div className="filters"><label>Group by <select value={group} onChange={e => setGroup(e.target.value)}>{['role', 'size', 'priority', 'needs', 'artifact', 'criteria', 'relations', 'container', 'workspace'].map(g => <option key={g}>{g}</option>)}</select></label></div>
       {error && <p className="error">{error}</p>}
       {report && <table className="list page-enter"><thead><tr><th>{group}</th><th>Tasks</th><th>First pass</th><th>Attempts</th><th>Rejections</th><th>Replans</th><th>Lead (h)</th></tr></thead><tbody>
-        {Object.entries(report.groups).map(([k, g]) => <tr key={k}><td>{k}</td><td>{g.tasks}</td><td>{n(g.firstPass)}</td><td>{n(g.attempts)}</td><td>{n(g.rejections)}</td><td>{n(g.replans)}</td><td>{g.leadMs.mean == null ? '—' : (g.leadMs.mean / 3600000).toFixed(1)}</td></tr>)}
+        {Object.entries(report.groups).map(([k, g]) => <tr key={k}><td>{groupLabel(group, k, names)}</td><td>{g.tasks}</td><td>{n(g.firstPass)}</td><td>{n(g.attempts)}</td><td>{n(g.rejections)}</td><td>{n(g.replans)}</td><td>{g.leadMs.mean == null ? '—' : (g.leadMs.mean / 3600000).toFixed(1)}</td></tr>)}
       </tbody></table>}
       {report && <p className="muted">{report.definitions.firstPass}. Groups are associations, not causes.</p>}
     </>

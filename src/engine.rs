@@ -467,7 +467,7 @@ fn letters(mut n: u64) -> String {
     String::from_utf8(text).unwrap()
 }
 impl State {
-    pub(crate) fn next_short_id(&mut self, directory: &Path) -> String {
+    pub(crate) fn short_name(&mut self, directory: &Path) -> String {
         if !self.workspace_ids.contains_key(directory) {
             let base = abbreviation(directory);
             let taken: HashSet<&str> = self.workspace_ids.values().map(|w| w.abbreviation.as_str()).collect();
@@ -480,6 +480,10 @@ impl State {
                 .unwrap();
             self.workspace_ids.insert(directory.to_path_buf(), WorkspaceId { abbreviation: chosen, next: 0 });
         }
+        self.workspace_ids[directory].abbreviation.clone()
+    }
+    pub(crate) fn next_short_id(&mut self, directory: &Path) -> String {
+        self.short_name(directory);
         let entry = self.workspace_ids.get_mut(directory).unwrap();
         entry.next += 1;
         format!("{}-{}", entry.abbreviation, entry.next)
@@ -500,6 +504,9 @@ impl State {
             let directory = task.workspace.clone().unwrap_or_else(|| PathBuf::from(&task.cwd));
             let short_id = self.next_short_id(&directory);
             if archived { &mut self.archived[i] } else { &mut self.tasks[i] }.short_id = Some(short_id);
+        }
+        for directory in self.config.workspaces.keys().cloned().collect::<Vec<_>>() {
+            self.short_name(&directory);
         }
     }
     pub fn index(&self, id: &str) -> Result<usize> {
@@ -539,6 +546,7 @@ impl State {
         let settings = self.settings(key);
         let agents: Vec<_> = crate::agents::enabled(&settings.agents, self.family)
             .into_iter()
+            .filter(|(_, agent)| !agent.planner_only)
             .map(|(id, agent)| json!({"id":id,"provider":agent.provider,"model":agent.model,"effort":agent.effort,"note":agent.note}))
             .collect();
         json!({"family":self.family,"default":settings.worker,"agents":agents,"usage":"Set attributes.model to an id to choose who implements a task; omit it to use the default. Review and replan always use the default."})
@@ -1133,6 +1141,7 @@ impl Engine {
         state.config.workspaces.clear();
         state.config.limits.clear();
         state.sessions.clear();
+        state.workspace_ids.clear();
         state.paused = false;
         state.hold_until = 0;
         self.commit(state)?;
@@ -1230,7 +1239,7 @@ impl Engine {
         let settings = self.state.settings(task.workspace.as_deref());
         settings.validate(self.state.family)?;
         let (worker, agent) = settings.task_agent(task.worker_model(), self.state.family)?;
-        let protocol = crate::workspace_prompts::worker(&crate::workspace_prompts::root(), &settings, task.attributes.role)?;
+        let protocol = crate::workspace_prompts::worker(&crate::workspace_prompts::root(), &settings, task.attributes.role, stage)?;
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
             "workspace":task.workspace,"cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"role":task.attributes.role,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
             "languages":task.attributes.languages,"functions":task.attributes.functions,

@@ -36,6 +36,8 @@ pub struct Agent {
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_only: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub planner_only: bool,
 }
 impl Agent {
     pub fn effort(&self) -> &str {
@@ -57,7 +59,7 @@ impl Agent {
     }
 }
 fn hosted(provider: Provider, harness: Harness, model: &str, effort: &str, retired: bool, note: &str) -> Agent {
-    Agent { provider, harness, model: model.into(), effort: Some(effort.into()), retired, note: Some(note.into()), worker_only: false }
+    Agent { provider, harness, model: model.into(), effort: Some(effort.into()), retired, note: Some(note.into()), worker_only: false, planner_only: false }
 }
 pub fn catalog() -> BTreeMap<String, Agent> {
     use {Harness::*, Provider::*};
@@ -69,7 +71,7 @@ pub fn catalog() -> BTreeMap<String, Agent> {
         ("claude_haiku_5_5_low".into(), Agent { worker_only: true, ..hosted(Anthropic, ClaudeCode, "claude-haiku-5-5", "low", false, "Hosted, small, fast; routine edits, summaries, checks") }),
         ("claude_sonnet_5_5_low".into(), hosted(Anthropic, ClaudeCode, "claude-sonnet-5-5", "low", false, "Hosted, mid size, low effort; routine implementation")),
         ("claude_sonnet_5_5_medium".into(), hosted(Anthropic, ClaudeCode, "claude-sonnet-5-5", "medium", false, "Hosted, mid size, medium effort; multi-file features")),
-        ("claude_opus_5_5_medium".into(), hosted(Anthropic, ClaudeCode, "claude-opus-5-5", "medium", false, "Hosted, largest; hardest design and debugging")),
+        ("claude_opus_5_5_medium".into(), Agent { planner_only: true, ..hosted(Anthropic, ClaudeCode, "claude-opus-5-5", "medium", false, "Hosted, largest; hardest design and debugging") }),
     ])
 }
 pub fn detect(variable: impl Fn(&str) -> Option<String>) -> Option<Family> {
@@ -115,7 +117,7 @@ pub fn enabled(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> BTr
 pub fn listing(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> Value {
     let mut all = catalog();
     all.extend(defined.clone());
-    json!({"family":family,"agents":all.into_iter().filter(|(_, a)| !a.retired).map(|(id, a)| json!({"id":id,"allowed":a.allowed(family),"planner":!a.worker_only,"agent":a})).collect::<Vec<_>>()})
+    json!({"family":family,"agents":all.into_iter().filter(|(_, a)| !a.retired).map(|(id, a)| json!({"id":id,"allowed":a.allowed(family),"planner":!a.worker_only,"worker":!a.planner_only,"agent":a})).collect::<Vec<_>>()})
 }
 #[cfg(test)]
 #[path = "agents_tests.rs"]

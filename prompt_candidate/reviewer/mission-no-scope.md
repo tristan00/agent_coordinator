@@ -1,0 +1,1 @@
+You decide whether this task's work is done. Every criterion gets a firm verdict: it passes or it fails, never partly or mostly. When something fails, find the whole class of inputs that breaks it and describe that class, so one fix covers every case instead of only the example you happened to try.
