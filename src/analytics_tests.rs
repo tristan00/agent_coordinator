@@ -17,7 +17,7 @@ fn board() -> (Temp, Engine) {
     let mut engine = temp.engine();
     let first = create(&mut engine, &ws, "First pass", json!({}));
     let second = create(&mut engine, &ws, "Second pass", json!({}));
-    let docs = create(&mut engine, &ws, "Docs", json!({"attributes":{"lane":"docs"}}));
+    let docs = create(&mut engine, &ws, "Docs", json!({"attributes":{"role":"docs"}}));
     let container = create(&mut engine, &ws, "Group", json!({"acceptance":[]}));
     let tasks = &mut engine.state.tasks;
     tasks[first].attempts = vec![attempt("implementation", "completed"), attempt("review", "accepted")];
@@ -63,16 +63,16 @@ fn report_summarizes_all_tasks_and_outcomes() {
 #[test]
 fn report_groups_by_feature_and_filters_rows() {
     let (_temp, engine) = board();
-    let grouped = report(&engine.state, json!({"groupBy":"lane"})).unwrap();
+    let grouped = report(&engine.state, json!({"groupBy":"role"})).unwrap();
     let keys: Vec<_> = grouped["groups"].as_object().unwrap().keys().cloned().collect();
-    assert_eq!(keys, ["\"code\"", "\"docs\""]);
-    assert_eq!(grouped["groups"]["\"code\""]["tasks"], 3);
+    assert_eq!(keys, ["\"docs\"", "\"worker\""]);
+    assert_eq!(grouped["groups"]["\"worker\""]["tasks"], 3);
     assert_eq!(grouped["groups"]["\"docs\""]["firstPass"], json!({"n":0,"mean":null}));
     let containers = report(&engine.state, json!({"groupBy":"container"})).unwrap();
     assert_eq!(containers["groups"]["true"]["tasks"], 1);
-    let filtered = report(&engine.state, json!({"filters":{"lane":"docs"}})).unwrap();
+    let filtered = report(&engine.state, json!({"filters":{"role":"docs"}})).unwrap();
     assert_eq!(filtered["tasks"].as_array().unwrap().len(), 1);
-    let none = report(&engine.state, json!({"filters":{"lane":"docs","criteria":2}})).unwrap();
+    let none = report(&engine.state, json!({"filters":{"role":"docs","criteria":2}})).unwrap();
     assert!(none["tasks"].as_array().unwrap().is_empty());
     assert!(none["groups"].as_object().unwrap().is_empty());
 }
@@ -95,7 +95,7 @@ fn report_windows_by_creation_time_and_includes_archived_tasks() {
 fn report_rejects_unknown_groups_and_fields() {
     let (_temp, engine) = board();
     assert!(report(&engine.state, json!({"groupBy":"title"})).unwrap_err().to_string().contains("groupBy must be"));
-    assert!(report(&engine.state, json!({"group":"lane"})).is_err());
+    assert!(report(&engine.state, json!({"group":"role"})).is_err());
     assert!(report(&engine.state, json!({"from":"yesterday"})).is_err());
     for group in GROUPS {
         report(&engine.state, json!({"groupBy":group})).unwrap();

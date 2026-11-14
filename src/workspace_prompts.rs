@@ -1,11 +1,14 @@
-use crate::{Result, engine::{Engine, workspace}, history::WorkspaceSettings, require};
+use crate::{Result, engine::{Engine, workspace}, history::{Role, WorkspaceSettings}, require};
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::{Component, Path, PathBuf}};
 
-pub const DOCUMENTS: [(&str, &str); 2] = [("project_planner", "PROJECT_PLANNER.md"), ("worker_protocol", "WORKER_PROTOCOL.md")];
 pub const LIMITS_FILE: &str = "LIMITS.json";
+pub fn kinds() -> Vec<&'static str> {
+    ["project_planner", "worker_protocol"].into_iter().chain(crate::history::ROLES.into_iter().filter(|role| *role != "worker")).collect()
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
@@ -17,6 +20,8 @@ pub struct Document {
 pub struct Selection {
     pub project_planner: Document,
     pub worker_protocol: Document,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, Document>,
 }
 pub fn root() -> PathBuf {
     Path::new(option_env!("COORDINATOR_SOURCE_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"))).join("prompt_candidate")
@@ -44,10 +49,9 @@ fn candidate(root: &Path, role: &str, selected: &str) -> Result<(Document, Strin
 }
 pub fn catalog(root: &Path) -> Result<Value> {
     let mut result = json!({"directory":root,"max_words":200,"invalid":[],"agents":crate::agents::listing(&Default::default(), crate::agents::launcher())});
-    for (role, _) in DOCUMENTS {
+    for role in kinds() {
         let mut entries = Vec::new();
-        fs::create_dir_all(root.join(role))?;
-        if root.join(role).exists() {
+        if root.join(role).is_dir() {
             for entry in fs::read_dir(root.join(role))? {
                 let entry = entry?;
                 if !entry.file_type()?.is_file() { continue; }
@@ -63,19 +67,29 @@ pub fn catalog(root: &Path) -> Result<Value> {
     }
     Ok(result)
 }
-pub fn verify(directory: &Path, settings: &WorkspaceSettings) -> Result<()> {
-    let selected = settings.prompts.as_ref().ok_or("Workspace prompt selections are required")?;
-    for (filename, document) in [("PROJECT_PLANNER.md", &selected.project_planner), ("WORKER_PROTOCOL.md", &selected.worker_protocol)] {
-        name(&document.candidate)?;
-        require(digest(&text(&directory.join(filename))?) == document.sha256, format!("Workspace prompt changed: {}", directory.join(filename).display()))?;
-    }
-    Ok(())
+fn selected(root: &Path, settings: &WorkspaceSettings, role: &str) -> Result<(Document, String)> {
+    let prompts = settings.prompts.as_ref().ok_or("Workspace prompt selections are required")?;
+    let document = match role {
+        "project_planner" => &prompts.project_planner,
+        "worker_protocol" => &prompts.worker_protocol,
+        _ => prompts.roles.get(role).ok_or_else(|| format!("No prompt selected for role {role}"))?,
+    };
+    let (current, text) = candidate(root, role, &document.candidate)?;
+    require(current.sha256 == document.sha256, format!("Prompt candidate {role}/{} changed since the workspace selected it", document.candidate))?;
+    Ok((current, text))
 }
-pub fn worker(directory: &Path, settings: &WorkspaceSettings) -> Result<Value> {
-    verify(directory, settings)?;
-    let document = &settings.prompts.as_ref().unwrap().worker_protocol;
-    let path = directory.join("WORKER_PROTOCOL.md");
-    Ok(json!({"path":path,"candidate":document.candidate,"sha256":document.sha256,"text":text(&path)?}))
+pub fn verify(root: &Path, settings: &WorkspaceSettings) -> Result<()> {
+    let roles: Vec<String> = settings.prompts.as_ref().map(|p| p.roles.keys().cloned().collect()).unwrap_or_default();
+    ["project_planner", "worker_protocol"].into_iter().chain(roles.iter().map(String::as_str)).try_for_each(|role| selected(root, settings, role).map(|_| ()))
+}
+pub fn planner(root: &Path, settings: &WorkspaceSettings) -> Result<String> {
+    Ok(selected(root, settings, "project_planner")?.1)
+}
+pub fn worker(root: &Path, settings: &WorkspaceSettings, role: Role) -> Result<Value> {
+    let own = settings.prompts.as_ref().is_some_and(|p| p.roles.contains_key(role.name()));
+    let kind = if own { role.name() } else { "worker_protocol" };
+    let (document, text) = selected(root, settings, kind)?;
+    Ok(json!({"role":kind,"candidate":document.candidate,"sha256":document.sha256,"text":text}))
 }
 pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     let path = PathBuf::from(input["path"].as_str().ok_or("Workspace path required")?);
@@ -89,13 +103,16 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     settings.validate(engine.state.family)?;
     let (planner, planner_text) = candidate(root, "project_planner", input["project_planner"].as_str().ok_or("project_planner candidate required")?)?;
     let (worker, worker_text) = candidate(root, "worker_protocol", input["worker_protocol"].as_str().ok_or("worker_protocol candidate required")?)?;
-    settings.prompts = Some(Selection { project_planner: planner, worker_protocol: worker });
+    let mut roles = BTreeMap::new();
+    for (role, selected) in input["roles"].as_object().into_iter().flatten() {
+        require(kinds().contains(&role.as_str()) && role != "project_planner" && role != "worker_protocol", format!("Unknown role {role}"))?;
+        roles.insert(role.clone(), candidate(root, role, selected.as_str().ok_or("Role prompt candidates must be filenames")?)?.0);
+    }
+    settings.prompts = Some(Selection { project_planner: planner, worker_protocol: worker, roles });
+    let _ = (planner_text, worker_text);
     fs::create_dir(&target)?;
     let result = (|| {
-        fs::write(target.join("PROJECT_PLANNER.md"), planner_text)?;
-        fs::write(target.join("WORKER_PROTOCOL.md"), worker_text)?;
         fs::write(target.join(LIMITS_FILE), serde_json::to_vec_pretty(&settings.limits)?)?;
-        verify(&target, &settings)?;
         let path = workspace(&target)?;
         let mut state = engine.state.clone();
         require(!state.config.workspaces.contains_key(&path), "Workspace already configured")?;
@@ -104,7 +121,7 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
         Ok(json!({"workspace":path,"settings":settings}))
     })();
     if result.is_err() {
-        for filename in DOCUMENTS.map(|(_, filename)| filename).into_iter().chain([LIMITS_FILE]) { let _ = fs::remove_file(target.join(filename)); }
+        let _ = fs::remove_file(target.join(LIMITS_FILE));
         let _ = fs::remove_dir(&target);
     }
     result
@@ -148,6 +165,7 @@ pub fn generate(engine: &mut Engine, input: Value, root: &Path) -> Result<Value>
         Ok(random.shuffled(names))
     };
     let (planner_prompts, worker_prompts) = (deck("project_planner", &mut random)?, deck("worker_protocol", &mut random)?);
+    let role_prompts: Vec<(&str, Vec<String>)> = kinds().into_iter().skip(2).filter_map(|role| deck(role, &mut random).ok().map(|names| (role, names))).collect();
     let mut created = Vec::new();
     for (index, path) in paths.iter().enumerate() {
         let limits: serde_json::Map<String, Value> = LIMIT_RANGES.iter().map(|(key, low, high)| (key.to_string(), json!(low + random.next() % (high - low + 1)))).collect();
@@ -155,7 +173,8 @@ pub fn generate(engine: &mut Engine, input: Value, root: &Path) -> Result<Value>
         let (planner, worker) = (&planners[random.below(planners.len())], &workers[random.below(workers.len())]);
         let settings = json!({"limits":limits,"updates":updates,"planner":planner,"worker":worker});
         created.push(create(engine, json!({"path":path,"settings":settings,
-            "project_planner":planner_prompts[index % planner_prompts.len()],"worker_protocol":worker_prompts[index % worker_prompts.len()]}), root)?);
+            "project_planner":planner_prompts[index % planner_prompts.len()],"worker_protocol":worker_prompts[index % worker_prompts.len()],
+            "roles":role_prompts.iter().map(|(role, names)| (role.to_string(), json!(names[index % names.len()]))).collect::<serde_json::Map<_, _>>()}), root)?);
     }
     Ok(json!({"seed":seed,"workspaces":created}))
 }

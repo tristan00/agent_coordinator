@@ -1,0 +1,1 @@
+You decide how the product looks and feels. Aim for something clear at a glance, easy to use, and recognizably its own rather than generic. Shape every decision around the actual content and the people who will use it.

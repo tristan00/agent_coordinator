@@ -1,4 +1,4 @@
-use crate::history::{self, Artifact, AttemptEvidence, Attributes, Event, Lane, Need, Size};
+use crate::history::{self, Artifact, AttemptEvidence, Attributes, Event, Need, Role, Size};
 use crate::{Result, evidence, lock, metrics, now, process, read, require, write};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -144,7 +144,7 @@ impl Task {
         self.acceptance.is_empty()
     }
     pub fn read_only(&self) -> bool {
-        self.attributes.lane == Lane::Audit
+        self.attributes.role == Role::Audit
     }
     pub(crate) fn worker_model(&self) -> Option<&str> {
         self.attributes.model.as_deref().filter(|_| self.stage == "implementation")
@@ -179,7 +179,7 @@ impl Task {
             self.model,
             self.effort,
             self.cwd,
-            self.attributes.lane,
+            self.attributes.role,
             self.attributes.needs,
             self.attributes.artifact
         ])
@@ -270,7 +270,7 @@ impl Input {
         }
         if let Some(attributes) = value.get("attributes").and_then(Value::as_object) {
             let unknown: Vec<_> = attributes.keys().filter(|k| !Attributes::FIELDS.contains(&k.as_str())).collect();
-            require(unknown.is_empty(), "Unknown attribute; use lane, needs, languages, functions, priority, size, artifact or deploy")?;
+            require(unknown.is_empty(), "Unknown attribute; use role, needs, languages, functions, priority, size, artifact or deploy")?;
         }
         serde_json::from_value(value).map_err(|e| format!("{e}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, writable, attributes").into())
     }
@@ -385,6 +385,8 @@ pub struct Config {
     pub capabilities: Vec<Need>,
     #[serde(default)]
     pub notify: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planner: Vec<String>,
     #[serde(default)]
     pub workspaces: BTreeMap<PathBuf, history::WorkspaceSettings>,
     #[serde(default, skip_serializing)]
@@ -423,6 +425,8 @@ pub struct State {
     changes: BTreeMap<PathBuf, u64>,
     #[serde(default, rename = "workspaceIds", skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_ids: BTreeMap<PathBuf, WorkspaceId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sessions: BTreeMap<String, crate::sessions::Session>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceId {
@@ -528,7 +532,7 @@ impl State {
         })
     }
     pub fn task_schema(&self, key: Option<&Path>) -> Value {
-        json!({"lanes":history::LANES,"laneNotes":{"audit":"Read-only: inspects and reports, never edits files"},"sizes":history::SIZES,"needs":history::NEEDS,"artifacts":history::ARTIFACTS,
+        json!({"roles":history::ROLES,"roleNotes":{"worker":"General worker; the default when no other role fits","audit":"Read-only: inspects and reports, never edits files"},"sizes":history::SIZES,"needs":history::NEEDS,"artifacts":history::ARTIFACTS,
             "priority":"0 (highest) to 3; omitted means 2","dependencyReasons":DEPENDENCY_REASONS,"classifications":history::classification_schema(),"limits":self.settings(key).limits.value()})
     }
     pub fn models(&self, key: Option<&Path>) -> Value {
@@ -857,6 +861,13 @@ impl Engine {
                 }
             }
             for field in ["tasks", "archived"] {
+                for task in raw.get_mut(field).and_then(Value::as_array_mut).into_iter().flatten() {
+                    if let Some(lane) = task.get_mut("attributes").and_then(Value::as_object_mut).and_then(|attributes| attributes.remove("lane")) {
+                        task["attributes"]["role"] = json!(history::role_from_lane(lane.as_str().unwrap_or_default()));
+                    }
+                }
+            }
+            for field in ["tasks", "archived"] {
                 for task in raw[field].as_array().into_iter().flatten() {
                     for link in task["dependencies"].as_array().into_iter().flatten() {
                         require(link.get("reason").is_some(), "Dependency reason missing; use after, or nothing")?;
@@ -867,7 +878,7 @@ impl Engine {
         } else {
             let command = vec![std::env::current_exe()?.to_string_lossy().into(), "--external".into()];
             let config =
-                Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), workspaces: BTreeMap::new(), limits: BTreeMap::new() };
+                Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), planner: Vec::new(), workspaces: BTreeMap::new(), limits: BTreeMap::new() };
             State {
                 family: None,
                 batches: Default::default(),
@@ -881,6 +892,7 @@ impl Engine {
                 sequence: 0,
                 changes: BTreeMap::new(),
                 workspace_ids: BTreeMap::new(),
+                sessions: BTreeMap::new(),
             }
         };
         require(!(state.schema_version > Some(history::SCHEMA_VERSION)), "State schema is newer than this coordinator")?;
@@ -910,7 +922,7 @@ impl Engine {
         for index in 0..state.tasks.len() {
             let task = &mut state.tasks[index];
             if task.legacy_audit {
-                task.attributes.lane = Lane::Audit;
+                task.attributes.role = Role::Audit;
             }
             if task.legacy_evidence.to_string().contains("candidate") && task.attributes.artifact == Artifact::None {
                 task.attributes.artifact = Artifact::Candidate;
@@ -963,7 +975,7 @@ impl Engine {
         self.state = state;
         Ok(())
     }
-    fn change(&mut self, mutate: impl FnOnce(&mut State) -> Result<Value>) -> Result<Value> {
+    pub(crate) fn change(&mut self, mutate: impl FnOnce(&mut State) -> Result<Value>) -> Result<Value> {
         let mut state = self.state.clone();
         let value = mutate(&mut state)?;
         self.commit(state)?;
@@ -1077,6 +1089,7 @@ impl Engine {
         .map(drop)
     }
     pub fn wipe(&mut self) -> Result<Value> {
+        crate::sessions::stop_all(self);
         let active: Vec<String> = self.state.tasks.iter().filter_map(|t| t.active.clone()).collect();
         for id in &active {
             self.signal_stop(id)?;
@@ -1101,11 +1114,13 @@ impl Engine {
                 Err(error) => errors.push(format!("{}: {error}", path.display())),
             }
         }
-        let attempts = self.directory.join("attempts");
-        if attempts.exists()
-            && let Err(error) = fs::remove_dir_all(&attempts)
-        {
-            errors.push(format!("{}: {error}", attempts.display()));
+        for folder in ["attempts", "sessions"] {
+            let folder = self.directory.join(folder);
+            if folder.exists()
+                && let Err(error) = fs::remove_dir_all(&folder)
+            {
+                errors.push(format!("{}: {error}", folder.display()));
+            }
         }
         let state = &self.state;
         let deleted = json!({"tasks":state.tasks.len(),"archived":state.archived.len(),"workspaces":state.config.workspaces.len(),"batches":state.batches.len(),"stoppedWorkers":active.len()});
@@ -1117,6 +1132,7 @@ impl Engine {
         state.changes.clear();
         state.config.workspaces.clear();
         state.config.limits.clear();
+        state.sessions.clear();
         state.paused = false;
         state.hold_until = 0;
         self.commit(state)?;
@@ -1135,7 +1151,7 @@ impl Engine {
                 let path = workspace(&path).map_err(|e| format!("Workspace {}: {e}", path.display()))?;
                 if self.state.config.workspaces.get(&path) != Some(&settings) {
                     settings.validate(self.state.family)?;
-                    crate::workspace_prompts::verify(&path, &settings)?;
+                    crate::workspace_prompts::verify(&crate::workspace_prompts::root(), &settings)?;
                 }
                 Ok((path, settings))
             })
@@ -1214,10 +1230,9 @@ impl Engine {
         let settings = self.state.settings(task.workspace.as_deref());
         settings.validate(self.state.family)?;
         let (worker, agent) = settings.task_agent(task.worker_model(), self.state.family)?;
-        let documents = task.workspace.as_deref().ok_or("Workspace directory is required")?;
-        let protocol = crate::workspace_prompts::worker(documents, &settings)?;
+        let protocol = crate::workspace_prompts::worker(&crate::workspace_prompts::root(), &settings, task.attributes.role)?;
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
-            "workspace":task.workspace,"cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
+            "workspace":task.workspace,"cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"role":task.attributes.role,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
             "languages":task.attributes.languages,"functions":task.attributes.functions,
             "writable":task.writable,"dependencies":task.dependencies,"after":task.after},
             "worker":worker,"agent":agent,"family":self.state.family,"workerProtocol":protocol,"feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
@@ -1357,7 +1372,7 @@ impl Engine {
         };
         let base = |item: &Value, parent: bool, existing: bool| {
             json!({"title":item["title"],"outcome":item["outcome"],"acceptance":if parent {json!([])} else {item["acceptance"].clone()},
-                "attributes":{"lane":item["lane"],"needs":item["needs"],"size":if parent {json!("large")} else {item["size"].clone()},
+                "attributes":{"role":item["role"],"needs":item["needs"],"size":if parent {json!("large")} else {item["size"].clone()},
                 "priority":task.attributes.priority,
                 "languages":item.get("languages").cloned().unwrap_or_else(|| if existing {json!(task.attributes.languages)} else {json!([])}),
                 "functions":item.get("functions").cloned().unwrap_or_else(|| if existing {json!(task.attributes.functions)} else {json!([])}),

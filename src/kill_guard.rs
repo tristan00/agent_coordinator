@@ -1,5 +1,3 @@
-//! Agent kill guard: the coordinator binary, linked as `taskkill`, `pkill` and `killall` into a folder that is
-//! prepended to PATH for planner and worker agents only. Kill-by-name is refused; everything else runs the real tool.
 use crate::Result;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -9,14 +7,12 @@ use std::{env, fs};
 pub const VARIABLE: &str = "COORDINATOR_KILL_GUARD";
 const TOOLS: [&str; 3] = ["taskkill", "pkill", "killall"];
 
-/// Returns the guarded tool name when this process was started through a guard link.
 pub fn tool() -> Option<&'static str> {
     let exe = env::current_exe().ok()?;
     let stem = exe.file_stem()?.to_str()?.to_ascii_lowercase();
     TOOLS.into_iter().find(|name| *name == stem)
 }
 
-/// Why a command is refused, or None when it only targets specific processes.
 pub fn refusal(tool: &str, args: &[String]) -> Option<String> {
     let broad = match tool {
         "taskkill" => {
@@ -55,7 +51,6 @@ pub fn run(tool: &str) -> ! {
     }
 }
 
-/// Links the running executable into `<data>/kill-guard/<digest>` under each tool name and returns that folder.
 pub fn install(data: &Path) -> Result<PathBuf> {
     let exe = env::current_exe()?;
     let digest = crate::evidence::digest(&exe)?;
@@ -78,13 +73,11 @@ pub fn install(data: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// PATH and guard variables to set on an agent process.
 pub fn environment(dir: &Path) -> Result<[(&'static str, OsString); 2]> {
     let path = env::join_paths(std::iter::once(dir.to_path_buf()).chain(env::var_os("PATH").iter().flat_map(env::split_paths)))?;
     Ok([("PATH", path), (VARIABLE, dir.as_os_str().to_owned())])
 }
 
-/// Records, per available shell, whether a lookup of each tool reaches the guard. Login shells may rebuild PATH.
 fn shell_check(dir: &Path) -> String {
     let probes: &[(&str, &[&str], &str)] = &[
         ("bash", &["-c"], "command -v {tool}"),

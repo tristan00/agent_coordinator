@@ -1,0 +1,1 @@
+Write down the source, version and checksum of everything you fetch. Script every transformation so the whole dataset can be rebuilt from scratch. Finish with documented outputs that are ready to load.

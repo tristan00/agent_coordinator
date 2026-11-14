@@ -195,9 +195,9 @@ fn size_artifact_priority_and_capability_rules() {
     assert!(board.fail(board.with("Priority", json!({"attributes":{"priority":9}}))).contains("Priority must be"));
     assert!(board.fail(board.with("Deploy", json!({"attributes":{"deploy":true}}))).contains("deploy requires artifact candidate"));
     assert!(board.fail(board.with("Gpu", json!({"attributes":{"needs":["gpu"]}}))).contains("No worker provides [\"gpu\"]"));
-    let id = board.create(board.with("Network", json!({"attributes":{"needs":["network","network"],"lane":"docs"}})));
+    let id = board.create(board.with("Network", json!({"attributes":{"needs":["network","network"],"role":"docs"}})));
     assert_eq!(board.task(&id).attributes.needs.len(), 1);
-    assert!(board.task(&id).attributes.lane == Lane::Docs);
+    assert!(board.task(&id).attributes.role == Role::Docs);
 }
 
 #[test]
@@ -538,7 +538,7 @@ fn two_rejections_of_one_criterion_send_the_task_to_replan() {
 }
 
 fn plan(acceptance: &str) -> Value {
-    json!({"status":"replanned","summary":"New approach","plan":{"title":"Revised title","outcome":"Revised outcome","acceptance":[acceptance],"lane":"code","needs":[],"size":"small"}})
+    json!({"status":"replanned","summary":"New approach","plan":{"title":"Revised title","outcome":"Revised outcome","acceptance":[acceptance],"role":"backend-code","needs":[],"size":"small"}})
 }
 
 #[test]
@@ -838,7 +838,7 @@ fn noncorrective_and_identical_edits_do_not_reset_work() {
     assert_eq!((board.engine.state.sequence, board.task(&a).history.len()), (sequence, length));
     board.engine.edit(&a, json!({"attributes":{"languages":["rust"]}})).unwrap();
     assert_eq!(board.task(&a).stage, "done");
-    board.engine.edit(&a, json!({"attributes":{"lane":"docs"}})).unwrap();
+    board.engine.edit(&a, json!({"attributes":{"role":"docs"}})).unwrap();
     assert_eq!(board.task(&a).stage, "implementation");
 }
 
@@ -1197,7 +1197,7 @@ fn legacy_flags_migrate_to_typed_attributes() {
         legacy("plain", &ws, json!({"standalone":true,"evidenceRequirements":"tests"})),
     ]);
     let engine = load(&temp, &state).unwrap();
-    assert!(engine.state.tasks[0].attributes.lane == Lane::Audit && engine.state.tasks[0].read_only());
+    assert!(engine.state.tasks[0].attributes.role == Role::Audit && engine.state.tasks[0].read_only());
     assert!(engine.state.tasks[1].attributes.artifact == Artifact::Candidate);
     assert!(engine.state.tasks[2].attributes.artifact == Artifact::None);
     let saved = fs::read_to_string(engine.directory.join("state.json")).unwrap();
@@ -1312,14 +1312,14 @@ fn model_listing_reports_enabled_options_and_the_default() {
 #[test]
 fn patching_one_attribute_keeps_the_others() {
     let mut board = model_board();
-    let id = board.create(board.with("Tune parser", json!({"attributes":{"lane":"data","size":"medium","needs":["network"],"priority":1}})));
+    let id = board.create(board.with("Tune parser", json!({"attributes":{"role":"data","size":"medium","needs":["network"],"priority":1}})));
     board.engine.edit(&id, json!({"attributes":{"model":"luna_6_high"}})).unwrap();
     let attributes = &board.task(&id).attributes;
     assert!(attributes.size == Size::Medium);
-    assert_eq!((attributes.lane, attributes.priority, attributes.model.as_deref()), (Lane::Data, Some(1), Some("luna_6_high")));
+    assert_eq!((attributes.role, attributes.priority, attributes.model.as_deref()), (Role::Data, Some(1), Some("luna_6_high")));
     assert_eq!(attributes.needs.len(), 1);
     board.engine.edit(&id, json!({"attributes":{"model":null}})).unwrap();
-    assert_eq!((board.task(&id).attributes.model.as_deref(), board.task(&id).attributes.lane), (None, Lane::Data));
+    assert_eq!((board.task(&id).attributes.model.as_deref(), board.task(&id).attributes.role), (None, Role::Data));
 }
 
 #[test]
@@ -1449,4 +1449,27 @@ fn task_value_lists_models_that_implemented_the_task() {
         }
     });
     assert_eq!(board.engine.task_value(board.task(&id), false).unwrap()["models"], json!([{"model":"small","effort":"low"},{"model":"medium","effort":"high"}]));
+}
+
+#[test]
+fn saved_lanes_become_roles_once() {
+    let temp = crate::test_support::Temp::new();
+    let mut engine = temp.engine();
+    let ws = temp.dir("workspace");
+    for title in ["A", "B", "C", "D"] {
+        engine.create(json!({"title":title,"outcome":"Done","cwd":ws,"acceptance":["Works"],"standalone":true})).unwrap();
+    }
+    let directory = engine.directory.clone();
+    let mut raw: Value = serde_json::from_slice(&fs::read(directory.join("state.json")).unwrap()).unwrap();
+    for (task, lane) in raw["tasks"].as_array_mut().unwrap().iter_mut().zip(["code", "ui", "audit", "research"]) {
+        let attributes = task["attributes"].as_object_mut().unwrap();
+        attributes.remove("role");
+        attributes.insert("lane".into(), json!(lane));
+    }
+    drop(engine);
+    fs::write(directory.join("state.json"), raw.to_string()).unwrap();
+    let engine = Engine::new(directory).unwrap();
+    let roles: Vec<_> = engine.state.tasks.iter().map(|t| t.attributes.role).collect();
+    assert_eq!(roles, [Role::BackendCode, Role::UiCode, Role::Audit, Role::Worker]);
+    assert!(engine.state.tasks[2].read_only());
 }

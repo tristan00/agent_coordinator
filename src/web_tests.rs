@@ -133,7 +133,7 @@ fn board_and_batch_routes_apply_their_effects() {
     assert_eq!(site.engine.state.tasks.len(), 2);
     site.send(api(Method::Put, "/api/config", json!({"implementation":["i"],"review":["r"]})));
     assert_eq!(site.engine.state.config.replan, ["i"]);
-    site.send(api(Method::Post, "/api/analytics", json!({"groupBy":"lane"})));
+    site.send(api(Method::Post, "/api/analytics", json!({"groupBy":"role"})));
     site.send(api(Method::Post, "/api/unknown", json!({})));
     assert_eq!(site.engine.state.tasks.len(), 2);
 }

@@ -16,9 +16,10 @@ function relations(tasks) {
   const children = new Map(tasks.map(t => [t.id, []]));
   for (const [id, p] of parent) children.get(p).push(id);
   children.forEach(list => list.sort());
-  const measure = measurements => id => {
+  const measure = (measurements, flip = false) => id => {
     const t = byId.get(id), m = measurements[id];
-    return {width: size(m?.width, 220), height: size(m?.height, 50 + Math.ceil(t.title.length / 24) * 20 + (children.get(id).length || t.container ? 80 : 0))};
+    const box = {width: size(m?.width, 220), height: size(m?.height, 50 + Math.ceil(t.title.length / 24) * 20 + (children.get(id).length || t.container ? 80 : 0))};
+    return flip ? {width: box.height, height: box.width} : box;
   };
   return {byId, parent, children, flows, links, measure};
 }
@@ -28,11 +29,24 @@ function score(width, height, room) {
   return Math.min(fit, 1 / (room.scale || 1)) + fit * 1e-6;
 }
 
-export function arrange(tasks, measurements = {}, room = {width: 2000, height: 1000}) {
-  const {byId, parent, children, flows, links, measure} = relations(tasks), sizeOf = measure(measurements), positions = {};
+export function arrange(tasks, measurements = {}, room = {width: 2000, height: 1000}, direction = 'down') {
+  if (direction !== 'down') return arrangeAcross(tasks, measurements, room, false);
+  const across = arrangeAcross(tasks, measurements, {width: room.height, height: room.width, scale: room.scale}, true);
+  return Object.fromEntries(Object.entries(across).map(([id, p]) => [id, {x: p.y, y: p.x}]));
+}
+
+function arrangeAcross(tasks, measurements, room, flip) {
+  const {byId, parent, children, flows, links, measure} = relations(tasks), sizeOf = measure(measurements, flip), positions = {};
   function block(id) {
     const own = sizeOf(id), kids = children.get(id);
     if (!kids.length) return {width: own.width, height: own.height, place: (x, y) => {positions[id] = {x, y};}};
+    if (flip) {
+      const group = layout(kids, false), height = Math.max(own.height, group.height);
+      return {width: own.width + gap.child + group.width, height, place: (x, y) => {
+        positions[id] = {x, y: y + (height - own.height) / 2};
+        group.place(x + own.width + gap.child, y + (height - group.height) / 2);
+      }};
+    }
     const group = layout(kids, false), width = Math.max(own.width, group.width);
     return {width, height: own.height + gap.child + group.height, place: (x, y) => {
       positions[id] = {x: x + (width - own.width) / 2, y};
@@ -138,7 +152,7 @@ export function arrange(tasks, measurements = {}, room = {width: 2000, height: 1
   return Object.fromEntries(Object.entries(positions).map(([id, p]) => [id, {x: Math.round(p.x), y: Math.round(p.y)}]));
 }
 
-export function extend(tasks, positions, measurements = {}) {
+export function extend(tasks, positions, measurements = {}, direction = 'down') {
   const missing = tasks.filter(t => !finite(positions[t.id]));
   if (!missing.length) return positions;
   const {byId, parent, children, flows, links, measure} = relations(tasks), sizeOf = measure(measurements), result = {...positions};
@@ -150,9 +164,13 @@ export function extend(tasks, positions, measurements = {}) {
     const up = box(parent.get(id));
     if (up) return {x: up.x, y: up.y + up.height + gap.child};
     const from = flows.filter(([, b]) => b === id).map(([a]) => box(a)).filter(Boolean);
-    if (from.length) return {x: Math.max(...from.map(b => b.x + b.width)) + gap.column, y: mean(from.map(b => b.y))};
+    if (from.length) return direction === 'down'
+      ? {x: mean(from.map(b => b.x)), y: Math.max(...from.map(b => b.y + b.height)) + gap.column}
+      : {x: Math.max(...from.map(b => b.x + b.width)) + gap.column, y: mean(from.map(b => b.y))};
     const to = [...flows.filter(([a]) => a === id).map(([, b]) => b), ...children.get(id)].map(box).filter(Boolean);
-    if (to.length) return {x: Math.min(...to.map(b => b.x)) - gap.column - own.width, y: mean(to.map(b => b.y))};
+    if (to.length) return direction === 'down'
+      ? {x: mean(to.map(b => b.x)), y: Math.min(...to.map(b => b.y)) - gap.column - own.height}
+      : {x: Math.min(...to.map(b => b.x)) - gap.column - own.width, y: mean(to.map(b => b.y))};
     const side = links.filter(pair => pair.includes(id)).map(pair => box(pair[0] === id ? pair[1] : pair[0])).filter(Boolean);
     if (side.length) return {x: Math.max(...side.map(b => b.x + b.width)) + gap.column, y: mean(side.map(b => b.y))};
     if (!boxes.length) return {x: 0, y: 0};

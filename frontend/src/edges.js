@@ -35,9 +35,20 @@ function rounded(points) {
 
 const side = (r, sign, y) => ({x: sign > 0 ? r.x + r.width : r.x, y: y ?? r.y + r.height / 2});
 
+const ks = [0, 1, -1, 2, -2, 3, -3, 5, -5];
+const stacked = (source, destination) => destination.y - source.y - source.height > 30 ? 1 : source.y - destination.y - destination.height > 30 ? -1 : 0;
+
+function verticalGeometry(kind, source, destination, rectangles, ports, sign) {
+  const lane = lanes[kind] || 0, step = Math.max(60, Math.min(source.width, destination.width) / 2 + 30);
+  const start = {x: ports.out ?? source.x + source.width / 2, y: sign > 0 ? source.y + source.height : source.y};
+  const end = {x: ports.in ?? destination.x + destination.width / 2, y: sign > 0 ? destination.y : destination.y + destination.height};
+  const reach = Math.max(50, Math.abs(end.y - start.y) / 2);
+  const curve = bestCurve(start, end, rectangles, bow => [{x: start.x + bow, y: start.y + sign * reach}, {x: end.x + bow, y: end.y - sign * reach}], ks.map(k => lane + k * step));
+  return {...curve, start, end};
+}
+
 function relationGeometry(kind, source, destination, rectangles, ports) {
   const lane = lanes[kind] || 0, step = Math.max(60, Math.min(source.height, destination.height) / 2 + 30);
-  const ks = [0, 1, -1, 2, -2, 3, -3, 5, -5];
   const ahead = destination.x - source.x - source.width, behind = source.x - destination.x - destination.width;
   if (ahead > 30 || behind > 30) {
     const sign = ahead > 30 ? 1 : -1, start = side(source, sign, ports.out), end = side(destination, -sign, ports.in);
@@ -60,24 +71,37 @@ function relationGeometry(kind, source, destination, rectangles, ports) {
 
 const facing = (source, destination) => destination.x - source.x - source.width > 30 ? [1, -1] : source.x - destination.x - destination.width > 30 ? [-1, 1] : [1, 1];
 
-export function relationLayout(list, rectangles) {
+export function relationLayout(list, rectangles, direction = 'down') {
   const groups = new Map(), ports = new Map(list.map(e => [e.id, {}]));
-  const middle = r => r.y + r.height / 2;
-  const join = (rect, sign, entry) => {
-    const key = `${rect.id}:${sign}`;
-    if (!groups.has(key)) groups.set(key, {rect, entries: []});
+  const middle = r => r.y + r.height / 2, centre = r => r.x + r.width / 2;
+  const vertical = new Map(list.map(e => [e.id, direction === 'down' ? stacked(e.source, e.destination) : 0]));
+  const join = (rect, side, entry) => {
+    const key = `${rect.id}:${side}`;
+    if (!groups.has(key)) groups.set(key, {rect, across: typeof side === 'string', entries: []});
     groups.get(key).entries.push(entry);
   };
   for (const e of list) {
+    const sign = vertical.get(e.id);
+    if (sign) {
+      join(e.source, sign > 0 ? 'bottom' : 'top', {id: e.id, end: 'out', order: centre(e.destination)});
+      join(e.destination, sign > 0 ? 'top' : 'bottom', {id: e.id, end: 'in', order: centre(e.source)});
+      continue;
+    }
     const [a, b] = facing(e.source, e.destination);
     join(e.source, a, {id: e.id, end: 'out', order: middle(e.destination)});
     join(e.destination, b, {id: e.id, end: 'in', order: middle(e.source)});
   }
-  for (const {rect, entries} of groups.values()) {
+  for (const {rect, across, entries} of groups.values()) {
     entries.sort((p, q) => p.order - q.order || (p.id < q.id ? -1 : 1));
-    entries.forEach((entry, i) => {ports.get(entry.id)[entry.end] = rect.y + rect.height * (0.2 + 0.6 * (i + 1) / (entries.length + 1));});
+    entries.forEach((entry, i) => {
+      const share = 0.2 + 0.6 * (i + 1) / (entries.length + 1);
+      ports.get(entry.id)[entry.end] = across ? rect.x + rect.width * share : rect.y + rect.height * share;
+    });
   }
-  return new Map(list.map(e => [e.id, relationGeometry(e.kind, e.source, e.destination, rectangles, ports.get(e.id))]));
+  return new Map(list.map(e => {
+    const sign = vertical.get(e.id);
+    return [e.id, sign ? verticalGeometry(e.kind, e.source, e.destination, rectangles, ports.get(e.id), sign) : relationGeometry(e.kind, e.source, e.destination, rectangles, ports.get(e.id))];
+  }));
 }
 export function hierarchyGeometry(source, destination, port, rectangles) {
   const {index, count} = port;
@@ -121,7 +145,11 @@ function corners(box) {
   return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sy]) => ({x: box.cx + sx * box.w * box.cos - sy * box.h * box.sin, y: box.cy + sx * box.w * box.sin + sy * box.h * box.cos}));
 }
 
+const reachX = box => Math.abs(box.w * box.cos) + Math.abs(box.h * box.sin);
+const reachY = box => Math.abs(box.w * box.sin) + Math.abs(box.h * box.cos);
+
 function overlaps(box, other) {
+  if (Math.abs(box.cx - other.cx) > reachX(box) + reachX(other) || Math.abs(box.cy - other.cy) > reachY(box) + reachY(other)) return false;
   const mine = corners(box), theirs = corners(other);
   return mine.some((a, i) => theirs.some((c, j) => {
     const b = mine[(i + 1) % 4], d = theirs[(j + 1) % 4];
@@ -156,6 +184,7 @@ function slots(item, others, nodeBoxes) {
   const words = item.text.split(' '), variants = words.length > 1 ? [item.text, words.slice(1).join(' ')] : [item.text];
   const height = 14, lift = height / 2 + 1, result = [];
   const reach = extent(item.points, item.text.length * 6.6 + 40), nearby = others.filter(o => near(reach, o.extent));
+  nodeBoxes = nodeBoxes.filter(n => near(reach, {x0: n.cx - n.w, y0: n.cy - n.h, x1: n.cx + n.w, y1: n.cy + n.h}));
   variants.forEach((label, short) => {
     const width = label.length * 6.6 + 4;
     for (let k = 0; k <= 10; k++) for (const flip of [-1, 1]) for (const level of [false, true]) for (const raised of [1, 0]) {
@@ -164,10 +193,17 @@ function slots(item, others, nodeBoxes) {
       if (angle > Math.PI / 2) angle -= Math.PI; else if (angle < -Math.PI / 2) angle += Math.PI;
       const cos = Math.cos(angle), sin = Math.sin(angle);
       const box = {cx: p.x + sin * flip * lift * raised, cy: p.y - cos * flip * lift * raised, w: width / 2, h: height / 2, cos, sin};
-      const centre = {x: box.cx, y: box.cy}, own = distance(centre, item.points);
-      const foreign = Math.min(Infinity, ...nearby.map(o => distance(centre, o.points)));
+      if (nodeBoxes.some(n => overlaps(box, n))) continue;
+      const centre = {x: box.cx, y: box.cy}, own = distance(centre, item.points), margin = 2 * own + 6;
+      const area = {x0: box.cx - reachX(box) - margin, y0: box.cy - reachY(box) - margin, x1: box.cx + reachX(box) + margin, y1: box.cy + reachY(box) + margin};
       const padded = {...box, w: box.w + 3, h: box.h + 3};
-      if (foreign < 2 * own + 2 || nodeBoxes.some(n => overlaps(box, n)) || nearby.some(o => o.points.slice(1).some((q, i) => cuts(padded, o.points[i], q)))) continue;
+      let blocked = false;
+      for (const o of nearby) {
+        if (!near(area, o.extent)) continue;
+        for (const s of o.segments) if (near(area, s) && (distance(centre, s.ends) < 2 * own + 2 || cuts(padded, s.ends[0], s.ends[1]))) {blocked = true; break;}
+        if (blocked) break;
+      }
+      if (blocked) continue;
       result.push({box, angle, label, slot: [short, k, flip, level, raised].join(), score: short * 1000 + (raised ? 0 : 500) + (level ? 200 : 0) + Math.round(Math.abs(fraction - 0.5) * 20) * 2 + (flip > 0 ? 1 : 0)});
     }
   });
@@ -177,7 +213,10 @@ function slots(item, others, nodeBoxes) {
 export function placeLabels(items, rectangles, memory = new Map()) {
   const placed = new Map(), boxes = [];
   const nodeBoxes = rectangles.map(r => ({cx: r.x + r.width / 2, cy: r.y + r.height / 2, w: r.width / 2 + 3, h: r.height / 2 + 3, cos: 1, sin: 0}));
-  const all = items.filter(i => i.points?.length > 1).map(i => ({...i, extent: extent(i.points, 0)}));
+  const all = items.filter(i => i.points?.length > 1).map(i => ({...i, extent: extent(i.points, 0), segments: i.points.slice(1).map((q, k) => {
+    const p = i.points[k];
+    return {ends: [p, q], x0: Math.min(p.x, q.x), y0: Math.min(p.y, q.y), x1: Math.max(p.x, q.x), y1: Math.max(p.y, q.y)};
+  })}));
   const free = s => !boxes.some(b => overlaps({...s.box, w: s.box.w + 2, h: s.box.h + 2}, b));
   const candidates = all.filter(i => i.text).sort((a, b) => (a.id < b.id ? -1 : 1)).map(item => ({item, options: slots(item, all.filter(o => o !== item), nodeBoxes)}));
   const kept = new Map(candidates.map(({item, options}) => [item.id, options.find(s => s.slot === memory.get(item.id))]));
@@ -192,4 +231,17 @@ export function placeLabels(items, rectangles, memory = new Map()) {
     placed.set(item.id, {x: box.cx, y: box.cy, label: choice.label, angle: choice.angle * 180 / Math.PI, bounds: {x0: box.cx - half, y0: box.cy - tall, x1: box.cx + half, y1: box.cy + tall}});
   }
   return placed;
+}
+export function directGeometry(kind, source, destination, direction = 'down') {
+  const sign = direction === 'down' ? stacked(source, destination) : 0;
+  if (kind === 'parent' || sign) {
+    if (kind !== 'parent') {
+      const start = {x: source.x + source.width / 2, y: sign > 0 ? source.y + source.height : source.y}, end = {x: destination.x + destination.width / 2, y: sign > 0 ? destination.y : destination.y + destination.height}, bend = Math.max(40, Math.abs(end.y - start.y) / 2);
+      return {start, end, points: [start, end], path: svg(start, {x: start.x, y: start.y + sign * bend}, {x: end.x, y: end.y - sign * bend}, end)};
+    }
+    const start = {x: source.x + source.width / 2, y: source.y + source.height}, end = {x: destination.x + destination.width / 2, y: destination.y}, bend = Math.max(40, Math.abs(end.y - start.y) / 2);
+    return {start, end, points: [start, end], path: svg(start, {x: start.x, y: start.y + bend}, {x: end.x, y: end.y - bend}, end)};
+  }
+  const [a, b] = facing(source, destination), start = side(source, a), end = side(destination, b), reach = Math.max(50, Math.abs(end.x - start.x) / 2);
+  return {start, end, points: [start, end], path: svg(start, {x: start.x + a * reach, y: start.y}, {x: end.x + b * reach, y: end.y}, end)};
 }

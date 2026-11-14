@@ -69,21 +69,38 @@ impl WorkspaceSettings {
         crate::agents::resolve(&self.agents, id.as_deref().ok_or(format!("Workspace {role} selection is required"))?, family)
     }
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Lane {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
     #[default]
-    Code,
-    Ui,
-    Data,
-    Docs,
-    Audit,
-    Cleanup,
+    Worker,
+    Analytics,
+    BackendCode,
+    UiCode,
+    Design,
+    Optimization,
     Test,
-    Build,
-    Research,
+    Docs,
+    Data,
+    Audit,
 }
-pub const LANES: [&str; 9] = ["code", "ui", "data", "docs", "audit", "cleanup", "test", "build", "research"];
+pub const ROLES: [&str; 10] = ["worker", "analytics", "backend-code", "ui-code", "design", "optimization", "test", "docs", "data", "audit"];
+impl Role {
+    pub fn name(self) -> &'static str {
+        ROLES[self as usize]
+    }
+}
+pub fn role_from_lane(lane: &str) -> &'static str {
+    match lane {
+        "code" => "backend-code",
+        "ui" => "ui-code",
+        "data" => "data",
+        "docs" => "docs",
+        "audit" => "audit",
+        "test" => "test",
+        _ => "worker",
+    }
+}
 pub const SIZES: [&str; 3] = ["small", "medium", "large"];
 pub const NEEDS: [&str; 4] = ["network", "browser", "process", "gpu"];
 pub const ARTIFACTS: [&str; 3] = ["none", "candidate", "report"];
@@ -135,7 +152,7 @@ pub fn classification_schema() -> Value {
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Attributes {
-    pub lane: Lane,
+    pub role: Role,
     pub needs: Vec<Need>,
     #[serde(deserialize_with = "languages")]
     pub languages: std::collections::BTreeSet<String>,
@@ -149,7 +166,7 @@ pub struct Attributes {
     pub model: Option<String>,
 }
 impl Attributes {
-    pub const FIELDS: [&'static str; 9] = ["lane", "needs", "languages", "functions", "priority", "size", "artifact", "deploy", "model"];
+    pub const FIELDS: [&'static str; 9] = ["role", "needs", "languages", "functions", "priority", "size", "artifact", "deploy", "model"];
     pub fn priority(&self) -> u8 {
         self.priority.unwrap_or(2)
     }

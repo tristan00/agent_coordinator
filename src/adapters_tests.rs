@@ -78,3 +78,17 @@ fn claude_executable_is_found_as_exe_or_npm_shim_on_path() {
     assert_eq!(executable("claude", Some(path)), Some(first.join("claude.exe")));
     assert_eq!(executable("claude", None), None);
 }
+
+#[test]
+fn worker_input_is_role_prompt_stage_and_task() {
+    let request = serde_json::json!({"stage":"implementation","workerProtocol":{"role":"ui-code","text":"Build interfaces people enjoy."},
+        "task":{"id":"t1","title":"Menu","outcome":"A working menu","acceptance":["Opens"],"cwd":"D:/w","role":"ui-code","needs":[],"languages":[],"functions":[],"model":"m","effort":"low","writable":[]},
+        "agent":{"model":"m"},"family":"claude","limits":{"words":10},"feedback":["Fix the close button"],"dependencies":[],"scratch":"D:/s","command":["x"],"run_id":"r"});
+    let text = crate::process::prompt(&request, "implementation").unwrap();
+    assert!(text.starts_with("Build interfaces people enjoy.\n\nImplement the task outcome"));
+    let task: serde_json::Value = serde_json::from_str(&text[text.find("\n\ntask: ").unwrap() + 8..]).unwrap();
+    assert_eq!((task["title"].as_str(), task["feedback"][0].as_str(), task["scratch"].as_str()), (Some("Menu"), Some("Fix the close button"), Some("D:/s")));
+    for hidden in ["agent", "family", "limits", "command", "run_id", "workerProtocol", "model", "effort", "dependencies", "writable"] {
+        assert!(task.get(hidden).is_none(), "{hidden}");
+    }
+}

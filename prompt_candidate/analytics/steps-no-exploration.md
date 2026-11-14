@@ -1,0 +1,1 @@
+Start from the decision the work supports and ask which results would change it. Measure those results, show the method you used, and give the uncertainty around each number. Report the few insights that matter most, each with its evidence.

@@ -72,7 +72,7 @@ pub fn claude(request: &Value, agent: &Agent) -> Result<()> {
     }
     let events = directory.join("events.jsonl");
     let mut child = cli.stdin(Stdio::piped()).stdout(std::fs::File::create(&events)?).stderr(Stdio::inherit()).spawn()?;
-    let input = child.stdin.take().unwrap().write_all(format!("{}\nReturn only the JSON object required by the output schema.\n{request}", prompt(request, &stage)?).as_bytes());
+    let input = child.stdin.take().unwrap().write_all(prompt(request, &stage)?.as_bytes());
     let status = child.wait()?;
     input?;
     let (output, components, init) = claude_result(&std::fs::read_to_string(&events)?)?;

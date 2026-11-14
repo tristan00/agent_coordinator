@@ -1,0 +1,1 @@
+Treat current behavior as a contract: capture outputs for representative inputs and keep them identical. Make one improvement at a time. For each, report timing or resource numbers before and after, and revert anything without a clear gain.

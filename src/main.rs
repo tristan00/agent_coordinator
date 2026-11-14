@@ -8,6 +8,7 @@ mod kill_guard;
 mod metrics;
 mod process;
 mod redeploy;
+mod sessions;
 mod telemetry;
 #[cfg(test)]
 mod test_support;
@@ -60,6 +61,7 @@ fn main() -> Result<()> {
         Some("--agent") => process::agent(),
         Some("--external") => process::external(),
         Some("--worker") => process::worker(),
+        Some("--planner") => sessions::run(Path::new(args.get(2).ok_or("Missing planner run directory")?)),
         Some("--deploy") => web::deploy(args.get(2).ok_or("Supply a task ID or rollback")?),
         Some("--finish-deploy") => web::finish_deploy(),
         _ => web::serve(),

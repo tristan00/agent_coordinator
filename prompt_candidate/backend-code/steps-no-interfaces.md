@@ -1,0 +1,1 @@
+Write the plainest code that solves the task. Test the main paths and the awkward ones: empty, huge, malformed and concurrent input. Make failures explicit and informative. Check speed at realistic sizes and fix anything noticeably slow.

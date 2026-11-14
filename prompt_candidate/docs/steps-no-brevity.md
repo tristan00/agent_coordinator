@@ -1,0 +1,1 @@
+Run the product yourself and document what really happens. Write the setup and usage steps exactly as they work, with examples that run. Re-check every claim against current behavior before finishing.

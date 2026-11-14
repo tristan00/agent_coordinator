@@ -1,10 +1,13 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
-import {ReactFlow, Background, Controls, MiniMap, MarkerType, Position, Handle, BaseEdge} from '@xyflow/react';
+import {ReactFlow, Background, Controls, MiniMap, MarkerType, Position, Handle, BaseEdge, Panel} from '@xyflow/react';
+import {ArrowDown, ArrowRight, Atom, Crosshair, Eye, HelpCircle, LayoutGrid, Maximize2} from 'lucide-react';
+import {FieldPicker, usePreference} from './Controls';
+import {FIELD, display, colorScale} from './fields';
 import '@xyflow/react/dist/style.css';
-import {relationLayout, hierarchyGeometry, placeLabels} from './edges';
+import {relationLayout, hierarchyGeometry, placeLabels, directGeometry} from './edges';
 import {createSimulation, arrange, extend} from './layout';
 import {BorderBeam} from './Activity';
-import TaskName, {matchesTask, taskLabel, modelText} from './TaskName';
+import TaskName, {taskLabel} from './TaskName';
 
 const views = new Map();
 const legible = 0.6, margin = 24;
@@ -35,21 +38,26 @@ const names = {dependency: 'Dependency', after: 'Ordering', parent: 'Parent → 
 function RelationEdge({id, style, markerEnd, labelStyle, data}) {
   const {kind, path, start, end, text} = data;
   const undirected = ['conflict', 'related'].includes(kind);
-  return <><BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} />
+  return <><BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} className={data.fresh ? 'edge-enter' : ''} />
+    {data.fresh && <path d={path} pathLength="1" className="edge-sweep" style={{stroke: colors[kind]}} fill="none" />}
+    {data.flow && <path d={path} className="edge-flow" style={{stroke: 'var(--live)'}} fill="none" />}
     <circle className={kind === 'parent' ? 'hierarchy-dot' : 'edge-dot'} cx={start.x} cy={start.y} r={kind === 'parent' ? 5 : 3.5} style={{fill: colors[kind]}} />
     {undirected && <circle className="edge-dot" cx={end.x} cy={end.y} r={3.5} style={{fill: colors[kind]}} />}
     <title>{data.tooltip}</title>{text && <text className="react-flow__edge-text graph-edge-reason" x={text.x} y={text.y} textAnchor="middle" dominantBaseline="central" transform={`rotate(${text.angle} ${text.x} ${text.y})`} style={labelStyle}>{text.label}</text>}</>;
 }
 const edgeTypes = {relation: RelationEdge};
 export default function Graph({tasks, allTasks = tasks, select, workspace, activityEnabled = true}) {
-  const key = `coordinator.graph.v1:${JSON.stringify(workspace)}`;
+  const [direction, setDirection] = usePreference('coordinator.graph.direction', 'down');
+  const key = `coordinator.graph.v2:${direction}:${JSON.stringify(workspace)}`;
   const view = useRef(readView(key));
   const [positions, setPositions] = useState(view.current.positions);
   const [measurements, setMeasurements] = useState({});
-  const [showDone, setShowDone] = useState(false);
-  const [showModels, setShowModels] = useState(false);
+  const [showDone, setShowDone] = usePreference('coordinator.graph.done', false);
+  const [fields, setFields] = usePreference('coordinator.graph.fields', ['status', 'role']);
+  const [colorBy, setColorBy] = usePreference('coordinator.graph.color', '');
   const [collapsed, setCollapsed] = useState(new Set());
-  const [query, setQuery] = useState('');
+  const seen = useRef(null);
+  const edgesSeen = useRef(null);
   const [inspected, setInspected] = useState(null);
   const flow = useRef(null);
   const simulation = useRef(null);
@@ -65,7 +73,7 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     if (task.parent) children.set(task.parent, [...(children.get(task.parent) || []), task.id]);
   });
   const scope = new Set(tasks.map(task => task.id));
-  const eligible = new Set(tasks.filter(task => (showDone || task.stage !== 'done' || tasks.some(other => other.stage !== 'done' && (other.dependencies.some(d => target(d) === task.id) || other.after.includes(task.id)))) && matchesTask(task, query)).map(task => task.id));
+  const eligible = new Set(tasks.filter(task => (showDone || task.stage !== 'done' || tasks.some(other => other.stage !== 'done' && (other.dependencies.some(d => target(d) === task.id) || other.after.includes(task.id))))).map(task => task.id));
   for (const id of [...eligible]) {
     const visited = new Set([id]);
     let parent = byId.get(id)?.parent;
@@ -92,9 +100,9 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   const [ready, setReady] = useState(false);
   const room = pane.current?.clientHeight ? {width: (pane.current.clientWidth - 2 * margin) / legible, height: (pane.current.clientHeight - 2 * margin) / legible, scale: legible} : undefined;
   const shownKey = JSON.stringify(shown.map(t => [t.id, t.title, t.parent, t.container, t.dependencies, t.after, t.conflicts, t.related]));
-  const defaults = useMemo(() => arrange(shown, measurements, room), [shownKey, measurements, room?.width, room?.height]);
+  const defaults = useMemo(() => arrange(shown, measurements, room, direction), [shownKey, measurements, room?.width, room?.height, direction]);
   const measured = shown.every(t => measurements[t.id]);
-  const established = shown.some(t => point(positions[t.id])) ? extend(shown, positions, measurements) : {...positions, ...defaults};
+  const established = shown.some(t => point(positions[t.id])) ? extend(shown, positions, measurements, direction) : {...positions, ...defaults};
   const placed = tasks.filter(t => point(established[t.id]));
   const missing = shown.some(t => !point(positions[t.id]));
   useEffect(() => {
@@ -175,18 +183,27 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   }, []);
   useEffect(() => () => {simulation.current?.cancel(); cancelAnimationFrame(frame.current);}, []);
   const ids = new Set(shown.map(task => task.id));
+  const now = Date.now();
+  if (!seen.current) seen.current = new Map(shown.map(task => [task.id, {at: 0, status: task.status, changed: 0}]));
+  shown.forEach(task => {
+    const memory = seen.current.get(task.id);
+    if (!memory) seen.current.set(task.id, {at: now, status: task.status, changed: 0});
+    else if (memory.status !== task.status) seen.current.set(task.id, {...memory, status: task.status, changed: now});
+  });
+  const scale = colorScale(FIELD[colorBy] || FIELD.status, shown);
   const nodes = shown.map(task => {
     const members = children.get(task.id) || [], parent = task.container || members.length > 0;
     const hidden = members.filter(id => !ids.has(id)).length;
     return {
       id: task.id, type: 'task', measured: measurements[task.id], position: established[task.id],
-      className: `graph-task ${parent ? 'graph-parent' : ''} ${task.parent ? 'graph-subtask' : ''} ${task.blocked ? 'bad' : task.active && !task.stopped && activityEnabled ? 'live' : task.stage === 'done' ? 'good' : ''}`,
+      className: `graph-task ${parent ? 'graph-parent' : ''} ${task.parent ? 'graph-subtask' : ''} ${task.blocked ? 'bad' : task.active && !task.stopped && activityEnabled ? 'live' : task.stage === 'done' ? 'good' : ''} ${task.stopped ? 'graph-stopped' : ''} ${now - seen.current.get(task.id).at < 900 ? 'graph-enter' : ''} ${now - seen.current.get(task.id).changed < 1600 ? 'graph-changed' : ''}`,
+      style: {'--node-accent': scale.color(task)},
       ariaLabel: `${parent ? 'Parent: ' : ''}${taskLabel(task)}. ${task.status}. Press Enter or Space to inspect.`,
       data: {active: !!task.active && !task.blocked && !task.stopped && activityEnabled, label: <>
         {parent && <span className="parent-label">Parent · {members.length} {members.length === 1 ? 'subtask' : 'subtasks'}</span>}
         {task.parent && <span className="subtask-label">Subtask</span>}
-        <strong><TaskName task={task} /></strong><span>{task.status} · {task.attributes.lane}</span>
-        {showModels && !task.container && <span className="graph-model">Model: {modelText(task) || 'not run yet'}</span>}
+        <strong><TaskName task={task} /></strong>
+        {!!fields.length && <span className="node-fields">{fields.filter(key => FIELD[key]).map(key => <span className="node-field" key={key}><i>{FIELD[key].label}</i><b>{display(FIELD[key], task)}</b></span>)}</span>}
         {parent && <><span>{members.length} direct children · {hidden} hidden</span>
           <button className="nodrag nopan" aria-label={`${collapsed.has(task.id) ? 'Expand' : 'Collapse'} ${task.title}`} aria-expanded={!collapsed.has(task.id)} onClick={event => {
             event.stopPropagation();
@@ -222,8 +239,10 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     if (!ids.has(from) || !ids.has(to)) return;
     const source = rectangle.get(from), destination = rectangle.get(to);
     if (!point(source) || !point(destination)) return;
-    const geometry = kind === 'parent' ? hierarchyGeometry(source, destination, ports.get(to) || {index: 0, count: 1}, rectangles) : {source, destination};
-    edges.push({id, source: from, target: to, label: kind === 'parent' ? undefined : kind === 'dependency' ? label.slice('dependency · '.length) : label, ariaLabel: description, className: `graph-edge-${kind}`, data: {kind, ...geometry},
+    const geometry = moving ? {...directGeometry(kind, source, destination, direction), quick: true} : kind === 'parent' ? hierarchyGeometry(source, destination, ports.get(to) || {index: 0, count: 1}, rectangles) : {source, destination};
+    if (edgesSeen.current && !edgesSeen.current.has(id)) edgesSeen.current.set(id, now);
+    const fresh = edgesSeen.current?.get(id) || 0;
+    edges.push({id, source: from, target: to, label: kind === 'parent' ? undefined : kind === 'dependency' ? label.slice('dependency · '.length) : label, ariaLabel: description, className: `graph-edge-${kind}`, data: {kind, ...geometry, fresh: now - fresh < 1200, flow: activityEnabled && ['dependency', 'after'].includes(kind) && !!byId.get(to)?.active && !byId.get(to)?.stopped},
       sourceHandle: kind === 'parent' ? 'hierarchy-out' : 'relations-out', targetHandle: kind === 'parent' ? 'hierarchy-in' : 'relations-in',
       type: 'relation',
       style: {stroke: colors[kind], strokeDasharray: dashes[kind], strokeWidth: kind === 'parent' ? 3 : kind === 'related' ? 1 : 1.5},
@@ -237,8 +256,8 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
     task.conflicts.forEach(id => edge(id, task.id, 'conflict'));
     task.related.forEach(id => edge(id, task.id, 'related'));
   });
-  const routes = relationLayout(edges.filter(e => e.data.kind !== 'parent').map(e => ({id: e.id, kind: e.data.kind, source: e.data.source, destination: e.data.destination})), rectangles);
-  edges.forEach(e => {if (routes.has(e.id)) e.data = {kind: e.data.kind, ...routes.get(e.id)};});
+  const routes = moving ? new Map() : relationLayout(edges.filter(e => e.data.kind !== 'parent').map(e => ({id: e.id, kind: e.data.kind, source: e.data.source, destination: e.data.destination})), rectangles, direction);
+  edges.forEach(e => {if (routes.has(e.id)) e.data = {kind: e.data.kind, fresh: e.data.fresh, flow: e.data.flow, ...routes.get(e.id)};});
   const box = r => JSON.stringify([r.x, r.y, r.width, r.height]);
   const blockedBy = (points, source, destination) => (points || []).slice(2, -2).filter(p => rectangles.some(r => r.id !== source && r.id !== destination && p.x > r.x - 4 && p.x < r.x + r.width + 4 && p.y > r.y - 4 && p.y < r.y + r.height + 4)).length;
   const stable = new Set(), nextRoutes = new Map(), degree = new Map();
@@ -246,35 +265,26 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
   edges.forEach(e => {
     const sig = box(rectangle.get(e.source)) + box(rectangle.get(e.target)) + degree.get(e.source) + ':' + degree.get(e.target);
     const cached = routeCache.current.get(e.id);
-    if (cached && cached.sig === sig && (moving || blockedBy(cached.data.points, e.source, e.target) <= cached.blocked)) {e.data = cached.data; stable.add(e.id);}
+    if (cached && cached.sig === sig && (moving || (!cached.data.quick && blockedBy(cached.data.points, e.source, e.target) <= cached.blocked))) {e.data = {...cached.data, fresh: e.data.fresh, flow: e.data.flow}; stable.add(e.id);}
     nextRoutes.set(e.id, stable.has(e.id) ? cached : {sig, data: e.data, blocked: blockedBy(e.data.points, e.source, e.target)});
   });
   routeCache.current = nextRoutes;
   const hits = (b, r) => b.x0 < r.x + r.width + 2 && r.x - 2 < b.x1 && b.y0 < r.y + r.height + 2 && r.y - 2 < b.y1;
-  const kept = new Map([...labelCache.current].filter(([id, t]) => stable.has(id) && (edges.find(e => e.id === id)?.label || '').endsWith(t.label) && (moving || !rectangles.some(r => hits(t.bounds, r)))));
+  const edgeById = new Map(edges.map(e => [e.id, e]));
+  const kept = new Map([...labelCache.current].filter(([id, t]) => stable.has(id) && edgeById.get(id)?.data.path === t.path && (edgeById.get(id)?.label || '').endsWith(t.label) && (moving || !rectangles.some(r => hits(t.bounds, r)))));
   const memory = new Map([...slots.current].filter(([id]) => kept.has(id)));
   const reserved = [...kept.values()].map(({bounds: b}) => ({x: b.x0, y: b.y0, width: b.x1 - b.x0, height: b.y1 - b.y0}));
   const reasons = moving ? kept : new Map([...placeLabels(edges.map(e => ({id: e.id, text: kept.has(e.id) ? '' : e.label || '', points: e.data.points})), [...rectangles, ...reserved], slots.current), ...kept]);
   if (!moving) memory.forEach((slot, id) => slots.current.set(id, slot));
-  if (!moving) labelCache.current = reasons;
+  if (!moving) labelCache.current = new Map([...reasons].map(([id, t]) => [id, {...t, path: edgeById.get(id)?.data.path}]));
   edges.forEach(e => {e.data = {...e.data, text: reasons.get(e.id), tooltip: e.ariaLabel};});
+  if (!edgesSeen.current) edgesSeen.current = new Map(edges.map(e => [e.id, 0]));
   if (!moving) drawn.current = [...edges.flatMap(e => e.data.points || []).map(p => ({x: p.x, y: p.y, width: 0, height: 0})), ...[...reasons.values()].map(({bounds: b}) => ({x: b.x0, y: b.y0, width: b.x1 - b.x0, height: b.y1 - b.y0}))];
   return {edges, relationships};
-  }, [geometryKey, moving, showDone, query, collapsed]);
+  }, [geometryKey, moving, showDone, collapsed, direction, JSON.stringify(allTasks.map(t => [t.id, !!t.active, t.stopped])), activityEnabled]);
   const selectedRelation = relationships.find(edge => edge.id === inspected);
   return <>
-    <div className="filters">
-      <input type="search" aria-label="Filter graph by ID or title" placeholder="Filter graph by ID or title" value={query} onChange={event => setQuery(event.target.value)} />
-      <label className="check"><input type="checkbox" checked={showDone} onChange={event => setShowDone(event.target.checked)} /> Show finished tasks</label>
-      <label className="check"><input type="checkbox" checked={showModels} onChange={event => setShowModels(event.target.checked)} /> Show models</label>
-      <button onClick={() => flow.current?.fitView({duration: 0})}>Fit graph</button>
-      <button onClick={frameGraph}>Reset view</button>
-      <button onClick={() => {stopLayout(); setEnabled(false); framed.current = false; persist({positions: {}, viewport: undefined}); setPositions({});}}>Arrange</button>
-      <label className="check"><input type="checkbox" role="switch" aria-label="Graph physics" aria-describedby="physics-status" checked={enabled} disabled={reducedMotion} onChange={event => {if (!event.target.checked) stopLayout(); setEnabled(event.target.checked);}} /> Physics</label>
-      <span className="muted" id="physics-status" role="status">{reducedMotion ? 'Physics paused for reduced motion. Manual dragging is available.' : enabled ? running ? 'Arranging tasks…' : 'Layout settled' : 'Physics off · positions frozen'}</span>
-      <span className="legend" aria-label="Relationship legend">{Object.entries(names).map(([kind, name]) => <span key={kind}><i className={kind} />{name}{['dependency', 'after'].includes(kind) ? ' →' : ''}</span>)}</span>
-    </div>
-    <p className="muted" id="graph-help">Drag tasks to arrange. Drag the background to pan. Scroll or pinch to zoom. Tab to a task and press Enter or Space to inspect; arrow keys move it. Hidden counts refer to immediate children. Focus or select an edge to inspect its full relationship. Supersession remains in task history.</p>
+    <p className="sr-only" id="graph-help">Drag tasks to arrange. Drag the background to pan. Scroll or pinch to zoom. Tab to a task and press Enter or Space to inspect; arrow keys move it. Hidden counts refer to immediate children. Focus or select an edge to inspect its full relationship.</p>
     {!shown.length && <p className="empty">No matching tasks in this scope.</p>}
     <div className="graph" ref={pane} onKeyUpCapture={event => {if (event.key.startsWith('Arrow')) persist({}); if (event.key.startsWith('Arrow')) releaseNode(event.target.closest('.react-flow__node')?.dataset.id);}} onFocusCapture={event => {const edge = event.target.closest(".react-flow__edge"); if (edge) setInspected(edge.dataset.id);}} onKeyDownCapture={event => {
       if (event.target.closest('button, input')) return;
@@ -310,8 +320,28 @@ export default function Graph({tasks, allTasks = tasks, select, workspace, activ
             view.current = {...view.current, positions: next}; return next;
           });
         }} onMoveEnd={(_, viewport) => persist({viewport})}>
-        <Background color="var(--line)" /><Controls showInteractive={false} />
-        <MiniMap pannable zoomable nodeColor="var(--accent)" maskColor="var(--bg)" />
+        <Panel position="top-left" className="graph-toolbar" aria-label="Graph view settings">
+          <FieldPicker fields={fields} setFields={setFields} colorBy={colorBy} setColorBy={setColorBy} />
+          <span className="toolbar-sep" />
+          <button type="button" className={`tool ${showDone ? 'on' : ''}`} aria-pressed={showDone} onClick={() => setShowDone(v => !v)} title="Show finished tasks"><Eye size={15} aria-hidden="true" />Finished</button>
+          <button type="button" role="switch" aria-checked={enabled} aria-label="Graph physics" aria-describedby="physics-status" className={`tool ${enabled ? 'on' : ''}`} disabled={reducedMotion} onClick={() => {if (enabled) stopLayout(); setEnabled(!enabled);}} title={reducedMotion ? 'Physics paused for reduced motion' : 'Physics layout'}><Atom size={15} aria-hidden="true" className={enabled && running ? 'spin' : ''} />Physics</button>
+          <button type="button" className="tool" onClick={() => {const next = direction === 'down' ? 'right' : 'down'; stopLayout(); setEnabled(false); framed.current = false; setDirection(next);}} title="Switch layout direction" aria-label={`Layout direction: ${direction === 'down' ? 'top to bottom' : 'left to right'}`}>{direction === 'down' ? <ArrowDown size={15} aria-hidden="true" /> : <ArrowRight size={15} aria-hidden="true" />}{direction === 'down' ? 'Top-down' : 'Left-right'}</button>
+          <span className="toolbar-sep" />
+          <button type="button" className="tool icon" onClick={() => flow.current?.fitView({duration: reducedMotion ? 0 : 300})} title="Fit graph" aria-label="Fit graph"><Maximize2 size={15} aria-hidden="true" /></button>
+          <button type="button" className="tool icon" onClick={frameGraph} title="Reset view" aria-label="Reset view"><Crosshair size={15} aria-hidden="true" /></button>
+          <button type="button" className="tool icon" onClick={() => {stopLayout(); setEnabled(false); framed.current = false; persist({positions: {}, viewport: undefined}); setPositions({});}} title="Arrange" aria-label="Arrange"><LayoutGrid size={15} aria-hidden="true" /></button>
+          <span className="tool icon help" tabIndex={0} title="Drag tasks to arrange. Drag the background to pan. Scroll or pinch to zoom. Tab to a task and press Enter or Space to inspect; arrow keys move it. Focus or select an edge to inspect its full relationship." aria-label="Graph help"><HelpCircle size={15} aria-hidden="true" /></span>
+          <span className="sr-only" id="physics-status" role="status">{reducedMotion ? 'Physics paused for reduced motion. Manual dragging is available.' : enabled ? running ? 'Arranging tasks…' : 'Layout settled' : 'Physics off · positions frozen'}</span>
+        </Panel>
+        <Panel position="bottom-left" className="graph-legend" aria-label="Legend">
+          <div className="legend-block"><span className="legend-title">{(FIELD[colorBy] || FIELD.status).label}</span>
+            {scale.gradient ? <span className="legend-gradient"><span>{scale.legend[0].label}</span><i style={{background: `linear-gradient(90deg, ${scale.legend[0].color}, hsl(115 80% 60%), ${scale.legend[1].color})`}} /><span>{scale.legend[1].label}</span></span>
+              : <span className="legend-swatches">{scale.legend.slice(0, 10).map(item => <span key={item.label}><i style={{background: item.color}} />{item.label}</span>)}{scale.legend.length > 10 && <span className="muted">+{scale.legend.length - 10}</span>}</span>}
+          </div>
+          <div className="legend-block legend">{Object.entries(names).map(([kind, name]) => <span key={kind}><i className={kind} />{name}</span>)}</div>
+        </Panel>
+        <Background color="var(--line)" /><Controls showInteractive={false} position="bottom-right" />
+        <MiniMap pannable zoomable nodeColor={node => node.style?.['--node-accent'] || 'var(--accent)'} maskColor="var(--bg)" position="top-right" />
       </ReactFlow>
     </div>
     <p className="graph-inspection" aria-live="polite">{selectedRelation?.description || 'Select an edge or expand relationship inspection for full endpoints and labels.'}</p>

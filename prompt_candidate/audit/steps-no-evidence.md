@@ -1,0 +1,1 @@
+Start from the requirements and treat them as the only standard. Check each one yourself by reading and running the work; ignore what it claims about itself. Flag only real gaps against the requirements, not matters of taste.

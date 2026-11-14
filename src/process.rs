@@ -42,9 +42,9 @@ pub fn local_agent(args: &[String]) -> bool {
 fn job_result(status: i32) -> Result<()> {
     if status == 0 { Err(std::io::Error::last_os_error().into()) } else { Ok(()) }
 }
-struct Job(HANDLE);
+pub(crate) struct Job(HANDLE);
 impl Job {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         unsafe {
             let job = Self(CreateJobObjectW(std::ptr::null(), std::ptr::null()));
             if job.0.is_null() {
@@ -56,10 +56,13 @@ impl Job {
             Ok(job)
         }
     }
-    fn stop(&self) -> Result<()> {
+    pub(crate) fn stop(&self) -> Result<()> {
         job_result(unsafe { TerminateJobObject(self.0, 1) })
     }
-    fn drain(&self) -> Result<()> {
+    pub(crate) fn contain(&self, child: &Child) -> Result<()> {
+        job_result(unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as _) })
+    }
+    pub(crate) fn drain(&self) -> Result<()> {
         let mut terminated = false;
         loop {
             let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
@@ -213,7 +216,7 @@ pub fn worker() -> Result<()> {
 pub(crate) fn schema(stage: &str) -> Value {
     let text = json!({"type":"string"});
     let list = json!({"type":"array","items":{"type":"string"}});
-    let lane = json!({"type":"string","enum":crate::history::LANES});
+    let role = json!({"type":"string","enum":crate::history::ROLES});
     let needs = json!({"type":"array","items":{"type":"string","enum":crate::history::NEEDS}});
     let size = json!({"type":"string","enum":["small","medium"]});
     let languages = json!({"type":"array","items":{"type":"string","enum":crate::history::LANGUAGES}});
@@ -226,7 +229,7 @@ pub(crate) fn schema(stage: &str) -> Value {
     let dependency = object(json!({"target":{"anyOf":[{"type":"string"},{"type":"integer"}]},"reason":{"type":"string","enum":crate::engine::DEPENDENCY_REASONS}}));
     let dependencies = json!({"type":"array","items":dependency});
     let child = object(
-        json!({"title":text,"outcome":text,"acceptance":list,"lane":lane,"needs":needs,"languages":languages,"functions":functions,"size":size,"artifact":artifact,"dependencies":dependencies,"after":{"type":"array","items":{"type":"integer"}}}),
+        json!({"title":text,"outcome":text,"acceptance":list,"role":role,"needs":needs,"languages":languages,"functions":functions,"size":size,"artifact":artifact,"dependencies":dependencies,"after":{"type":"array","items":{"type":"integer"}}}),
     );
     let mut properties = json!({"status":{"type":"string","enum":worker_statuses(stage)},"summary":text,"checks":list,"findings":list});
     if stage != "replan" {
@@ -236,7 +239,7 @@ pub(crate) fn schema(stage: &str) -> Value {
         "review" => {}
         "replan" => {
             properties["plan"] = object(
-                json!({"title":text,"outcome":text,"acceptance":list,"lane":lane,"needs":needs,"languages":languages,"functions":functions,"size":size,"dependencies":{"type":"array","items":object(json!({"target":text,"reason":{"type":"string","enum":crate::engine::DEPENDENCY_REASONS}}))},"children":{"type":"array","items":child}}),
+                json!({"title":text,"outcome":text,"acceptance":list,"role":role,"needs":needs,"languages":languages,"functions":functions,"size":size,"dependencies":{"type":"array","items":object(json!({"target":text,"reason":{"type":"string","enum":crate::engine::DEPENDENCY_REASONS}}))},"children":{"type":"array","items":child}}),
             )
         }
         _ => properties["blocker"] = json!({"type":"string","enum":["none","capability","dependency","definition","environment","external"]}),
@@ -246,15 +249,17 @@ pub(crate) fn schema(stage: &str) -> Value {
 fn limit(request: &Value, key: &str) -> u64 {
     request["limits"][key].as_u64().or_else(|| crate::history::Limits::default().value()[key].as_u64()).unwrap_or_default()
 }
-fn rules(request: &Value) -> Result<String> {
-    let protocol = request["workerProtocol"]["text"].as_str().ok_or("Workspace worker protocol is required")?;
-    crate::require((1..=200).contains(&protocol.split_whitespace().count()), "Workspace worker protocol must contain 1..200 words")?;
-    Ok(format!(
-        "{protocol}\nKeep summary under {} words and at most {} findings of {} words.",
-        limit(request, "summaryWords"),
-        limit(request, "findings"),
-        limit(request, "findingWords")
-    ))
+fn task_view(request: &Value) -> Value {
+    let task = &request["task"];
+    let mut view = json!({"id":task["id"],"title":task["title"],"outcome":task["outcome"],"acceptance":task["acceptance"],"cwd":task["cwd"],
+        "role":task["role"],"needs":task["needs"],"languages":task["languages"],"functions":task["functions"]});
+    for (key, value) in [("artifact", &task["artifact"]), ("writable", &task["writable"]), ("feedback", &request["feedback"]), ("dependencies", &request["dependencies"]),
+        ("scratch", &request["scratch"]), ("implementation", &request["implementation"]), ("recentAttempts", &request["recentAttempts"]), ("capabilities", &request["capabilities"])] {
+        if !(value.is_null() || value.as_array().is_some_and(Vec::is_empty)) {
+            view[key] = value.clone();
+        }
+    }
+    view
 }
 pub fn external() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
@@ -264,7 +269,7 @@ pub fn external() -> Result<()> {
     let stage = request["stage"].as_str().unwrap_or("implementation");
     let schema_path = directory.join("schema.json");
     write(&schema_path, &schema(stage))?;
-    let prompt = format!("{}\n{}\nWhen finished, write one JSON object matching the schema at {} to {}.\n{request}", action(&request, stage), rules(&request)?, schema_path.display(), result.display());
+    let prompt = format!("{}\n\nWhen finished, write one JSON object matching the schema at {} to {}.", prompt(&request, stage)?, schema_path.display(), result.display());
     std::fs::write(directory.join("prompt.md"), prompt)?;
     while read::<Value>(&result).is_err() {
         thread::sleep(Duration::from_secs(1));
@@ -274,7 +279,7 @@ pub fn external() -> Result<()> {
 fn action(request: &Value, stage: &str) -> String {
     if stage == "replan" {
         return format!(
-            "This task is blocked or failed review repeatedly. Inspect task.cwd read-only and recentAttempts, then return a plan that can succeed with the listed capabilities. Prefer splitting into small isolated children: one concern and one lane each, at most {} runnable criteria, title under {} words, under {} words. Order siblings with after indices. Dependencies require target/reason records: uses_artifact, uses_api, uses_schema or uses_data; use after, or nothing otherwise. Child dependency targets may be sibling indices or existing task IDs. Preserve existing dependencies on rewrites. With no children, the plan replaces the task definition. Never put task ids, hashes or coordination instructions in text. Return held only when a decision only the user can make is required; name it in one finding.",
+            "This task is blocked or failed review repeatedly. Inspect task.cwd read-only and recentAttempts, then return a plan that can succeed with the listed capabilities. Prefer splitting into small isolated children: one concern and one role each, at most {} runnable criteria, title under {} words, under {} words. Order siblings with after indices. Dependencies require target/reason records: uses_artifact, uses_api, uses_schema or uses_data; use after, or nothing otherwise. Child dependency targets may be sibling indices or existing task IDs. Preserve existing dependencies on rewrites. With no children, the plan replaces the task definition. Never put task ids, hashes or coordination instructions in text. Return held only when a decision only the user can make is required; name it in one finding.",
             limit(request, "criteria"),
             limit(request, "titleWords"),
             limit(request, "words")
@@ -301,8 +306,9 @@ pub(crate) fn request_agent(request: &Value) -> Result<crate::agents::Agent> {
     Ok(agent)
 }
 pub(crate) fn prompt(request: &Value, stage: &str) -> Result<String> {
-    Ok(format!("{}
-{}", action(request, stage), rules(request)?))
+    let protocol = request["workerProtocol"]["text"].as_str().ok_or("Workspace worker protocol is required")?;
+    crate::require((1..=200).contains(&protocol.split_whitespace().count()), "Workspace worker protocol must contain 1..200 words")?;
+    Ok(format!("{protocol}\n\n{}\n\ntask: {}", action(request, stage), serde_json::to_string_pretty(&task_view(request))?))
 }
 pub fn agent() -> Result<()> {
     let request: Value = read(Path::new(&std::env::var("COORDINATOR_REQUEST")?))?;
@@ -316,7 +322,7 @@ pub fn agent() -> Result<()> {
     let stage = request["stage"].as_str().unwrap_or("implementation");
     let schema_path = directory.join("schema.json");
     write(&schema_path, &schema(stage))?;
-    let prompt = format!("{}\n{}\n{request}", action(&request, stage), rules(&request)?);
+    let prompt = prompt(&request, stage)?;
     let program = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut cli = command(&program);
     let profile = std::env::var_os("USERPROFILE").map(PathBuf::from).filter(|path| path.is_absolute());

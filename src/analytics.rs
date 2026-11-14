@@ -14,11 +14,11 @@ struct Query {
     filters: BTreeMap<String, Value>,
     group_by: Option<String>,
 }
-const GROUPS: [&str; 9] = ["workspace", "lane", "size", "priority", "needs", "artifact", "criteria", "relations", "container"];
+const GROUPS: [&str; 9] = ["workspace", "role", "size", "priority", "needs", "artifact", "criteria", "relations", "container"];
 fn features(state: &State, task: &Task) -> Value {
     let relations = task.dependencies.len() + task.after.len() + task.conflicts.len() + usize::from(task.parent.is_some());
     json!({"workspace":task.workspace.as_ref().map(|w| w.to_string_lossy()).unwrap_or_else(|| task.cwd.clone().into()),
-        "lane":task.attributes.lane,"size":task.attributes.size,"priority":task.attributes.priority(),"needs":task.attributes.needs,"artifact":task.attributes.artifact,
+        "role":task.attributes.role,"size":task.attributes.size,"priority":task.attributes.priority(),"needs":task.attributes.needs,"artifact":task.attributes.artifact,
         "criteria":task.acceptance.len(),"relations":relations,"container":task.container(),"children":state.children(&task.id).count(),"words":task.definition_words()})
 }
 fn outcomes(task: &Task) -> Value {
@@ -33,7 +33,7 @@ fn outcomes(task: &Task) -> Value {
 }
 pub fn report(state: &State, input: Value) -> Result<Value> {
     let query: Query = serde_json::from_value(input)?;
-    crate::require(query.group_by.as_deref().is_none_or(|g| GROUPS.contains(&g)), "groupBy must be workspace, lane, size, priority, needs, artifact, criteria, relations or container")?;
+    crate::require(query.group_by.as_deref().is_none_or(|g| GROUPS.contains(&g)), "groupBy must be workspace, role, size, priority, needs, artifact, criteria, relations or container")?;
     let window = |at: Option<u64>| at.is_none_or(|at| query.from.is_none_or(|from| at >= from) && query.to.is_none_or(|to| at < to));
     let mut rows = Vec::new();
     for task in state.tasks.iter().chain(&state.archived) {

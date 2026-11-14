@@ -156,6 +156,10 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
                 Ok(event)
             }
             ("POST", ["", "api", "wipe"]) => engine.wipe(),
+            ("POST", ["", "api", "sessions"]) => crate::sessions::create(engine, input),
+            ("POST", ["", "api", "sessions", id, "messages"]) => crate::sessions::message(engine, id, input),
+            ("POST", ["", "api", "sessions", id, "deliver"]) => crate::sessions::deliver_now(engine, id),
+            ("POST", ["", "api", "sessions", id, "stop"]) => crate::sessions::stop(engine, id),
             ("POST", ["", "api", "tasks"]) => engine.create(input).map_err(schema_hint),
             ("POST", ["", "api", "workspaces"]) => crate::workspace_prompts::create(engine, input, &crate::workspace_prompts::root()),
             ("POST", ["", "api", "workspaces", "generate"]) => crate::workspace_prompts::generate(engine, input, &crate::workspace_prompts::root()),
@@ -217,6 +221,8 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
         ["", "api", "prompt-candidates"] => crate::workspace_prompts::catalog(&crate::workspace_prompts::root())?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
         ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
+        ["", "api", "sessions"] => crate::sessions::list(engine)?,
+        ["", "api", "sessions", id] => crate::sessions::view(engine, id)?,
         ["", "api", "kill-guard"] => json!({"directory":crate::kill_guard::install(&engine.directory)?,"variable":crate::kill_guard::VARIABLE}),
         ["", "api", "state"] => {
             engine.sync_waiting()?;
@@ -374,7 +380,7 @@ pub fn serve() -> Result<()> {
             }
         }
         if !shutdown && last_tick.elapsed() >= Duration::from_millis(100) {
-            error = engine.tick().err().map(|e| e.to_string()).unwrap_or_default();
+            error = engine.tick().and_then(|()| crate::sessions::tick(&mut engine)).err().map(|e| e.to_string()).unwrap_or_default();
             last_tick = Instant::now();
             if let Some(id) = engine.pending_deploy.take() {
                 match handoff(&mut engine, &id, port) {

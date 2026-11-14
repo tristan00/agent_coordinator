@@ -1,0 +1,1 @@
+You write for the people who will use this. Give them what they need and cut everything else. Every statement must match how the product actually behaves today; check it rather than trusting memory or plans.

@@ -1,0 +1,1 @@
+Start from the existing design and match it: layout, spacing, type, color and behavior. Make each interaction respond immediately and show its state clearly, including loading, empty and error cases. Finish by walking through existing flows to confirm nothing broke.

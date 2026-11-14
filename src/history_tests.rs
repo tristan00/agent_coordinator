@@ -77,7 +77,7 @@ fn attributes_validate_priority_deploy_and_classifications() {
     let defaults = parse(json!({})).unwrap();
     defaults.validate().unwrap();
     assert_eq!(defaults.priority(), 2);
-    assert!(defaults.lane == Lane::Code && defaults.size == Size::Small && defaults.artifact == Artifact::None && !defaults.deploy);
+    assert!(defaults.role == Role::Worker && defaults.size == Size::Small && defaults.artifact == Artifact::None && !defaults.deploy);
     parse(json!({"priority":0})).unwrap().validate().unwrap();
     parse(json!({"priority":3})).unwrap().validate().unwrap();
     assert!(parse(json!({"priority":4})).unwrap().validate().is_err());
@@ -86,7 +86,7 @@ fn attributes_validate_priority_deploy_and_classifications() {
     parse(json!({"deploy":true,"artifact":"candidate"})).unwrap().validate().unwrap();
     assert!(parse(json!({"languages":["cobol"]})).is_err());
     assert!(parse(json!({"functions":["Testing"]})).is_err());
-    assert!(parse(json!({"lane":"marketing"})).is_err());
+    assert!(parse(json!({"role":"marketing"})).is_err());
     assert!(parse(json!({"needs":["quantum"]})).is_err());
     let mut attributes = parse(json!({"languages":["rust","css","rust"],"functions":["testing"]})).unwrap();
     assert_eq!(attributes.languages.iter().map(String::as_str).collect::<Vec<_>>(), ["css", "rust"]);

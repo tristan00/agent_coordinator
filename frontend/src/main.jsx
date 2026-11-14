@@ -1,15 +1,19 @@
 import React, {useState, useEffect, useRef, useCallback, useMemo} from 'react';
 import {createRoot} from 'react-dom/client';
 import Graph from './Graph';
-import {BorderBeam, AnimatedCount} from './Activity';
+import {AnimatedCount} from './Activity';
 import TaskName, {matchesTask} from './TaskName';
+import {ScopeBar, usePreference} from './Controls';
+import {TaskCard, Detail} from './Task';
+import {phase, matches, categoryName} from './fields';
 import './style.css';
+import './redesign.css';
 
 const readPreference = key => { try { return localStorage.getItem(key); } catch { return null; } };
 const savePreference = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
 
 const STATUSES = ['To do', 'In progress', 'Review', 'Done'];
-const LANES = ['code', 'ui', 'data', 'docs', 'audit', 'cleanup'];
+const ROLES = ['worker', 'analytics', 'backend-code', 'ui-code', 'design', 'optimization', 'test', 'docs', 'data', 'audit'];
 const NEEDS = ['network', 'browser', 'process', 'gpu'];
 const SIZES = ['small', 'medium', 'large'];
 const ARTIFACTS = ['none', 'candidate', 'report'];
@@ -31,15 +35,6 @@ async function api(path, method = 'GET', body) {
   return value;
 }
 
-function phase(t, state) {
-  if (t.blocked) return {text: `Needs decision: ${t.failure}`, tone: 'bad'};
-  if (t.stopped || state.paused) return {text: t.active ? 'Stopping' : 'Stopped', tone: 'muted'};
-  if (t.active) return {text: `${t.stage === 'replan' ? 'Replanning' : t.stage === 'review' ? 'Reviewing' : 'Implementing'}`, tone: 'live'};
-  if (t.stage === 'done') return {text: t.container ? 'All child tasks done' : 'Accepted', tone: 'good'};
-  if (t.stage === 'replan') return {text: 'Queued for replanning', tone: 'warn'};
-  return {text: t.waitingReason || (t.failure ? `Retrying: ${t.failure}` : 'Ready'), tone: t.waitingReason ? 'muted' : ''};
-}
-
 function Modal({title, close, children}) {
   const ref = useRef(null);
   useEffect(() => {
@@ -57,12 +52,11 @@ function Modal({title, close, children}) {
 }
 
 const categoryLabels = {languages: 'Languages', functions: 'Functional responsibilities'};
-const categoryName = value => ({cpp: 'C++', csharp: 'C#', javascript: 'JavaScript', typescript: 'TypeScript', powershell: 'PowerShell', api: 'API', ui: 'UI', css: 'CSS', html: 'HTML', sql: 'SQL'}[value] || value.charAt(0).toUpperCase() + value.slice(1));
 const categoryOptions = (state, key) => state?.versions.classifications?.[key]?.items.enum || [];
 const categoryText = (attributes, key) => attributes[key]?.length ? attributes[key].map(categoryName).join(', ') : 'Uncategorized';
 const classificationError = (attributes, state) => Object.keys(categoryLabels).some(key => (attributes[key] || []).some(value => !categoryOptions(state, key).includes(value))) ? 'Remove unsupported classifications before saving.' : '';
 function Classifications({attributes, state, change}) {
-  return <section className="classifications" aria-label="Task classifications"><p className="muted">Select every applicable language and function. Empty selections are uncategorized. Classifications do not change lane or execution capabilities.</p>
+  return <section className="classifications" aria-label="Task classifications"><p className="muted">Select every applicable language and function. Empty selections are uncategorized. Classifications do not change role or execution capabilities.</p>
     {Object.entries(categoryLabels).map(([key, label]) => <fieldset key={key}><legend>{label}</legend>
       {[...new Set([...categoryOptions(state, key), ...(attributes[key] || [])])].map(value => <label className="check" key={value}><input type="checkbox" checked={(attributes[key] || []).includes(value)} onChange={e => change(key, e.target.checked ? [...(attributes[key] || []), value] : attributes[key].filter(v => v !== value))} />{categoryName(value)}{!categoryOptions(state, key).includes(value) && ' (unsupported — remove)'}</label>)}
       {!attributes[key]?.length && <span className="muted">Uncategorized</span>}
@@ -92,7 +86,8 @@ function App() {
   const [page, setPage] = useState(() => readPreference('coordinator.page') || 'Board');
   const [workspace, setWorkspace] = useState(() => readPreference('coordinator.workspace') || '');
   const [query, setQuery] = useState('');
-  const [filters, setFilters] = useState({languages: '', functions: '', lane: '', needs: ''});
+  const [filters, setFilters] = useState([]);
+  const [showStopped, setShowStopped] = usePreference('coordinator.board.stopped', false);
   const [selected, setSelected] = useState(null);
   const [editor, setEditor] = useState(null);
   const [error, setError] = useState('');
@@ -113,33 +108,26 @@ function App() {
   const byId = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
   const workspaces = [...new Map([...Object.keys(state?.config?.workspaces || {}), ...tasks.map(workspaceOf)].filter(Boolean).map(path => [pathKey(path), path.replace(/^\\\\\?\\/, '')])).values()].sort();
   const scoped = tasks.filter(t => !workspace || pathKey(workspaceOf(t)) === pathKey(workspace));
-  const visible = scoped.filter(t => matchesTask(t, query) && Object.entries(filters).every(([key, value]) => !value || (key === 'lane' ? t.attributes.lane === value : value === 'uncategorized' ? !t.attributes[key]?.length : (t.attributes[key] || []).includes(value))));
+  const visible = scoped.filter(t => matchesTask(t, query) && matches(t, filters));
+  const chooseWorkspace = value => {setWorkspace(value); savePreference('coordinator.workspace', value);};
   const go = p => { setPage(p); savePreference('coordinator.page', p); };
-  const card = t => {
-    const p = phase(t, state);
-    return (
-      <article className={`task ${p.tone}`} key={t.id}>
-        {p.tone === 'live' && !offline && <BorderBeam />}
-        <button className="task-title" onClick={() => setSelected(t.id)}><TaskName task={t} /></button>
-        <div className="chips"><span>Lane: {t.attributes.lane}</span><span>Languages: {categoryText(t.attributes, 'languages')}</span><span>Functions: {categoryText(t.attributes, 'functions')}</span><span>P{t.attributes.priority ?? 2}</span>{t.container && <span>container · {t.children.length}</span>}{t.parent && <span>child</span>}</div>
-        <p className={`reason ${p.tone}`}>{p.text}</p>
-      </article>
-    );
+  const card = t => <TaskCard key={t.id} task={t} paused={state.paused} offline={!!offline} open={setSelected} />;
+  const column = status => {
+    const list = visible.filter(t => t.status === status), live = list.filter(t => !t.stopped), stopped = list.filter(t => t.stopped);
+    return <section key={status} className="column"><h2><span>{status}</span><AnimatedCount value={list.length} /></h2>
+      {live.map(card)}{!live.length && !stopped.length && <p className="column-empty">Nothing here</p>}
+      {!!stopped.length && <div className="stopped-group"><button type="button" className="stopped-toggle" aria-expanded={showStopped} onClick={() => setShowStopped(v => !v)}><span>{showStopped ? '▾' : '▸'} Stopped</span><span className="count">{stopped.length}</span></button>{showStopped && stopped.map(card)}</div>}
+    </section>;
   };
-  if (!state) return <main><header className="top"><h1>Coordinator</h1>{themeToggle}</header><p role="status">{offline || 'Connecting…'}</p></main>;
+  if (!state) return <main><header className="topbar"><h1>Coordinator</h1>{themeToggle}</header><p role="status">{offline || 'Connecting…'}</p></main>;
   return (
     <div className="shell">
       <aside>
         <div className="brand">Coordinator</div>
-        <label>Workspace
-          <select aria-label="Workspace" value={workspaces.find(path => pathKey(path) === pathKey(workspace)) || ''} onChange={e => { setWorkspace(e.target.value); savePreference('coordinator.workspace', e.target.value); }}>
-            <option value="">All workspaces</option>{workspaces.map(w => <option key={w}>{w}</option>)}
-          </select>
-        </label>
         <nav>{PAGES.map(p => <button key={p} aria-current={page === p ? 'page' : undefined} onClick={() => go(p)}>{p}</button>)}</nav>
       </aside>
       <main>
-        <header className="top">
+        <header className="topbar">
           <h1>{page}</h1>{themeToggle}
           <span className={`pill ${offline || state.paused ? 'bad' : state.holdUntil > Date.now() ? 'warn' : 'good'}`}>{offline ? 'Disconnected' : state.paused ? 'Board stopped' : state.holdUntil > Date.now() ? `Usage hold until ${when(state.holdUntil)}` : 'Running'}</span>
           <button onClick={() => act(`/api/${state.paused ? 'resume' : 'stop'}`)}>{state.paused ? 'Resume board' : 'Stop board'}</button>
@@ -147,71 +135,24 @@ function App() {
         </header>
         {error && <p className="error" role="alert">{error}</p>}
         {state.error && <p className="error">Scheduler: {state.error}</p>}
-        {['Board', 'List'].includes(page) && <div className="filters"><input type="search" placeholder="Filter by ID or title" value={query} onChange={e => setQuery(e.target.value)} />{Object.entries({...categoryLabels, lane: 'Lane', needs: 'Execution capability'}).map(([key, label]) => <label key={key}>{label}<select aria-label={`Filter ${label.toLowerCase()}`} value={filters[key]} onChange={e => setFilters(f => ({...f, [key]: e.target.value}))}><option value="">All</option>{key !== 'lane' && <option value="uncategorized">{key === 'needs' ? 'No capabilities required' : 'Uncategorized'}</option>}{(key === 'lane' ? LANES : key === 'needs' ? NEEDS : categoryOptions(state, key)).map(v => <option key={v} value={v}>{categoryName(v)}</option>)}</select></label>)}<button onClick={() => {setQuery(''); setFilters({languages: '', functions: '', lane: '', needs: ''});}}>Clear filters</button><span><AnimatedCount value={visible.length} /> tasks</span><small>All selected filters must match.</small></div>}
-        {page === 'Board' && <div className="board page-enter">{STATUSES.map(s => <section key={s} className="column"><h2>{s} <AnimatedCount value={visible.filter(t => t.status === s).length} /></h2>{visible.filter(t => t.status === s).map(card)}</section>)}</div>}
-        {page === 'List' && <table className="list page-enter"><thead><tr><th>Task</th><th>Status</th><th>Lane</th><th>Languages</th><th>Functions</th><th>Execution capabilities</th><th>Blocked by</th><th>State</th></tr></thead><tbody>{visible.map(t => <tr key={t.id}><td><button className="link" onClick={() => setSelected(t.id)}><TaskName task={t} /></button></td><td>{t.status}</td><td>{t.attributes.lane}</td><td>{categoryText(t.attributes, 'languages')}</td><td>{categoryText(t.attributes, 'functions')}</td><td>{t.attributes.needs.join(', ') || 'none'}</td><td>{t.dependencies.map(d => byId[typeof d === 'string' ? d : d.target]?.title).filter(Boolean).join(', ')}</td><td className={`reason ${phase(t, state).tone}`}>{phase(t, state).text}</td></tr>)}</tbody></table>}
-        {page === 'Graph' && <Graph key={workspace} activityEnabled={!offline && !state.paused} workspace={workspace} tasks={scoped} allTasks={tasks} select={setSelected} />}
+        {page !== 'Settings' && <ScopeBar workspaces={workspaces} workspace={workspaces.find(path => pathKey(path) === pathKey(workspace)) || ''} setWorkspace={chooseWorkspace} query={query} setQuery={setQuery} filters={filters} setFilters={setFilters} tasks={scoped} count={visible.length} total={scoped.length} showFilters={page !== 'Analytics'} />}
+        {page === 'Board' && <div className="board page-enter">{STATUSES.map(column)}</div>}
+        {page === 'List' && <table className="list page-enter"><thead><tr><th>Task</th><th>Status</th><th>Role</th><th>Languages</th><th>Functions</th><th>Execution capabilities</th><th>Blocked by</th><th>State</th></tr></thead><tbody>{visible.map(t => <tr key={t.id}><td><button className="link" onClick={() => setSelected(t.id)}><TaskName task={t} /></button></td><td>{t.status}</td><td>{t.attributes.role}</td><td>{categoryText(t.attributes, 'languages')}</td><td>{categoryText(t.attributes, 'functions')}</td><td>{t.attributes.needs.join(', ') || 'none'}</td><td>{t.dependencies.map(d => byId[typeof d === 'string' ? d : d.target]?.title).filter(Boolean).join(', ')}</td><td className={`reason ${phase(t, state.paused).tone}`}>{phase(t, state.paused).text}</td></tr>)}</tbody></table>}
+        {page === 'Graph' && <Graph key={workspace} activityEnabled={!offline && !state.paused} workspace={workspace} tasks={visible} allTasks={tasks} select={setSelected} />}
         {page === 'Analytics' && <Analytics workspace={workspace} select={setSelected} />}
         {page === 'Settings' && <Settings state={state} act={act} />}
       </main>
-      {selected && byId[selected] && <Detail task={byId[selected]} byId={byId} state={state} close={() => setSelected(null)} select={setSelected} act={act} edit={t => { setSelected(null); setEditor({task: t}); }} />}
+      {selected && byId[selected] && <Detail task={byId[selected]} byId={byId} paused={state.paused} wordLimit={limitsFor(state, workspaceOf(byId[selected])).words} reasons={dependencyReasons(state)} close={() => setSelected(null)} select={setSelected} act={act} edit={t => { setSelected(null); setEditor({task: t}); }} />}
       {editor && !editor.grouped && <Editor {...editor} tasks={tasks} state={state} workspace={workspace} close={() => { setEditor(null); refresh(); }} />}
       {editor?.grouped && <GroupEditor tasks={tasks} state={state} workspace={workspace} close={() => { setEditor(null); refresh(); }} />}
     </div>
   );
 }
 
-function Detail({task: t, byId, state, close, select, act, edit}) {
-  const reasons = dependencyReasons(state);
-  const typed = d => ({target: dependencyTarget(d), reason: d.reason});
-  const link = relation => {
-    const id = dependencyTarget(relation);
-    const suffix = typeof relation === 'object' ? ` · ${reasons.includes(relation.reason) ? relation.reason.replaceAll('_', ' ') : `Unresolved reason${relation.reason ? `: ${relation.reason}` : ''}`}` : '';
-    return byId[id] ? <button key={id} className="link" onClick={() => select(id)}><TaskName task={byId[id]} />{suffix}</button> : <span key={id}>Unavailable task: {id}{suffix}</span>;
-  };
-  const all = Object.values(byId);
-  const blocks = all.flatMap(task => task.dependencies.filter(d => dependencyTarget(d) === t.id).map(d => ({target: task.id, reason: d.reason})));
-  const children = [...new Set([...t.children, ...all.filter(task => task.parent === t.id).map(task => task.id)])];
-  const relations = [['Dependencies', t.dependencies.map(typed)], ['Required by', blocks], ['Runs after (ordering only)', t.after], ['Parent', t.parent ? [t.parent] : []], ['Children', children], ['Conflicts with', t.conflicts], ['Related', t.related]].filter(([, ids]) => ids.length);
-  const control = t.stopped || t.blocked ? 'resume' : 'stop';
-  return (
-    <Modal title={<TaskName task={t} />} close={close}>
-      <div className="actions">
-        <span className="pill">{t.status}</span><span>Stage {t.stage} · revision {t.revision}</span>
-        {t.stage !== 'done' && <button onClick={() => act(`/api/tasks/${t.id}/${control}`)}>{control === 'resume' ? 'Resume' : 'Stop'}</button>}
-        <button disabled={!!t.active} onClick={() => edit(t)}>Edit</button>
-        {t.stage !== 'done' && !t.container && <button disabled={!!t.active} onClick={() => act(`/api/tasks/${t.id}/replan`, 'POST')}>Replan</button>}
-        <button disabled={!!t.active} onClick={async () => { if (confirm('Archive this task?') && await act(`/api/tasks/${t.id}`, 'DELETE')) close(); }}>Archive</button>
-      </div>
-      <p className={`reason ${phase(t, state).tone}`}>{phase(t, state).text}</p>
-      <p>{t.outcome}</p>
-      {!!t.acceptance.length && <><h3>Acceptance</h3><ol>{t.acceptance.map((c, i) => <li key={i}>{c}</li>)}</ol></>}
-      <dl className="facts">
-        <dt>Grouping</dt><dd>{t.parent ? 'Child of parent container' : t.standalone ? 'Standalone' : 'Unresolved — choose Parent container or Standalone in Edit'}</dd><dt>Lane</dt><dd>{t.attributes.lane}</dd><dt>Languages</dt><dd>{categoryText(t.attributes, 'languages')}</dd><dt>Functional responsibilities</dt><dd>{categoryText(t.attributes, 'functions')}</dd><dt>Execution capabilities</dt><dd>{t.attributes.needs.join(', ') || 'none'}</dd>
-        <dt>Priority</dt><dd>{t.attributes.priority ?? 2}</dd><dt>Size</dt><dd>{t.attributes.size}</dd>
-        <dt>Artifact</dt><dd>{t.attributes.artifact}{t.attributes.deploy ? ' · deploys on acceptance' : ''}</dd>
-        <dt>Words</dt><dd>{t.definitionWords} / {limitsFor(state, workspaceOf(t)).words}</dd>
-        {relations.map(([label, ids]) => <React.Fragment key={label}><dt>{label}</dt><dd className="links">{ids.map(link)}</dd></React.Fragment>)}
-        <dt>Workspace</dt><dd className="path">{workspaceOf(t)}</dd>
-      </dl>
-      {!!t.feedback.length && <><h3>Feedback for next attempt</h3><ul>{t.feedback.map((f, i) => <li key={i}>{f}</li>)}</ul></>}
-      <h3>Attempts</h3>
-      <ol className="attempts">{[...t.attempts].reverse().map(a => (
-        <li key={a.id}>
-          <strong>{a.stage}</strong> · {a.result?.status || a.error || (a.ended ? 'ended' : 'running')} · {when(a.started)} · <a href={`/api/attempts/${a.id}/log`} target="_blank" rel="noreferrer">log</a>
-          {a.result && <p>{a.result.summary}</p>}
-          {a.result?.criteria && <p className="muted">Criteria: {a.result.criteria.join(', ')}</p>}
-          {!!a.result?.findings?.length && <ul>{a.result.findings.map((f, i) => <li key={i}>{f}</li>)}</ul>}
-        </li>
-      ))}</ol>
-    </Modal>
-  );
-}
-
 function Editor({task, tasks, state, workspace, close}) {
   const [form, setForm] = useState(() => ({
     title: task?.title || '', outcome: task?.outcome || '', acceptance: Array.from({length: Math.max(limitsFor(state, task ? workspaceOf(task) : workspace).criteria, task?.acceptance.length || 0)}, (_, i) => task?.acceptance[i] || ''),
-    cwd: task?.cwd || workspace || '', lane: task?.attributes.lane || 'code', needs: task?.attributes.needs || [], priority: String(task?.attributes.priority ?? 2),
+    cwd: task?.cwd || workspace || '', role: task?.attributes.role || 'worker', needs: task?.attributes.needs || [], priority: String(task?.attributes.priority ?? 2),
     languages: task?.attributes.languages || [], functions: task?.attributes.functions || [],
     size: task?.attributes.size || 'small', artifact: task?.attributes.artifact || 'none', deploy: !!task?.attributes.deploy,
     dependencies: task?.dependencies || [], after: task?.after || [], conflicts: task?.conflicts || [], related: task?.related || [], parent: task?.parent || '',
@@ -241,7 +182,7 @@ function Editor({task, tasks, state, workspace, close}) {
     const body = {title: form.title, outcome: form.outcome, acceptance, cwd: form.cwd,
       dependencies: form.dependencies, after: form.after, conflicts: form.conflicts, related: form.related,
       writable: form.writable.split('\n').map(w => w.trim()).filter(Boolean), model: form.model || null, effort: form.effort || null,
-      attributes: {languages: form.languages, functions: form.functions, lane: form.lane, needs: form.needs, priority: Number(form.priority), size: form.size, artifact: form.artifact, deploy: form.deploy}};
+      attributes: {languages: form.languages, functions: form.functions, role: form.role, needs: form.needs, priority: Number(form.priority), size: form.size, artifact: form.artifact, deploy: form.deploy}};
     if (!task || groupingChanged) Object.assign(body, grouping === 'parent' ? {parent: form.parent, standalone: false} : {parent: null, standalone: true});
     setBusy(true);
     try { await api(task ? `/api/tasks/${task.id}` : '/api/tasks', task ? 'PATCH' : 'POST', body); close(); } catch (err) { setError(err.message); } finally { setBusy(false); }
@@ -255,7 +196,7 @@ function Editor({task, tasks, state, workspace, close}) {
         {rows.map((c, i) => <label key={i}>Criterion {i + 1}<input value={c} onChange={e => set('acceptance', rows.map((x, j) => (j === i ? e.target.value : x)))} /></label>)}
         <label>Working directory<input required value={form.cwd} onChange={e => set('cwd', e.target.value)} /></label>
         <div className="row">
-          <label>Lane<select value={form.lane} onChange={e => set('lane', e.target.value)}>{LANES.map(v => <option key={v}>{v}</option>)}</select></label>
+          <label>Role<select value={form.role} onChange={e => set('role', e.target.value)}>{ROLES.map(v => <option key={v}>{v}</option>)}</select></label>
           <label>Priority<select value={form.priority} onChange={e => set('priority', e.target.value)}>{[0, 1, 2, 3].map(v => <option key={v}>{v}</option>)}</select></label>
           <label>Size<select value={form.size} onChange={e => set('size', e.target.value)}>{SIZES.map(v => <option key={v}>{v}</option>)}</select></label>
           <label>Artifact<select value={form.artifact} onChange={e => set('artifact', e.target.value)}>{ARTIFACTS.map(v => <option key={v}>{v}</option>)}</select></label>
@@ -298,7 +239,7 @@ function Dependencies({value, change, options, reasons, invalid}) {
 }
 
 function GroupEditor({tasks, state, workspace, close}) {
-  const newChild = () => ({localKey: crypto.randomUUID(), title: '', outcome: '', acceptance: Array.from({length: limitsFor(state, workspace).criteria}, () => ''), dependencies: [], after: [], attributes: {lane: 'code', needs: [], languages: [], functions: []}});
+  const newChild = () => ({localKey: crypto.randomUUID(), title: '', outcome: '', acceptance: Array.from({length: limitsFor(state, workspace).criteria}, () => ''), dependencies: [], after: [], attributes: {role: 'worker', needs: [], languages: [], functions: []}});
   const [container, setContainer] = useState({title: '', outcome: '', cwd: workspace || '', acceptance: [], attributes: {languages: [], functions: []}});
   const [children, setChildren] = useState(() => [newChild()]);
   const [grouping, setGrouping] = useState('');
@@ -338,7 +279,7 @@ function GroupEditor({tasks, state, workspace, close}) {
         <label>Child title<input required value={c.title} onChange={e => update(c.localKey, {title: e.target.value})} /></label>
         <label>Child outcome<textarea required value={c.outcome} onChange={e => update(c.localKey, {outcome: e.target.value})} /></label>
         {c.acceptance.map((v, j) => <label key={j}>Criterion {j + 1}<input value={v} onChange={e => update(c.localKey, {acceptance: c.acceptance.map((a, k) => k === j ? e.target.value : a)})} /></label>)}
-        <label>Lane<select value={c.attributes.lane} onChange={e => update(c.localKey, {attributes: {...c.attributes, lane: e.target.value}})}>{LANES.map(v => <option key={v}>{v}</option>)}</select></label>
+        <label>Role<select value={c.attributes.role} onChange={e => update(c.localKey, {attributes: {...c.attributes, role: e.target.value}})}>{ROLES.map(v => <option key={v}>{v}</option>)}</select></label>
         <Classifications attributes={c.attributes} state={state} change={(key, value) => update(c.localKey, {attributes: {...c.attributes, [key]: value}})} />
         <Dependencies value={c.dependencies} change={dependencies => update(c.localKey, {dependencies})} options={options} reasons={dependencyReasons(state)} invalid={setError} />
         <label>Runs after (ordering only)<select multiple value={c.after} onChange={e => update(c.localKey, {after: [...e.target.selectedOptions].map(o => o.value)})}>{options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}</select></label>
@@ -352,7 +293,7 @@ function GroupEditor({tasks, state, workspace, close}) {
 }
 
 function Analytics({workspace, select}) {
-  const [group, setGroup] = useState('lane');
+  const [group, setGroup] = useState('role');
   const [report, setReport] = useState(null);
   const [error, setError] = useState('');
   useEffect(() => {
@@ -361,7 +302,7 @@ function Analytics({workspace, select}) {
   const n = v => (v?.mean == null ? '—' : v.mean.toFixed(2));
   return (
     <>
-      <div className="filters"><label>Group by <select value={group} onChange={e => setGroup(e.target.value)}>{['lane', 'size', 'priority', 'needs', 'artifact', 'criteria', 'relations', 'container', 'workspace'].map(g => <option key={g}>{g}</option>)}</select></label></div>
+      <div className="filters"><label>Group by <select value={group} onChange={e => setGroup(e.target.value)}>{['role', 'size', 'priority', 'needs', 'artifact', 'criteria', 'relations', 'container', 'workspace'].map(g => <option key={g}>{g}</option>)}</select></label></div>
       {error && <p className="error">{error}</p>}
       {report && <table className="list page-enter"><thead><tr><th>{group}</th><th>Tasks</th><th>First pass</th><th>Attempts</th><th>Rejections</th><th>Replans</th><th>Lead (h)</th></tr></thead><tbody>
         {Object.entries(report.groups).map(([k, g]) => <tr key={k}><td>{k}</td><td>{g.tasks}</td><td>{n(g.firstPass)}</td><td>{n(g.attempts)}</td><td>{n(g.rejections)}</td><td>{n(g.replans)}</td><td>{g.leadMs.mean == null ? '—' : (g.leadMs.mean / 3600000).toFixed(1)}</td></tr>)}

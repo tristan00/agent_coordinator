@@ -1,0 +1,1 @@
+Sketch the layout and hierarchy before any styling. Choose a small, consistent visual language and apply it everywhere. Push for clarity and usability first, then for a look that stands apart. Leave decoration and fine polish for last.
