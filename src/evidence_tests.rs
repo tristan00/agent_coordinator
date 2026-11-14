@@ -105,6 +105,26 @@ fn capture_trace_keeps_only_completed_tool_results() {
 }
 
 #[test]
+fn capture_agent_activity_appends_workspace_scoped_csv_rows() {
+    let temp = Temp::new();
+    let workspace = temp.dir("workspace");
+    let attempt = temp.dir("attempt");
+    fs::write(
+        attempt.join("events.jsonl"),
+        r#"{"type":"item.completed","timestamp":"2026-11-13T23:00:00Z","item":{"type":"command_execution","command":"python run.py","exit_code":0,"aggregated_output":"ok"}}"#,
+    ).unwrap();
+    let request = json!({
+        "run_id":"run-1",
+        "task":{"id":"task-1","title":"Build game","workspace":workspace,"cwd":workspace},
+        "agent":{"model":"test-agent"}
+    });
+    capture_agent_activity(&attempt, &request).unwrap();
+    let csv = fs::read_to_string(workspace.join("agent_activity.csv")).unwrap();
+    assert!(csv.starts_with("timestamp,task,task_id,run_id,agent,kind,operation,status,target,details\n"));
+    assert!(csv.contains("2026-11-13T23:00:00Z,Build game,task-1,run-1,test-agent,command,python run.py,0"));
+}
+
+#[test]
 fn clean_scratch_removes_only_declared_scratch() {
     let temp = Temp::new();
     for (configuration, removed) in [(Some(json!({"scratch":true})), true), (Some(json!({"scratch":false})), false), (None, false)] {

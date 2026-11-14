@@ -352,6 +352,10 @@ pub fn agent() -> Result<()> {
     let tokens = reader.join().map_err(|_| "Codex output reader interrupted")??;
     input?;
     crate::evidence::capture_trace(directory)?;
+    let request: Value = read(&directory.join("request.json"))?;
+    if let Err(error) = crate::evidence::capture_agent_activity(directory, &request) {
+        eprintln!("Could not record agent activity: {error}");
+    }
     let components = crate::telemetry::resource_usage(&directory.join("events.jsonl"));
     if tokens.is_some() || components.is_some() {
         write(&directory.join("usage.json"), &Usage { total_tokens: tokens.or_else(|| components.as_ref().and_then(crate::telemetry::total)), components, source: "codex_token_footer".into() })?;

@@ -6,5 +6,5 @@ Make it hard to break.
 - Unknown request types get a normal response that lists what is supported.
 - Very large or long requests finish in bounded time or report a limit.
 - Keep any output channel the request reserves for a protocol free of logs.
-- When there are two ways to do something, pick the one that stays inside your own work.
+- If you didn't start it, don't stop it.
 - Reviewers: send malformed, unknown and oversized requests before accepting.

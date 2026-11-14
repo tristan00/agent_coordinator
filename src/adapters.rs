@@ -89,6 +89,9 @@ pub fn claude(request: &Value, agent: &Agent) -> Result<()> {
     };
     write(&directory.join("launch-settings.json"), &observed)?;
     crate::evidence::capture_trace(&directory)?;
+    if let Err(error) = crate::evidence::capture_agent_activity(&directory, request) {
+        eprintln!("Could not record agent activity: {error}");
+    }
     require(status.success(), "Claude worker failed; inspect attempt log")?;
     write(&result, &output)
 }

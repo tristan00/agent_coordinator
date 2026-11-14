@@ -1217,7 +1217,7 @@ impl Engine {
         let documents = task.workspace.as_deref().ok_or("Workspace directory is required")?;
         let protocol = crate::workspace_prompts::worker(documents, &settings)?;
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
-            "cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
+            "workspace":task.workspace,"cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"lane":task.attributes.lane,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
             "languages":task.attributes.languages,"functions":task.attributes.functions,
             "writable":task.writable,"dependencies":task.dependencies,"after":task.after},
             "worker":worker,"agent":agent,"family":self.state.family,"workerProtocol":protocol,"feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
@@ -1259,6 +1259,7 @@ impl Engine {
             Attempt { id: id(), revision: task.revision, stage: stage.clone(), started: now(), ended: None, result: None, error: None, evidence: AttemptEvidence { configuration: Some(settings), ..Default::default() } };
         let mut request = self.request(task, &attempt.id)?;
         request["command"] = json!(command);
+        request["run_id"] = json!(attempt.id);
         write(&self.attempt_path(&attempt.id).join("request.json"), &request)?;
         let attempt_id = attempt.id.clone();
         self.change(|state| {

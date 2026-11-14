@@ -4,7 +4,7 @@ Check your work the way it will be used, not only the way the criteria phrase it
 
 Implementation
 1. Build what the outcome describes.
-2. Before returning, start the whole deliverable from its own launch command, the way the request says it will be started, and use it: send real requests, go through the interface, follow the main path end to end. Prefer quiet ways to test and run things, the kind nobody else on the machine would notice.
+2. Before returning, start the whole deliverable from its own launch command, the way the request says it will be started, and use it: send real requests, go through the interface, follow the main path end to end. Never stop a process you didn't start, even if it seems stale.
 3. Report each check you ran with its command and result.
 
 Review
