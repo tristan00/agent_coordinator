@@ -130,7 +130,13 @@ pub fn supervise(directory: &Path) -> Result<()> {
         }
         let log = OpenOptions::new().create(true).append(true).open(directory.join("log.txt"))?;
         write(&directory.join("launch-intent.json"), &json!({"at":now()}))?;
-        let mut child = command(std::env::current_exe()?.to_str().ok_or("Invalid executable path")?)
+        let guard = directory.parent().and_then(Path::parent).ok_or_else(|| "Missing data directory".into()).and_then(crate::kill_guard::install).and_then(|dir| crate::kill_guard::environment(&dir));
+        let mut child = command(std::env::current_exe()?.to_str().ok_or("Invalid executable path")?);
+        match guard {
+            Ok(vars) => drop(child.envs(vars)),
+            Err(error) => writeln!(&log, "Kill guard unavailable: {error}")?,
+        }
+        let mut child = child
             .arg("--worker")
             .current_dir(request["task"]["cwd"].as_str().ok_or("Missing cwd")?)
             .env("COORDINATOR_REQUEST", directory.join("request.json"))

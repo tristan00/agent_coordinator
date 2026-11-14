@@ -4,6 +4,7 @@ mod analytics;
 mod engine;
 mod evidence;
 mod history;
+mod kill_guard;
 mod metrics;
 mod process;
 mod redeploy;
@@ -44,6 +45,9 @@ fn lock(file: &Path) -> Result<File> {
     Ok(handle)
 }
 fn main() -> Result<()> {
+    if let Some(tool) = kill_guard::tool() {
+        kill_guard::run(tool);
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--identity") => {

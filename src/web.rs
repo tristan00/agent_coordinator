@@ -217,6 +217,7 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
         ["", "api", "prompt-candidates"] => crate::workspace_prompts::catalog(&crate::workspace_prompts::root())?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
         ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
+        ["", "api", "kill-guard"] => json!({"directory":crate::kill_guard::install(&engine.directory)?,"variable":crate::kill_guard::VARIABLE}),
         ["", "api", "state"] => {
             engine.sync_waiting()?;
             let tasks = engine.state.tasks.iter().map(|task| engine.task_value(task, false)).collect::<Result<Vec<_>>>()?;
