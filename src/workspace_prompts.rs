@@ -25,7 +25,6 @@ pub fn role_kinds() -> Vec<&'static str> {
 pub struct Document {
     pub candidate: String,
     pub sha256: String,
-    /// The prompt is the current default in the prompts folder, not a file under prompt_candidate.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
 }
@@ -40,7 +39,6 @@ pub struct Selection {
 pub fn root() -> PathBuf {
     Path::new(option_env!("COORDINATOR_SOURCE_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"))).join("prompt_candidate")
 }
-/// The current defaults: planner.txt, worker.txt and <role>.txt prompts plus settings.json, beside the candidate folder.
 pub fn defaults_root(root: &Path) -> PathBuf {
     root.with_file_name("prompts")
 }
@@ -61,7 +59,6 @@ fn default_settings(root: &Path) -> Result<Value> {
     let path = defaults_root(root).join("settings.json");
     serde_json::from_str(&fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?).map_err(|error| format!("{}: {error}", path.display()).into())
 }
-/// What a workspace created without explicit choices gets.
 pub fn defaults(root: &Path) -> Result<Value> {
     let mut prompts = serde_json::Map::new();
     for kind in kinds() {
@@ -145,7 +142,6 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     require(!parent.starts_with(project), "Workspace data must be outside the coordinator source directory")?;
     let target = parent.join(path.file_name().ok_or("Workspace name required")?);
     require(!engine.state.config.workspaces.contains_key(&target), "Workspace already configured")?;
-    // Anything the request leaves out comes from the current defaults in the prompts folder.
     let settings_input = if input["settings"].is_null() { default_settings(root)? } else { input["settings"].clone() };
     let mut settings: WorkspaceSettings = serde_json::from_value(settings_input)?;
     settings.validate(engine.state.family)?;
