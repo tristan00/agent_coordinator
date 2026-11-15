@@ -141,10 +141,11 @@ pub fn supervise(directory: &Path) -> Result<()> {
         }
         let mut child = child
             .arg("--worker")
-            .current_dir(request["task"]["cwd"].as_str().ok_or("Missing cwd")?)
+            .current_dir(crate::adapters::working_directory(&request)?)
             .env("COORDINATOR_REQUEST", directory.join("request.json"))
             .env("COORDINATOR_RESULT", directory.join("result.json"))
             .env("COORDINATOR_SCRATCH", directory.join("scratch"))
+            .envs(crate::adapters::temp_environment(&crate::adapters::working_directory(&request)?, &format!("attempt-{}", directory.file_name().unwrap_or_default().to_string_lossy()))?)
             .stdin(Stdio::piped())
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -331,10 +332,8 @@ pub fn agent() -> Result<()> {
     let model = agent.model.as_str();
     let effort = agent.effort();
     cli.args(["--model", model, "-c", &format!("model_reasoning_effort=\"{effort}\"")]);
-    let read_only = request["readOnly"] == true;
-    if let Some(scratch) = request["scratch"].as_str() && read_only {
-        cli.current_dir(scratch).args(["--cd", scratch]);
-    }
+    let root = crate::adapters::working_directory(&request)?;
+    cli.current_dir(&root).arg("--cd").arg(&root);
     let events = std::fs::File::create(directory.join("events.jsonl"))?;
     let mut child = cli
         .args(["--skip-git-repo-check", "--ephemeral", "--json", "--color", "never", "--dangerously-bypass-approvals-and-sandbox", "--disable", "memories"])

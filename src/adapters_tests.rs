@@ -92,3 +92,29 @@ fn worker_input_is_role_prompt_stage_and_task() {
         assert!(task.get(hidden).is_none(), "{hidden}");
     }
 }
+
+#[test]
+fn every_stage_launches_in_the_workspace_root() {
+    let temp = crate::test_support::Temp::new();
+    let root = temp.dir("workspace");
+    let case = root.join("case");
+    for stage in ["implementation", "review", "replan"] {
+        let request = json!({"stage":stage,"readOnly":stage != "implementation","scratch":temp.path().join("scratch"),"task":{"workspace":root,"cwd":case}});
+        assert_eq!(working_directory(&request).unwrap(), root, "{stage}");
+    }
+    let legacy = json!({"task":{"cwd":case}});
+    assert_eq!(working_directory(&legacy).unwrap(), case);
+}
+
+#[test]
+fn every_agent_gets_a_private_temp_folder_inside_the_workspace() {
+    let temp = crate::test_support::Temp::new();
+    let root = temp.dir("workspace");
+    let first = temp_environment(&root, "attempt-a").unwrap();
+    let second = temp_environment(&root, "attempt-b").unwrap();
+    assert_eq!(first.clone().map(|(name, _)| name), ["TEMP", "TMP", "TMPDIR"]);
+    assert!(first.iter().all(|(_, path)| path == &first[0].1 && path.is_dir() && !path.to_string_lossy().starts_with(r"\\?\")));
+    assert!(first[0].1.ends_with(std::path::Path::new("tmp").join("attempt-a")));
+    assert_ne!(first[0].1, second[0].1);
+    assert!(PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\")).join("tmp").join("attempt-a") == first[0].1);
+}

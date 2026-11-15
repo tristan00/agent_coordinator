@@ -26,23 +26,33 @@ pub fn refusal(tool: &str, args: &[String]) -> Option<String> {
     })
 }
 
+const ACTIVE: &str = "COORDINATOR_KILL_GUARD_ACTIVE";
+
+pub fn guarded(dir: &Path) -> bool {
+    dir.parent().and_then(Path::file_name).is_some_and(|name| name.eq_ignore_ascii_case("kill-guard"))
+}
+
+pub fn real(tool: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    env::split_paths(path).filter(|dir| !guarded(dir)).find_map(|dir| {
+        [dir.join(tool), dir.join(format!("{tool}{}", env::consts::EXE_SUFFIX))].into_iter().find(|file| file.is_file())
+    })
+}
+
 pub fn run(tool: &str) -> ! {
     let args: Vec<String> = env::args().skip(1).collect();
     if let Some(reason) = refusal(tool, &args) {
         eprintln!("{reason}");
         std::process::exit(1);
     }
-    let guard = env::var_os(VARIABLE).map(PathBuf::from);
-    let real = env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path).filter(|dir| Some(dir) != guard.as_ref()).find_map(|dir| {
-            [dir.join(tool), dir.join(format!("{tool}{}", env::consts::EXE_SUFFIX))].into_iter().find(|file| file.is_file())
-        })
-    });
-    let Some(real) = real else {
+    if env::var_os(ACTIVE).is_some() {
+        eprintln!("{tool}: kill guard invoked itself; refusing to recurse");
+        std::process::exit(126);
+    }
+    let Some(real) = env::var_os("PATH").and_then(|path| real(tool, &path)) else {
         eprintln!("{tool}: command not found");
         std::process::exit(127);
     };
-    match Command::new(real).args(&args).status() {
+    match Command::new(real).args(&args).env(ACTIVE, "1").status() {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(error) => {
             eprintln!("{tool}: {error}");
@@ -74,7 +84,7 @@ pub fn install(data: &Path) -> Result<PathBuf> {
 }
 
 pub fn environment(dir: &Path) -> Result<[(&'static str, OsString); 2]> {
-    let path = env::join_paths(std::iter::once(dir.to_path_buf()).chain(env::var_os("PATH").iter().flat_map(env::split_paths)))?;
+    let path = env::join_paths(std::iter::once(dir.to_path_buf()).chain(env::var_os("PATH").iter().flat_map(env::split_paths).filter(|entry| !guarded(entry))))?;
     Ok([("PATH", path), (VARIABLE, dir.as_os_str().to_owned())])
 }
 

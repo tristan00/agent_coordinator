@@ -14,12 +14,14 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-const SKIPPED: [&str; 8] = [".git", "target", "node_modules", ".venv", "venv", "__pycache__", ".harness", ".env"];
+pub const SKIPPED: [&str; 8] = [".git", "target", "node_modules", ".venv", "venv", "__pycache__", ".harness", ".env"];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
     pub output: PathBuf,
     pub deliverable: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,7 +105,7 @@ pub fn create(engine: &mut Engine, input: Value) -> Result<Value> {
     require(!engine.state.sessions.values().any(|s| s.workspace == directory && s.status == "running"), "A session is already running in this workspace")?;
     fs::create_dir_all(&output)?;
     let id = id();
-    let session = Session { id: id.clone(), workspace: directory.clone(), output, deliverable: deliverable.to_string_lossy().replace('\\', "/"), callback, status: "running".into(), requests: Vec::new(), deliveries: 0, conversation: None, outbox: Vec::new(), retry_at: 0, created: now() };
+    let session = Session { id: id.clone(), workspace: directory.clone(), root: Some(source.clone()), output, deliverable: deliverable.to_string_lossy().replace('\\', "/"), callback, status: "running".into(), requests: Vec::new(), deliveries: 0, conversation: None, outbox: Vec::new(), retry_at: 0, created: now() };
     engine.change(|state| {
         state.sessions.insert(id.clone(), session);
         Ok(Value::Null)
@@ -123,13 +125,15 @@ fn prompt(session: &Session, text: &str, first: bool, instructions: &str) -> Str
     if !first {
         return format!("New request from the same user. The workspace, deliverable folder and delivery rules are unchanged.\n\n{text}");
     }
-    let w = session.workspace.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
+    let clean = |path: &Path| path.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
+    let w = clean(&session.workspace);
+    let root = clean(session.root.as_deref().unwrap_or(&session.workspace));
+    let deliverable = clean(&session.workspace.join(&session.deliverable));
     format!(
-        "You are the planner of the agent coordinator for the workspace {w}.\n\
-         Plan the request as coordinator tasks; workers implement and review them. The coordinator is at $COORDINATOR_URL and your workspace is $COORDINATOR_WORKSPACE (W). GET $COORDINATOR_URL/api/task-schema?workspace=W lists the task fields and limits, GET $COORDINATOR_URL/api/tasks?workspace=W lists your tasks, and POST $COORDINATOR_URL/api/tasks creates one.\n\
-         The deliverable is the folder {} inside the workspace. Whenever it holds a complete version, POST an empty JSON object to $COORDINATOR_URL/api/sessions/$COORDINATOR_SESSION/deliver; each delivery replaces the previous one. When you end your turn the request finishes once no task can still run, and a final delivery is made then.\n\
-         No one is available to answer questions during the work; make decisions yourself.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}",
-        session.deliverable
+        "You are the planner of the agent coordinator for the request folder {w}, inside the workspace {root}, which is your working directory.\n\
+         Plan the request as coordinator tasks; workers implement and review them. The coordinator is at $COORDINATOR_URL and the request folder is $COORDINATOR_WORKSPACE (W). GET $COORDINATOR_URL/api/task-schema?workspace=W lists the task fields and limits, GET $COORDINATOR_URL/api/tasks?workspace=W lists your tasks, and POST $COORDINATOR_URL/api/tasks creates one.\n\
+         The deliverable is the folder {deliverable}. Whenever it holds a complete version, POST an empty JSON object to $COORDINATOR_URL/api/sessions/$COORDINATOR_SESSION/deliver; each delivery replaces the previous one. When you end your turn the request finishes once no task can still run, and a final delivery is made then.\n\
+         No one is available to answer questions during the work; make decisions yourself.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}"
     )
 }
 
@@ -141,7 +145,7 @@ fn start(engine: &mut Engine, id: &str, text: String) -> Result<()> {
     let run = engine.directory.join("sessions").join(id).join((session.requests.len() + 1).to_string());
     fs::create_dir_all(&run)?;
     let port: u16 = read(&engine.directory.join("port.json")).unwrap_or(4242);
-    write(&run.join("request.json"), &json!({"session":id,"workspace":session.workspace,"prompt":prompt(&session, &text, session.requests.is_empty(), &instructions),"agent":agent,
+    write(&run.join("request.json"), &json!({"session":id,"workspace":session.workspace,"root":session.root.as_ref().unwrap_or(&session.workspace),"prompt":prompt(&session, &text, session.requests.is_empty(), &instructions),"agent":agent,
         "conversation":session.conversation,"command":engine.state.config.planner,"url":format!("http://127.0.0.1:{port}")}))?;
     write(&run.join("launch-intent.json"), &json!({"at":now()}))?;
     let request = Request { text, run: run.clone(), started: now(), planner_ended: None, exit_code: None, usage: None, ended: None, delivery: None, error: None };
@@ -423,9 +427,12 @@ pub fn run(directory: &Path) -> Result<()> {
     let agent: Agent = serde_json::from_value(request["agent"].clone())?;
     let (argv, conversation) = arguments(&request, &agent)?;
     let workspace = PathBuf::from(request["workspace"].as_str().ok_or("Missing workspace")?);
+    let root = request["root"].as_str().map_or_else(|| workspace.clone(), PathBuf::from);
     let mut cli = command(&argv[0]);
-    cli.args(&argv[1..]).current_dir(&workspace).stdin(Stdio::piped()).stdout(File::create(directory.join("events.jsonl"))?).stderr(File::create(directory.join("log.txt"))?);
+    cli.args(&argv[1..]).current_dir(&root).stdin(Stdio::piped()).stdout(File::create(directory.join("events.jsonl"))?).stderr(File::create(directory.join("log.txt"))?);
     cli.env("COORDINATOR_URL", request["url"].as_str().unwrap_or_default()).env("COORDINATOR_SESSION", request["session"].as_str().unwrap_or_default()).env("COORDINATOR_WORKSPACE", &workspace);
+    let label = format!("planner-{}-{}", request["session"].as_str().unwrap_or_default(), directory.file_name().unwrap_or_default().to_string_lossy());
+    cli.envs(crate::adapters::temp_environment(&root, &label)?);
     for (name, _) in std::env::vars_os() {
         if crate::adapters::hosted_claude_environment(&name.to_string_lossy()) {
             cli.env_remove(name);

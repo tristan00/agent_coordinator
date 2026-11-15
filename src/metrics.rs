@@ -216,7 +216,7 @@ fn footprint<'a>(files: impl Iterator<Item = &'a Value> + Clone) -> Value {
         "churn":added + deleted,"unknownLineCounts":total-known})
 }
 
-const EXCLUDED: &[&str] = &[".git", "target", "node_modules", "dist", "build", "coverage", "vendor", "generated", ".venv", "__pycache__", "data"];
+const EXCLUDED: &[&str] = &[".git", "target", "node_modules", "dist", "build", "coverage", "vendor", "generated", ".venv", "__pycache__", "data", "tmp"];
 pub fn size(snapshot: &Snapshot, workspace: &Path) -> Value {
     let categories: BTreeMap<_, _> = ["source", "ui", "test", "generated", "other"]
         .into_iter()

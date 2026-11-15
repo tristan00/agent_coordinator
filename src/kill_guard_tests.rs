@@ -38,3 +38,18 @@ fn install_links_every_tool_and_prepends_the_guard() {
     assert_eq!((path_key, variable, value), ("PATH", VARIABLE, dir.clone().into_os_string()));
     assert_eq!(env::split_paths(&path).next().unwrap(), dir);
 }
+
+#[test]
+fn real_tool_lookup_skips_every_guard_folder() {
+    let temp = crate::test_support::Temp::new();
+    let name = format!("taskkill{}", env::consts::EXE_SUFFIX);
+    let old = temp.dir("data/kill-guard/old");
+    let new = temp.dir("data/kill-guard/new");
+    let system = temp.dir("system");
+    for dir in [&old, &new, &system] {
+        fs::write(dir.join(&name), b"").unwrap();
+    }
+    let path = env::join_paths([&new, &old, &system]).unwrap();
+    assert_eq!(real("taskkill", &path), Some(system.join(&name)));
+    assert_eq!(real("taskkill", &env::join_paths([&new, &old]).unwrap()), None);
+}

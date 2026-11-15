@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::{Component, Path, PathBuf}};
 
 pub const LIMITS_FILE: &str = "LIMITS.json";
+pub const AGENTS_FILE: &str = "AGENTS.md";
 /// Prompt kinds chosen by a task's stage rather than its role.
 pub const STAGE_KINDS: [(&str, &str); 2] = [("review", "reviewer"), ("replan", "replanner")];
 pub fn kinds() -> Vec<&'static str> {
@@ -125,8 +126,10 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     settings.prompts = Some(Selection { project_planner: planner, worker_protocol: worker, roles });
     let _ = (planner_text, worker_text);
     fs::create_dir(&target)?;
+    let port: u16 = crate::read(&engine.directory.join("port.json")).unwrap_or(4242);
     let result = (|| {
         fs::write(target.join(LIMITS_FILE), serde_json::to_vec_pretty(&settings.limits)?)?;
+        fs::write(target.join(AGENTS_FILE), agents_guide(&target, port, settings.updates))?;
         let path = workspace(&target)?;
         let mut state = engine.state.clone();
         require(!state.config.workspaces.contains_key(&path), "Workspace already configured")?;
@@ -137,9 +140,58 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     })();
     if result.is_err() {
         let _ = fs::remove_file(target.join(LIMITS_FILE));
+        let _ = fs::remove_file(target.join(AGENTS_FILE));
         let _ = fs::remove_dir(&target);
     }
     result
+}
+pub fn agents_guide(workspace: &Path, port: u16, updates: crate::history::Updates) -> String {
+    let w = workspace.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
+    let wait = match updates {
+        crate::history::Updates::Events => "holds the request until something in the workspace changes or S seconds pass",
+        crate::history::Updates::Poll => "answers immediately in this workspace, so call it again to follow progress",
+    };
+    let skipped = crate::sessions::SKIPPED.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
+    format!(
+        "# Workspace {w}\n\n\
+         Every agent working in this workspace starts in this folder.\n\n\
+         ## Keep your work in this workspace\n\n\
+         Keep everything you create under `{w}`: code, data, downloads, scripts, logs and scratch files. \
+         Do not write to the system temp folder or any folder outside this workspace. \
+         `TEMP`, `TMP` and `TMPDIR` already point to a private folder under `{w}\\tmp`, so `/tmp` and temp-file libraries stay inside the workspace.\n\n\
+         ## Delivering results\n\n\
+         Each request runs in its own request folder inside this workspace, and names a deliverable folder inside that request folder. \
+         `GET /api/sessions/{{id}}` shows them as `workspace` and `deliverable`. \
+         Results leave the workspace only by delivery: the coordinator copies the deliverable folder out.\n\n\
+         - The deliverable folder is copied out by itself, so it must contain everything the result needs and work without anything outside it, \
+         including the rest of the workspace. Use paths relative to the folder.\n\
+         - Whenever the deliverable folder holds a complete, working version, `POST /api/sessions/{{id}}/deliver` with the body `{{}}`. \
+         Each delivery replaces the previous one, so deliver the first working version early and again after each improvement.\n\
+         - Planners have the session id in `$COORDINATOR_SESSION`.\n\
+         - When the planner ends its turn, the coordinator makes one final delivery once no task can still run. \
+         If the request is stopped first, only what was already delivered is handed in.\n\
+         - The copy leaves out symbolic links, `.pyc` files, `{LIMITS_FILE}` at the top of the folder, and folders named {skipped}.\n\n\
+         ## Coordinator endpoints for this workspace\n\n\
+         Base URL: `http://127.0.0.1:{port}` (planners also have it in `$COORDINATOR_URL`). \
+         Send request bodies as JSON with `Content-Type: application/json`. \
+         `W` is this workspace, `{w}`, URL-encoded; passing a request folder inside it instead narrows results to that request.\n\n\
+         | Endpoint | Use |\n\
+         |---|---|\n\
+         | `GET /api/task-schema?workspace=W` | Task fields, roles, sizes and this workspace's limits |\n\
+         | `GET /api/tasks?workspace=W` | List the tasks |\n\
+         | `GET /api/tasks/{{id}}` | Read one task |\n\
+         | `POST /api/tasks` | Create a task; its `cwd` must be inside this workspace |\n\
+         | `POST /api/tasks/batch` | Create several tasks at once |\n\
+         | `PATCH /api/tasks/{{id}}` | Correct a task |\n\
+         | `POST /api/tasks/{{id}}/stop` and `/resume` | Stop or resume a task |\n\
+         | `POST /api/tasks/{{id}}/replan` | Ask for a task to be replanned |\n\
+         | `DELETE /api/tasks/{{id}}` | Remove a task |\n\
+         | `GET /api/updates?workspace=W&after=SEQ&wait=S` | Changes after sequence `SEQ`; it {wait} |\n\
+         | `GET /api/agents?workspace=W` | Worker models a task can request |\n\
+         | `GET /api/attempts/{{id}}/log` | Read an attempt's log |\n\
+         | `GET /api/sessions/{{id}}` | Read a planner session and its deliveries |\n\
+         | `POST /api/sessions/{{id}}/deliver` | Hand in the session's deliverable folder; planners have their session id in `$COORDINATOR_SESSION` |\n"
+    )
 }
 
 const LIMIT_RANGES: [(&str, u64, u64); 6] = [("words", 60, 240), ("titleWords", 6, 20), ("criteria", 1, 6), ("summaryWords", 20, 80), ("findings", 1, 6), ("findingWords", 15, 60)];
@@ -155,12 +207,6 @@ impl Random {
     fn below(&mut self, count: usize) -> usize {
         (self.next() % count as u64) as usize
     }
-    fn shuffled<T>(&mut self, mut items: Vec<T>) -> Vec<T> {
-        for index in (1..items.len()).rev() {
-            items.swap(index, self.below(index + 1));
-        }
-        items
-    }
 }
 pub fn generate(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     let paths: Vec<PathBuf> = serde_json::from_value(input["paths"].clone()).map_err(|_| "paths must be a list of new absolute directories")?;
@@ -174,22 +220,22 @@ pub fn generate(engine: &mut Engine, input: Value, root: &Path) -> Result<Value>
     let planners: Vec<String> = agents.iter().filter(|(_, agent)| !agent.worker_only).map(|(id, _)| id.clone()).collect();
     require(!planners.is_empty(), "No agents are enabled for this launcher family; start the coordinator from Claude Code or Codex, or set AGENT_FAMILY")?;
     let listed = catalog(root)?;
-    let deck = |role: &str, random: &mut Random| -> Result<Vec<String>> {
+    let candidates = |role: &str| -> Result<Vec<String>> {
         let names: Vec<String> = listed[role].as_array().into_iter().flatten().filter_map(|entry| entry["candidate"].as_str().map(str::to_owned)).collect();
         require(!names.is_empty(), format!("prompt_candidate/{role} has no valid prompt"))?;
-        Ok(random.shuffled(names))
+        Ok(names)
     };
-    let (planner_prompts, worker_prompts) = (deck("project_planner", &mut random)?, deck("worker_protocol", &mut random)?);
-    let role_prompts: Vec<(&str, Vec<String>)> = role_kinds().into_iter().map(|role| deck(role, &mut random).map(|names| (role, names))).collect::<Result<_>>()?;
+    let (planner_prompts, worker_prompts) = (candidates("project_planner")?, candidates("worker_protocol")?);
+    let role_prompts: Vec<(&str, Vec<String>)> = role_kinds().into_iter().map(|role| candidates(role).map(|names| (role, names))).collect::<Result<_>>()?;
     let mut created = Vec::new();
-    for (index, path) in paths.iter().enumerate() {
+    for path in &paths {
         let limits: serde_json::Map<String, Value> = LIMIT_RANGES.iter().map(|(key, low, high)| (key.to_string(), json!(low + random.next() % (high - low + 1)))).collect();
         let updates = ["poll", "events"][random.below(2)];
         let (planner, worker) = (&planners[random.below(planners.len())], &workers[random.below(workers.len())]);
         let settings = json!({"limits":limits,"updates":updates,"planner":planner,"worker":worker});
         created.push(create(engine, json!({"path":path,"settings":settings,
-            "project_planner":planner_prompts[index % planner_prompts.len()],"worker_protocol":worker_prompts[index % worker_prompts.len()],
-            "roles":role_prompts.iter().map(|(role, names)| (role.to_string(), json!(names[index % names.len()]))).collect::<serde_json::Map<_, _>>()}), root)?);
+            "project_planner":planner_prompts[random.below(planner_prompts.len())],"worker_protocol":worker_prompts[random.below(worker_prompts.len())],
+            "roles":role_prompts.iter().map(|(role, names)| (role.to_string(), json!(names[random.below(names.len())]))).collect::<serde_json::Map<_, _>>()}), root)?);
     }
     Ok(json!({"seed":seed,"workspaces":created}))
 }

@@ -30,7 +30,8 @@ fn run_planner(engine: &Engine, id: &str) {
 #[test]
 fn a_session_copies_the_workspace_runs_the_planner_and_delivers_on_completion() {
     let temp = Temp::new();
-    let (mut engine, source) = setup(&temp, "mkdir submission & echo built> submission\\app.txt & echo raw> data.csv");
+    let w = temp.path().join("config").join("case").display().to_string().trim_start_matches(r"\\?\").to_owned();
+    let (mut engine, source) = setup(&temp, &format!(r"mkdir {w}\submission & echo built> {w}\submission\app.txt & echo raw> {w}\data.csv & cd> {w}\submission\cwd.txt"));
     let case = source.join("case");
     let output = temp.path().join("out");
     let created = create(&mut engine, json!({"workspace":source,"directory":case,"request":"Build it","output":output,"deliverable":"submission"})).unwrap();
@@ -43,21 +44,29 @@ fn a_session_copies_the_workspace_runs_the_planner_and_delivers_on_completion() 
     let prompt = request["prompt"].as_str().unwrap();
     assert!(prompt.contains("Request:\nBuild it") && prompt.contains("Planner instructions:\n") && !prompt.contains("Limits"));
     assert!(!prompt.contains("PROJECT_PLANNER.md") && !prompt.contains("WORKER_PROTOCOL.md"));
+    assert_eq!(request["root"].as_str().map(PathBuf::from), Some(workspace(&source).unwrap()));
+    let shown = |path: &Path| path.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
+    assert!(prompt.contains(&format!("inside the workspace {}, which is your working directory", shown(&workspace(&source).unwrap()))));
+    assert!(prompt.contains(&format!("The deliverable is the folder {}.", shown(&workspace(&case).unwrap().join("submission")))));
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
-    assert_eq!(engine.state.sessions[&id].requests[0].exit_code, Some(0));
+    let log = fs::read_to_string(engine.state.sessions[&id].requests[0].run.join("log.txt")).unwrap_or_default();
+    assert_eq!(engine.state.sessions[&id].requests[0].exit_code, Some(0), "{log}");
     assert_eq!(engine.state.sessions[&id].status, "running");
     tick(&mut engine).unwrap();
     let session = &engine.state.sessions[&id];
     assert_eq!((session.status.as_str(), session.deliveries, session.requests[0].delivery), ("waiting", 1, Some(1)));
     assert_eq!(fs::read_to_string(output.join("1").join("app.txt")).unwrap().trim(), "built");
     assert!(!output.join("1").join("data.csv").exists());
+    let launched = fs::read_to_string(output.join("1").join("cwd.txt")).unwrap();
+    assert_eq!(PathBuf::from(launched.trim().trim_start_matches(r"\\?\")).file_name(), source.file_name());
 }
 
 #[test]
 fn the_session_stays_open_while_tasks_can_still_run_and_follow_ups_resume_it() {
     let temp = Temp::new();
-    let (mut engine, source) = setup(&temp, "mkdir submission & echo v> submission\\v.txt");
+    let w = temp.path().join("config").join("case").display().to_string().trim_start_matches(r"\\?\").to_owned();
+    let (mut engine, source) = setup(&temp, &format!(r"mkdir {w}\submission & echo v> {w}\submission\v.txt"));
     let case = source.join("case");
     let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First","output":temp.path().join("out"),"deliverable":"submission"})).unwrap()["id"].as_str().unwrap().to_owned();
     engine.create(json!({"title":"Pending work","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();

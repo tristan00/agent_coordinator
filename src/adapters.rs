@@ -12,16 +12,20 @@ fn attempt(request: &Value) -> Result<(PathBuf, PathBuf, String)> {
     let directory = result.parent().ok_or("Missing attempt directory")?.to_path_buf();
     Ok((result, directory, request["stage"].as_str().unwrap_or("implementation").to_owned()))
 }
-fn working_directory(request: &Value) -> Result<PathBuf> {
-    let read_only = request["readOnly"] == true;
-    let cwd = if read_only { request["scratch"].as_str() } else { request["task"]["cwd"].as_str() };
-    let cwd = PathBuf::from(cwd.ok_or("Missing working directory")?);
+pub fn working_directory(request: &Value) -> Result<PathBuf> {
+    let task = &request["task"];
+    let cwd = PathBuf::from(task["workspace"].as_str().or(task["cwd"].as_str()).ok_or("Missing working directory")?);
     std::fs::create_dir_all(&cwd)?;
     Ok(cwd)
 }
 fn usage_components(source: &str, input: u64, cached: u64, written: u64, output: u64, turns: u64) -> Value {
     let field = |value: u64| json!({"value":value,"measuredTurns":turns,"turns":turns});
     json!({"source":source,"fields":{"input_tokens":field(input),"cached_input_tokens":field(cached),"cache_write_input_tokens":field(written),"output_tokens":field(output),"reasoning_output_tokens":field(0)}})
+}
+pub fn temp_environment(root: &Path, name: &str) -> Result<[(&'static str, PathBuf); 3]> {
+    let directory = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\")).join("tmp").join(name);
+    std::fs::create_dir_all(&directory)?;
+    Ok([("TEMP", directory.clone()), ("TMP", directory.clone()), ("TMPDIR", directory)])
 }
 pub fn hosted_claude_environment(name: &str) -> bool {
     name == "CLAUDECODE" || name == "CLAUDE_PID" || name == "CLAUDE_EFFORT" || name.starts_with("CLAUDE_CODE_") || name.starts_with("CLAUDE_AGENT_SDK") || name.starts_with("CLAUDE_PREVIEW")

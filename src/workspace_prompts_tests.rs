@@ -71,7 +71,24 @@ fn creation_keeps_the_workspace_empty_and_freezes_selection_hashes() {
     let settings: WorkspaceSettings = serde_json::from_value(result["settings"].clone()).unwrap();
     assert_eq!(engine.state.workspace_ids[&directory].abbreviation, "FIR");
     assert_eq!(engine.state.workspace_ids[&directory].next, 0);
-    assert_eq!(fs::read_dir(&directory).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>(), [LIMITS_FILE]);
+    assert_eq!(fs::read_dir(&directory).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>(), [AGENTS_FILE, LIMITS_FILE]);
+    let guide = fs::read_to_string(directory.join(AGENTS_FILE)).unwrap();
+    let shown = directory.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
+    assert!(guide.starts_with(&format!("# Workspace {shown}\n")) && guide.contains(&format!("Keep everything you create under `{shown}`")));
+    for route in ["/api/task-schema?workspace=W", "/api/tasks?workspace=W", "PATCH /api/tasks/{id}", "/api/updates?workspace=W&after=SEQ&wait=S", "/api/sessions/{id}/deliver"] {
+        assert!(guide.contains(route), "{route}");
+    }
+    for admin in ["/api/deployment", "/api/wipe", "/api/config", "/api/state", "/api/analytics", "/api/workspaces"] {
+        assert!(!guide.contains(admin), "{admin}");
+    }
+    assert!(guide.contains("answers immediately") == (settings.updates == crate::history::Updates::Poll));
+    for delivery in ["## Delivering results", "must contain everything the result needs and work without anything outside it","POST /api/sessions/{id}/deliver` with the body `{}`", "$COORDINATOR_SESSION", "only what was already delivered is handed in", "`node_modules`"] {
+        assert!(guide.contains(delivery), "{delivery}");
+    }
+    let generic = guide.replace(&shown, "").to_lowercase();
+    for specific in ["benchmark", "submission", "harness.json", "judge", "score"] {
+        assert!(!generic.contains(specific), "{specific}");
+    }
     assert_eq!(worker(&fixture.0, &settings, crate::history::Role::Worker, "implementation").unwrap()["text"], "Worker candidate unique instructions.");
     assert!(!planner(&fixture.0, &settings).unwrap().is_empty());
     assert_eq!(engine.state.config.workspaces[&directory], settings);
@@ -86,7 +103,7 @@ fn creation_keeps_the_workspace_empty_and_freezes_selection_hashes() {
 }
 
 #[test]
-fn generation_deals_every_prompt_before_repeating_and_is_reproducible_by_seed() {
+fn generation_picks_each_role_independently_and_is_reproducible_by_seed() {
     let fixture = Fixture::new();
     for index in 0..3 {
         fs::write(fixture.0.join(format!("project_planner/p{index}.md")), format!("Planner candidate {index}.")).unwrap();
@@ -95,32 +112,37 @@ fn generation_deals_every_prompt_before_repeating_and_is_reproducible_by_seed() 
             fs::write(fixture.0.join(format!("{role}/r{index}.md")), format!("{role} candidate {index}.")).unwrap();
         }
     }
-    let run = |prefix: &str| {
+    let run = |prefix: &str, seed: u64| {
         let mut engine = fixture.engine();
-        let paths: Vec<_> = (0..6).map(|i| fixture.0.join(format!("{prefix}{i}"))).collect();
-        generate(&mut engine, json!({"paths":paths,"seed":42}), &fixture.0).unwrap()
+        let paths: Vec<_> = (0..30).map(|i| fixture.0.join(format!("{prefix}{i}"))).collect();
+        generate(&mut engine, json!({"paths":paths,"seed":seed}), &fixture.0).unwrap()
     };
-    let first = run("a");
-    let pick = |result: &Value, role: &str| -> Vec<String> { result["workspaces"].as_array().unwrap().iter().map(|w| w["settings"]["prompts"][role]["candidate"].as_str().unwrap().to_owned()).collect() };
-    let roles = |result: &Value, role: &str| -> Vec<String> { result["workspaces"].as_array().unwrap().iter().map(|w| w["settings"]["prompts"]["roles"][role]["candidate"].as_str().unwrap().to_owned()).collect() };
+    let first = run("a", 42);
+    let pick = |result: &Value, role: &str| -> Vec<String> {
+        result["workspaces"].as_array().unwrap().iter().map(|w| {
+            let prompts = &w["settings"]["prompts"];
+            prompts.get(role).filter(|p| p.is_object()).unwrap_or(&prompts["roles"][role])["candidate"].as_str().unwrap().to_owned()
+        }).collect()
+    };
     for workspace in first["workspaces"].as_array().unwrap() {
         let mut expected = role_kinds();
         expected.sort();
         assert_eq!(workspace["settings"]["prompts"]["roles"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), expected);
     }
-    for role in role_kinds() {
-        let names = roles(&first, role);
-        assert_eq!(names[..3].iter().collect::<std::collections::BTreeSet<_>>().len(), 3, "{role}: {names:?}");
-        assert_eq!(names[..3], names[3..]);
-    }
-    for role in ["project_planner", "worker_protocol"] {
+    let all: Vec<&str> = ["project_planner", "worker_protocol"].into_iter().chain(role_kinds()).collect();
+    for role in &all {
         let names = pick(&first, role);
-        assert_eq!(names[..3].iter().collect::<std::collections::BTreeSet<_>>().len(), 3, "{role}: {names:?}");
-        assert_eq!(names[..3], names[3..]);
+        assert_eq!(names.iter().collect::<std::collections::BTreeSet<_>>().len(), 3, "{role}: {names:?}");
     }
-    let second = run("b");
+    let pairs = |a: &str, b: &str| pick(&first, a).into_iter().zip(pick(&first, b)).collect::<std::collections::BTreeSet<_>>().len();
+    assert!(pairs("worker_protocol", "reviewer") > 3 && pairs("reviewer", "test") > 3 && pairs("project_planner", "worker_protocol") > 3);
+    let second = run("b", 42);
     let models = |result: &Value| -> Vec<(Value, Value, Value)> { result["workspaces"].as_array().unwrap().iter().map(|w| (w["settings"]["planner"].clone(), w["settings"]["worker"].clone(), w["settings"]["limits"].clone())).collect() };
-    assert_eq!((models(&first), pick(&first, "project_planner")), (models(&second), pick(&second, "project_planner")));
+    assert_eq!(models(&first), models(&second));
+    for role in &all {
+        assert_eq!(pick(&first, role), pick(&second, role), "{role}");
+    }
+    assert_ne!(pick(&first, "worker_protocol"), pick(&run("c", 7), "worker_protocol"));
     for workspace in first["workspaces"].as_array().unwrap() {
         assert_ne!(workspace["settings"]["planner"], "luna_6_high");
     }
@@ -155,7 +177,9 @@ fn the_shipped_catalog_lists_every_prompt_candidate() {
     let listed = catalog(&root()).unwrap();
     assert_eq!(listed["invalid"], json!([]));
     for kind in kinds() {
-        assert_eq!(listed[kind].as_array().unwrap().len(), if kind == "project_planner" { 7 } else { 3 }, "{kind}");
+        let files = fs::read_dir(root().join(kind)).unwrap().filter(|e| e.as_ref().unwrap().file_type().unwrap().is_file()).count();
+        assert!(files >= 2, "{kind}");
+        assert_eq!(listed[kind].as_array().unwrap().len(), files, "{kind}");
     }
 }
 
