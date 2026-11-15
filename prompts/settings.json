@@ -1,0 +1,13 @@
+{
+  "planner": "claude_opus_5_5_medium",
+  "worker": "claude_sonnet_5_5_medium",
+  "updates": "events",
+  "limits": {
+    "words": 150,
+    "titleWords": 15,
+    "criteria": 4,
+    "summaryWords": 60,
+    "findings": 3,
+    "findingWords": 45
+  }
+}

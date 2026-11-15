@@ -25,6 +25,9 @@ pub fn role_kinds() -> Vec<&'static str> {
 pub struct Document {
     pub candidate: String,
     pub sha256: String,
+    /// The prompt is the current default in the prompts folder, not a file under prompt_candidate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +39,36 @@ pub struct Selection {
 }
 pub fn root() -> PathBuf {
     Path::new(option_env!("COORDINATOR_SOURCE_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"))).join("prompt_candidate")
+}
+/// The current defaults: planner.txt, worker.txt and <role>.txt prompts plus settings.json, beside the candidate folder.
+pub fn defaults_root(root: &Path) -> PathBuf {
+    root.with_file_name("prompts")
+}
+fn default_file(kind: &str) -> String {
+    match kind {
+        "project_planner" => "planner.txt".into(),
+        "worker_protocol" => "worker.txt".into(),
+        _ => format!("{kind}.txt"),
+    }
+}
+fn default_prompt(root: &Path, kind: &str) -> Result<(Document, String)> {
+    let file = default_file(kind);
+    let path = defaults_root(root).join(&file);
+    let text = text(&path).map_err(|error| format!("Default prompt {}: {error}", path.display()))?;
+    Ok((Document { candidate: file, sha256: digest(&text), default: true }, text))
+}
+fn default_settings(root: &Path) -> Result<Value> {
+    let path = defaults_root(root).join("settings.json");
+    serde_json::from_str(&fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?).map_err(|error| format!("{}: {error}", path.display()).into())
+}
+/// What a workspace created without explicit choices gets.
+pub fn defaults(root: &Path) -> Result<Value> {
+    let mut prompts = serde_json::Map::new();
+    for kind in kinds() {
+        let (document, text) = default_prompt(root, kind)?;
+        prompts.insert(kind.into(), json!({"file":document.candidate,"sha256":document.sha256,"words":text.split_whitespace().count()}));
+    }
+    Ok(json!({"directory":defaults_root(root),"settings":default_settings(root)?,"prompts":prompts}))
 }
 fn name(value: &str) -> Result<()> {
     require(!value.is_empty() && !value.contains(['/', '\\', ':']) && Path::new(value).components().count() == 1 && matches!(Path::new(value).components().next(), Some(Component::Normal(_))), "Prompt candidate must be a filename within its role directory")
@@ -56,7 +89,7 @@ fn candidate(root: &Path, role: &str, selected: &str) -> Result<(Document, Strin
     let path = directory.join(selected);
     require(path.canonicalize()?.parent() == Some(directory.as_path()), "Candidate resolves outside its role directory")?;
     let text = text(&path)?;
-    Ok((Document { candidate: selected.into(), sha256: digest(&text) }, text))
+    Ok((Document { candidate: selected.into(), sha256: digest(&text), default: false }, text))
 }
 pub fn catalog(root: &Path) -> Result<Value> {
     let mut result = json!({"directory":root,"max_words":200,"invalid":[],"agents":crate::agents::listing(&Default::default(), crate::agents::launcher())});
@@ -85,8 +118,9 @@ fn selected(root: &Path, settings: &WorkspaceSettings, role: &str) -> Result<(Do
         "worker_protocol" => &prompts.worker_protocol,
         _ => prompts.roles.get(role).ok_or_else(|| format!("No prompt selected for role {role}"))?,
     };
-    let (current, text) = candidate(root, role, &document.candidate)?;
-    require(current.sha256 == document.sha256, format!("Prompt candidate {role}/{} changed since the workspace selected it", document.candidate))?;
+    let (current, text) = if document.default { default_prompt(root, role)? } else { candidate(root, role, &document.candidate)? };
+    let shown = if document.default { format!("prompts/{}", document.candidate) } else { format!("{role}/{}", document.candidate) };
+    require(current.sha256 == document.sha256, format!("Prompt {shown} changed since the workspace selected it"))?;
     Ok((current, text))
 }
 pub fn verify(root: &Path, settings: &WorkspaceSettings) -> Result<()> {
@@ -111,20 +145,22 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
     require(!parent.starts_with(project), "Workspace data must be outside the coordinator source directory")?;
     let target = parent.join(path.file_name().ok_or("Workspace name required")?);
     require(!engine.state.config.workspaces.contains_key(&target), "Workspace already configured")?;
-    let mut settings: WorkspaceSettings = serde_json::from_value(input["settings"].clone())?;
+    // Anything the request leaves out comes from the current defaults in the prompts folder.
+    let settings_input = if input["settings"].is_null() { default_settings(root)? } else { input["settings"].clone() };
+    let mut settings: WorkspaceSettings = serde_json::from_value(settings_input)?;
     settings.validate(engine.state.family)?;
-    let (planner, planner_text) = candidate(root, "project_planner", input["project_planner"].as_str().ok_or("project_planner candidate required")?)?;
-    let (worker, worker_text) = candidate(root, "worker_protocol", input["worker_protocol"].as_str().ok_or("worker_protocol candidate required")?)?;
-    let mut roles = BTreeMap::new();
-    for (role, selected) in input["roles"].as_object().into_iter().flatten() {
-        require(role_kinds().contains(&role.as_str()), format!("Unknown role {role}"))?;
-        roles.insert(role.clone(), candidate(root, role, selected.as_str().ok_or("Role prompt candidates must be filenames")?)?.0);
+    let pick = |kind: &str, selected: &Value| -> Result<Document> {
+        Ok(match selected {
+            Value::Null => default_prompt(root, kind)?.0,
+            _ => candidate(root, kind, selected.as_str().ok_or(format!("The {kind} prompt candidate must be a filename"))?)?.0,
+        })
+    };
+    let given = input["roles"].as_object().cloned().unwrap_or_default();
+    if let Some(role) = given.keys().find(|role| !role_kinds().contains(&role.as_str())) {
+        return Err(format!("Unknown role {role}").into());
     }
-    for (_, kind) in STAGE_KINDS {
-        require(roles.contains_key(kind), format!("A {kind} prompt candidate is required"))?;
-    }
-    settings.prompts = Some(Selection { project_planner: planner, worker_protocol: worker, roles });
-    let _ = (planner_text, worker_text);
+    let roles = role_kinds().into_iter().map(|kind| Ok((kind.to_owned(), pick(kind, given.get(kind).unwrap_or(&Value::Null))?))).collect::<Result<BTreeMap<_, _>>>()?;
+    settings.prompts = Some(Selection { project_planner: pick("project_planner", &input["project_planner"])?, worker_protocol: pick("worker_protocol", &input["worker_protocol"])?, roles });
     fs::create_dir(&target)?;
     let port: u16 = crate::read(&engine.directory.join("port.json")).unwrap_or(4242);
     let result = (|| {

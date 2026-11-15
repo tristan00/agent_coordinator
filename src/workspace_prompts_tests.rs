@@ -17,7 +17,7 @@ fn workspace_agents_are_explicit_and_preserve_exact_model_effort_pairs() {
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("workspace-prompts-{}", crate::engine::id()));
+        let path = std::env::temp_dir().join(format!("workspace-prompts-{}", crate::engine::id())).join("prompt_candidate");
         fs::create_dir_all(path.join("project_planner")).unwrap();
         for kind in kinds() {
             fs::create_dir_all(path.join(kind)).unwrap();
@@ -39,8 +39,9 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        assert!(self.0.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        fs::remove_dir_all(&self.0).unwrap();
+        let parent = self.0.parent().unwrap();
+        assert!(parent.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(parent).unwrap();
     }
 }
 #[test]
@@ -152,21 +153,32 @@ fn generation_picks_each_role_independently_and_is_reproducible_by_seed() {
 }
 
 #[test]
-fn roles_use_their_own_prompt_and_fall_back_to_the_worker_protocol() {
+fn roles_use_their_own_prompt_and_the_defaults_fill_the_rest() {
     let fixture = Fixture::new();
     fixture.candidates();
-    fs::create_dir_all(fixture.0.join("ui-code")).unwrap();
+    let defaults = defaults_root(&fixture.0);
+    fs::create_dir_all(&defaults).unwrap();
+    for kind in kinds() {
+        fs::write(defaults.join(default_file(kind)), format!("{kind} default instructions.")).unwrap();
+    }
+    fs::write(defaults.join("settings.json"), r#"{"planner":"sol_6_1_light","worker":"sol_6_1_light","updates":"events"}"#).unwrap();
     fs::write(fixture.0.join("ui-code/visual.md"), "Build interfaces people enjoy.").unwrap();
     let mut engine = fixture.engine();
     let mut input = fixture.input("roles");
-    input["roles"] = json!({"ui-code":"visual.md","reviewer":"selected.md","replanner":"selected.md"});
+    input["roles"] = json!({"ui-code":"visual.md"});
     let result = create(&mut engine, input, &fixture.0).unwrap();
     let settings: WorkspaceSettings = serde_json::from_value(result["settings"].clone()).unwrap();
     let ui = worker(&fixture.0, &settings, crate::history::Role::UiCode, "implementation").unwrap();
     assert_eq!((ui["role"].as_str(), ui["text"].as_str()), (Some("ui-code"), Some("Build interfaces people enjoy.")));
-    for role in [crate::history::Role::Worker, crate::history::Role::BackendCode, crate::history::Role::Audit] {
-        assert_eq!(worker(&fixture.0, &settings, role, "implementation").unwrap()["role"], "worker_protocol");
-    }
+    let backend = worker(&fixture.0, &settings, crate::history::Role::BackendCode, "implementation").unwrap();
+    assert_eq!((backend["candidate"].as_str(), backend["text"].as_str()), (Some("backend-code.txt"), Some("backend-code default instructions.")));
+    assert_eq!(worker(&fixture.0, &settings, crate::history::Role::Worker, "implementation").unwrap()["role"], "worker_protocol");
+    let plain = create(&mut engine, json!({"path":fixture.0.join("plain")}), &fixture.0).unwrap();
+    let settings: WorkspaceSettings = serde_json::from_value(plain["settings"].clone()).unwrap();
+    assert_eq!((settings.updates, settings.planner.as_deref()), (crate::history::Updates::Events, Some("sol_6_1_light")));
+    assert_eq!(planner(&fixture.0, &settings).unwrap(), "project_planner default instructions.");
+    fs::write(defaults.join("planner.txt"), "Edited later.").unwrap();
+    assert!(planner(&fixture.0, &settings).unwrap_err().to_string().contains("planner.txt"));
     let mut unknown = fixture.input("unknown-role");
     unknown["roles"] = json!({"marketing":"visual.md"});
     assert!(create(&mut engine, unknown, &fixture.0).is_err());

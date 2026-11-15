@@ -219,6 +219,7 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
         ["", "api", "task-schema"] => engine.state.task_schema(update_query(full)?.workspace.as_deref()),
         ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
         ["", "api", "prompt-candidates"] => crate::workspace_prompts::catalog(&crate::workspace_prompts::root())?,
+        ["", "api", "workspaces", "defaults"] => crate::workspace_prompts::defaults(&crate::workspace_prompts::root())?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
         ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
         ["", "api", "sessions"] => crate::sessions::list(engine)?,
