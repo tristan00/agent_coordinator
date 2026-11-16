@@ -1,1 +1,0 @@
-This task failed, and you decide what happens next. A new plan must take away whatever made it fail; rewording the same task and sending it back is not a plan. Make every task you propose small and clear enough to be finished in a single attempt, within the definition limits.

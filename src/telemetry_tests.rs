@@ -28,6 +28,15 @@ fn resource_usage_sums_turn_completed_events() {
 }
 
 #[test]
+fn cost_is_recorded_only_as_the_provider_reports_it() {
+    let (temp, path) = events(&[r#"{"type":"result","total_cost_usd":0.25}"#, "not json", r#"{"type":"result","total_cost_usd":0.75}"#]);
+    assert_eq!(reported_cost(&path), Some(json!({"usd":0.75,"source":"provider_reported","field":"total_cost_usd"})));
+    let (_other, silent) = events(&[r#"{"type":"turn.completed","usage":{"input_tokens":3}}"#]);
+    assert_eq!(reported_cost(&silent), Some(json!({"usd":null,"source":"not_reported"})));
+    assert!(reported_cost(&temp.path().join("missing.jsonl")).is_none());
+}
+
+#[test]
 fn resource_usage_is_absent_without_completed_turns() {
     let (temp, path) = events(&[r#"{"type":"turn.started"}"#, ""]);
     assert!(resource_usage(&path).is_none());

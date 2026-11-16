@@ -23,16 +23,6 @@ fn fingerprint_is_fnv1a_64() {
     assert_ne!(fingerprint(b"ab"), fingerprint(b"ba"));
 }
 
-#[test]
-fn common_lines_finds_longest_common_subsequence() {
-    assert_eq!(common_lines(&[1, 2, 3], &[1, 2, 3]), 3);
-    assert_eq!(common_lines(&[1, 2, 3], &[1, 4, 3]), 2);
-    assert_eq!(common_lines(&[1, 2], &[1, 9, 2]), 2);
-    assert_eq!(common_lines(&[], &[1, 2]), 0);
-    assert_eq!(common_lines(&[1, 2, 3, 4], &[3, 4, 1, 2]), 2);
-    assert_eq!(common_lines(&[5, 1, 5, 2, 5], &[1, 2]), 2);
-    assert_eq!(common_lines(&[7, 7], &[7]), 1);
-}
 
 #[test]
 fn categories_follow_documented_precedence() {
@@ -56,7 +46,6 @@ fn categories_follow_documented_precedence() {
 
 #[test]
 fn wait_reasons_map_to_interval_buckets() {
-    assert_eq!(wait_bucket("Waiting for writable scope C:\\x"), "resource");
     assert_eq!(wait_bucket("Waiting for result from Alpha"), "dependency");
     assert_eq!(wait_bucket("Waiting for Alpha to settle"), "dependency");
     assert_eq!(wait_bucket("Retry scheduled at 5"), "retry");
@@ -141,49 +130,7 @@ fn capture_records_text_and_binary_files_and_excludes_runtime_trees() {
     assert!(snapshot.skipped.is_empty());
 }
 
-#[test]
-fn compare_reports_line_changes_whitespace_edits_and_totals() {
-    let (_temp, ws) = workspace();
-    let before = capture(std::slice::from_ref(&ws), Path::new("Z:\\unused"));
-    fs::write(ws.join("src").join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
-    fs::remove_file(ws.join("notes.txt")).unwrap();
-    fs::write(ws.join("src").join("new.rs"), "x\ny\n").unwrap();
-    fs::write(ws.join("w.rs"), "  a\n\nb  \n").unwrap();
-    fs::write(ws.join("bin.dat"), [0u8, 1, 3]).unwrap();
-    let after = capture(std::slice::from_ref(&ws), Path::new("Z:\\unused"));
-    let value = compare(before, after, &ws, &[]);
-    let files: BTreeMap<String, Value> = value["files"].as_array().unwrap().iter()
-        .map(|f| (Path::new(f["path"].as_str().unwrap()).strip_prefix(&ws).unwrap().to_string_lossy().into_owned(), f.clone())).collect();
-    let summary = |name: &str| (files[name]["added"].clone(), files[name]["deleted"].clone(), files[name]["category"].clone());
-    assert_eq!(summary("src\\a.rs"), (json!(1), json!(0), json!("source")));
-    assert_eq!(summary("notes.txt"), (json!(0), json!(1), json!("other")));
-    assert_eq!(summary("src\\new.rs"), (json!(2), json!(0), json!("source")));
-    assert_eq!(summary("w.rs"), (json!(3), json!(2), json!("source")));
-    assert_eq!(summary("bin.dat"), (Value::Null, Value::Null, json!("other")));
-    assert_eq!(files["w.rs"]["whitespaceOnly"], true);
-    assert_eq!(files["src\\a.rs"]["whitespaceOnly"], false);
-    assert!(files["notes.txt"]["whitespaceOnly"].is_null() && files["notes.txt"]["afterFingerprint"].is_null());
-    assert!(files["src\\new.rs"]["beforeFingerprint"].is_null());
-    assert_eq!(value["totals"], json!({"uniqueFiles":5,"added":6,"deleted":3,"net":3,"churn":9,"unknownLineCounts":1}));
-    assert_eq!(value["attribution"], "scoped_observation");
-    assert_eq!(value["scopeSize"]["after"]["byCategory"]["source"]["files"], 3);
-}
 
-#[test]
-fn compare_marks_peers_ambiguous_and_ignores_skipped_roots() {
-    let (_temp, ws) = workspace();
-    let peers = ["other-attempt".to_string()];
-    let same = compare(capture(std::slice::from_ref(&ws), Path::new("Z:\\")), capture(std::slice::from_ref(&ws), Path::new("Z:\\")), &ws, &peers);
-    assert_eq!(same["files"], json!([]));
-    assert_eq!((same["attribution"].as_str(), same["overlappingAttempts"].clone()), (Some("ambiguous"), json!(peers)));
-    let before = capture(std::slice::from_ref(&ws), Path::new("Z:\\"));
-    fs::write(ws.join("src").join("a.rs"), "changed").unwrap();
-    let mut after = capture(std::slice::from_ref(&ws), Path::new("Z:\\"));
-    after.skipped.insert(ws.join("src"));
-    let value = compare(before, after, &ws, &[]);
-    assert_eq!(value["files"], json!([]));
-    assert_eq!(value["skipped"].as_array().unwrap().len(), 1);
-}
 
 #[test]
 fn size_counts_lines_by_category() {
@@ -244,19 +191,6 @@ fn project_capture_writes_each_endpoint_once() {
     assert!(directory.join("project-after.json").exists());
     assert!(project_capture(&directory, &json!({"task":{}}), true).is_err());
     assert!(project_capture(&directory, &json!({"task":{"workspaceId":ws.join("absent")}}), true).is_err());
-}
-
-#[test]
-fn clean_removes_snapshots_and_tolerates_missing_files() {
-    let temp = Temp::new();
-    let directory = temp.dir("attempt");
-    for name in ["baseline.json", "final-snapshot.json", "changes.json"] {
-        fs::write(directory.join(name), "{}").unwrap();
-    }
-    clean(&directory);
-    clean(&directory);
-    assert!(!directory.join("baseline.json").exists() && !directory.join("final-snapshot.json").exists());
-    assert!(directory.join("changes.json").exists());
 }
 
 #[test]

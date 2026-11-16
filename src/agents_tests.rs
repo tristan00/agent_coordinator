@@ -69,16 +69,6 @@ fn agent_definitions_reject_unknown_fields_and_round_trip() {
 }
 
 #[test]
-fn listing_marks_what_the_launcher_family_allows() {
-    let listed = listing(&BTreeMap::new(), Some(Family::Claude));
-    let agents = listed["agents"].as_array().unwrap();
-    assert!(agents.iter().all(|a| a["id"] != "sol_light"));
-    let allowed = |id: &str| agents.iter().find(|a| a["id"] == id).unwrap()["allowed"].as_bool().unwrap();
-    assert!(allowed("claude_haiku_5_5_low") && !allowed("sol_6_1_light"));
-    assert_eq!(listed["family"], "claude");
-}
-
-#[test]
 fn enabled_lists_workspace_definitions_or_the_family_catalog() {
     let all = enabled(&BTreeMap::new(), Some(Family::Claude));
     assert!(all.contains_key("claude_haiku_5_5_low") && all.contains_key("claude_opus_5_5_medium"));
@@ -94,9 +84,6 @@ fn luna_is_a_worker_only_agent() {
     let settings = |planner: &str, worker: &str| -> crate::history::WorkspaceSettings { serde_json::from_value(json!({"planner":planner,"worker":worker})).unwrap() };
     assert!(settings("luna_6_high", "sol_6_1_light").validate(family).unwrap_err().to_string().contains("only be a worker"));
     settings("sol_6_1_light", "luna_6_high").validate(family).unwrap();
-    let listed = listing(&BTreeMap::new(), family);
-    let luna = listed["agents"].as_array().unwrap().iter().find(|a| a["id"] == "luna_6_high").unwrap();
-    assert_eq!((luna["planner"].as_bool(), luna["agent"]["workerOnly"].as_bool()), (Some(false), Some(true)));
     let roundtrip: Agent = serde_json::from_value(serde_json::to_value(&catalog()["luna_6_high"]).unwrap()).unwrap();
     assert!(roundtrip.worker_only);
 }
@@ -108,7 +95,5 @@ fn opus_is_a_planner_only_agent() {
     settings("claude_opus_5_5_medium", "claude_sonnet_5_5_low").validate(family).unwrap();
     assert!(settings("claude_sonnet_5_5_low", "claude_opus_5_5_medium").validate(family).unwrap_err().to_string().contains("only be a planner"));
     assert!(settings("claude_sonnet_5_5_low", "claude_sonnet_5_5_low").task_agent(Some("claude_opus_5_5_medium"), family).unwrap_err().to_string().contains("only be a planner"));
-    let listed = listing(&BTreeMap::new(), family);
-    let opus = listed["agents"].as_array().unwrap().iter().find(|a| a["id"] == "claude_opus_5_5_medium").unwrap();
-    assert_eq!((opus["planner"].as_bool(), opus["worker"].as_bool()), (Some(true), Some(false)));
+    assert!(catalog()["claude_opus_5_5_medium"].planner_only);
 }

@@ -1,1 +1,0 @@
-Skip the happy path; it is rarely where things break. Probe limits, empty and malformed input, concurrency and previously working features. For every failure, write down the exact input, the steps, and the expected versus actual result, so anyone can reproduce it.

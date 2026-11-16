@@ -2,7 +2,7 @@ use crate::history::{self, Artifact, AttemptEvidence, Attributes, Event, Need, R
 use crate::{Result, evidence, lock, metrics, now, process, read, require, write};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::mem::{MaybeUninit, size_of};
 use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
@@ -115,8 +115,6 @@ pub struct Task {
     pub conflicts: Vec<String>,
     #[serde(default)]
     pub related: Vec<String>,
-    #[serde(default)]
-    pub writable: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inherited: BTreeMap<String, usize>,
     #[serde(default)]
@@ -163,6 +161,7 @@ impl Task {
     pub fn status(&self) -> &'static str {
         match self.stage.as_str() {
             "done" => "Done",
+            _ if self.stopped && self.active.is_none() => "Stopped",
             "review" => "Review",
             _ if self.blocked && self.active.is_none() => "Blocked",
             _ if self.active.is_some() || !self.attempts.is_empty() || self.stage == "replan" => "In progress",
@@ -188,7 +187,7 @@ impl Task {
     fn snapshot(&self) -> Value {
         json!({"title":self.title,"outcome":self.outcome,"acceptance":self.acceptance,"cwd":self.cwd,"workspaceId":self.workspace,"key":self.key,
             "dependencies":self.dependencies,"after":self.after,"parent":self.parent,"standalone":self.standalone,"conflicts":self.conflicts,"related":self.related,
-            "writable":self.writable,"model":self.model,"effort":self.effort,"attributes":self.attributes,"definitionWords":self.definition_words()})
+            "model":self.model,"effort":self.effort,"attributes":self.attributes,"definitionWords":self.definition_words()})
     }
     pub fn record(&mut self, kind: &str, source: &str, evidence: Value) {
         self.history.push(Event::new(self, kind, source, evidence));
@@ -254,7 +253,6 @@ struct Input {
     conflicts: Option<Vec<String>>,
     related: Option<Vec<String>>,
     supersedes: Option<Vec<String>>,
-    writable: Option<Vec<PathBuf>>,
     #[serde(default, deserialize_with = "nullable")]
     model: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
@@ -273,7 +271,7 @@ impl Input {
             let unknown: Vec<_> = attributes.keys().filter(|k| !Attributes::FIELDS.contains(&k.as_str())).collect();
             require(unknown.is_empty(), "Unknown attribute; use role, needs, languages, functions, priority, size, artifact or deploy")?;
         }
-        serde_json::from_value(value).map_err(|e| format!("{e}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, writable, attributes").into())
+        serde_json::from_value(value).map_err(|e| format!("{e}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, attributes").into())
     }
     fn grouping(&self) -> Result<()> {
         require(self.parent.as_ref().is_some_and(Option::is_some) ^ (self.standalone == Some(Some(true))), "Choose exactly one grouping: parent container or standalone true")?;
@@ -324,9 +322,6 @@ impl Input {
             task.attributes.needs.sort();
             task.attributes.needs.dedup();
         }
-        if let Some(paths) = self.writable {
-            task.writable = writable_paths(task.workdir(), paths)?;
-        }
         Ok(())
     }
 }
@@ -337,17 +332,6 @@ pub(crate) fn workspace(path: &Path) -> Result<PathBuf> {
     validate_workdir(path)?;
     Ok(path.canonicalize()?)
 }
-fn writable_paths(base: &Path, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    let mut resolved = Vec::new();
-    for path in paths {
-        require(!(path.as_os_str().is_empty() || path.components().any(|part| part == Component::ParentDir)), "Writable paths must be absolute or workspace relative, without '..'")?;
-        let path = resolve_scope_path(&base.join(path))?;
-        if !resolved.contains(&path) {
-            resolved.push(path);
-        }
-    }
-    Ok(resolved)
-}
 pub(crate) fn resolve_scope_path(path: &Path) -> Result<PathBuf> {
     for ancestor in path.ancestors() {
         match ancestor.canonicalize() {
@@ -357,7 +341,7 @@ pub(crate) fn resolve_scope_path(path: &Path) -> Result<PathBuf> {
             Err(error) => return Err(error.into()),
         }
     }
-    Err("Missing writable path root".into())
+    Err("Missing path root".into())
 }
 pub(crate) fn covers(root: &Path, path: &Path) -> bool {
     let normalized = |part: Component<'_>| part.as_os_str().to_string_lossy().trim_end_matches(['.', ' ']).to_lowercase();
@@ -519,6 +503,17 @@ impl State {
     pub fn children<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a Task> {
         self.tasks.iter().filter(move |task| task.parent.as_deref() == Some(id))
     }
+    pub fn halted(&self, task: &Task) -> bool {
+        if task.stage == "done" {
+            return false;
+        }
+        if !task.container() {
+            return task.stopped && task.active.is_none();
+        }
+        let children: Vec<&Task> = self.children(&task.id).collect();
+        let halted: Vec<bool> = children.iter().map(|c| self.halted(c)).collect();
+        halted.contains(&true) && children.iter().zip(&halted).all(|(c, h)| *h || c.stage == "done")
+    }
     fn ancestors<'a>(&'a self, task: &'a Task) -> Vec<&'a Task> {
         let mut chain = Vec::new();
         let mut parent = task.parent.as_deref().and_then(|id| self.get(id));
@@ -540,7 +535,7 @@ impl State {
         })
     }
     pub fn task_schema(&self, key: Option<&Path>) -> Value {
-        json!({"roles":history::ROLES,"roleNotes":{"worker":"General worker; the default when no other role fits","audit":"Read-only: inspects and reports, never edits files"},"sizes":history::SIZES,"needs":history::NEEDS,"artifacts":history::ARTIFACTS,
+        json!({"roles":history::ROLES,"roleNotes":{"worker":"General worker; the default when no other role fits","audit":"Read-only: inspects and reports, never edits files","abstraction":"Finds the principles behind examples and what else they cover"},"sizes":history::SIZES,"needs":history::NEEDS,"artifacts":history::ARTIFACTS,
             "priority":"0 (highest) to 3; omitted means 2","dependencyReasons":DEPENDENCY_REASONS,"classifications":history::classification_schema(),"limits":self.settings(key).limits.value()})
     }
     pub fn models(&self, key: Option<&Path>) -> Value {
@@ -847,6 +842,7 @@ pub struct Engine {
     pub state: State,
     pub pending_deploy: Option<String>,
     pub notices: Vec<Value>,
+    pub actor: Option<String>,
 }
 impl Engine {
     pub fn new(directory: PathBuf) -> Result<Self> {
@@ -950,7 +946,7 @@ impl Engine {
         state.assign_short_ids();
         state.schema_version = Some(history::SCHEMA_VERSION);
         write(&file, &state)?;
-        Ok(Self { directory, state, pending_deploy: None, notices: Vec::new() })
+        Ok(Self { directory, state, pending_deploy: None, notices: Vec::new(), actor: None })
     }
     pub fn task(&self, id: &str) -> Result<usize> {
         self.state.index(id)
@@ -961,6 +957,13 @@ impl Engine {
     pub(crate) fn commit(&mut self, mut state: State) -> Result<()> {
         state.schema_version = Some(history::SCHEMA_VERSION);
         let next = self.state.sequence + 1;
+        if let Some(actor) = &self.actor {
+            let known: HashMap<&str, usize> = self.state.tasks.iter().chain(&self.state.archived).map(|t| (t.id.as_str(), t.history.len())).collect();
+            for task in state.tasks.iter_mut().chain(state.archived.iter_mut()) {
+                let seen = known.get(task.id.as_str()).copied().unwrap_or(0);
+                task.history.iter_mut().skip(seen).filter(|e| e.actor.is_none()).for_each(|e| e.actor = Some(actor.clone()));
+            }
+        }
         let mut changed: Vec<PathBuf> = Vec::new();
         for task in &mut state.tasks {
             if self.state.get(&task.id).is_none_or(|old| old.brief() != task.brief()) {
@@ -1010,7 +1013,7 @@ impl Engine {
             value.as_object_mut().unwrap().remove("history");
         }
         let blocks: Vec<_> = self.state.tasks.iter().filter(|t| t.dependencies.iter().any(|d| d.target == task.id)).map(|t| &t.id).collect();
-        value["status"] = json!(task.status());
+        value["status"] = json!(if self.state.halted(task) { "Stopped" } else { task.status() });
         value["container"] = json!(task.container());
         value["children"] = json!(self.state.children(&task.id).map(|t| &t.id).collect::<Vec<_>>());
         value["blocks"] = json!(blocks);
@@ -1244,7 +1247,7 @@ impl Engine {
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
             "workspace":task.workspace,"cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"role":task.attributes.role,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
             "languages":task.attributes.languages,"functions":task.attributes.functions,
-            "writable":task.writable,"dependencies":task.dependencies,"after":task.after},
+            "dependencies":task.dependencies,"after":task.after},
             "worker":worker,"agent":agent,"family":self.state.family,"workerProtocol":protocol,"feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
             "readOnly":stage != "implementation" || task.read_only()});
         if stage == "review" {
@@ -1276,13 +1279,45 @@ impl Engine {
             require(command.iter().any(|arg| arg == "{model}") && command.iter().any(|arg| arg.contains("{effort}")), "Worker command requires explicit {model} and {effort} placeholders")?;
         }
         let actual_command: Vec<_> = command.iter().map(|arg| arg.replace("{model}", &agent.model).replace("{effort}", agent.effort())).collect();
+        let name = |t: &Task| t.short_id.clone().unwrap_or_else(|| t.id.clone());
+        let git = match &task.workspace {
+            Some(workspace) if !task.read_only() => {
+                let ancestors: Vec<String> = self.state.ancestors(task).into_iter().map(name).collect();
+                crate::git::prepare(workspace, task.workdir(), &name(task), &ancestors, &stage)?
+            }
+            _ => None,
+        };
+        if stage == "review"
+            && let Some(git) = git.as_ref().filter(|g| g["conflict"] == true)
+        {
+            return self.return_conflicted(index, git);
+        }
+        let cwd = git.as_ref().map_or_else(|| task.workdir().to_path_buf(), |g| crate::git::map(task.workdir(), g));
         let settings = json!({"scratch":true,"acceptance":task.acceptance,"requested":{"model":task.model,"effort":task.effort},"effective":{"worker":worker,"agent":agent,"family":self.state.family,"model":agent.model,"effort":agent.effort},"needs":task.attributes.needs,
             "registeredCommand":registered,"actualCommand":actual_command,"stage":stage,"request":"request.json","revision":task.revision,
-            "workspaceId":task.workspace,"cwd":task.workdir(),"writable":task.writable,
+            "workspaceId":task.workspace,"cwd":cwd,
             "coordinatorVersion":env!("CARGO_PKG_VERSION"),"coordinatorBuild":crate::web::deployment()["digest"]});
-        let attempt =
-            Attempt { id: id(), revision: task.revision, stage: stage.clone(), started: now(), ended: None, result: None, error: None, evidence: AttemptEvidence { configuration: Some(settings), ..Default::default() } };
+        let attempt = Attempt {
+            id: id(),
+            revision: task.revision,
+            stage: stage.clone(),
+            started: now(),
+            ended: None,
+            result: None,
+            error: None,
+            evidence: AttemptEvidence { configuration: Some(settings), git: git.clone(), ..Default::default() },
+        };
         let mut request = self.request(task, &attempt.id)?;
+        if let Some(git) = &git {
+            request["task"]["cwd"] = json!(cwd);
+            let implemented = task.attempts.iter().rev().filter(|a| a.stage == "implementation").find_map(|a| a.evidence.git.as_ref());
+            let base = if stage == "replan" { implemented.map_or(&git["base"], |i| &i["base"]) } else { &git["base"] };
+            request["git"] = json!({"branch":git["branch"],"main":git["main"],"base":base,"worktree":git["worktree"]});
+            if git["conflict"] == true {
+                let note = format!("Merging {} into this branch left conflicts; resolve them and commit before continuing", git["main"].as_str().unwrap_or_default());
+                request["feedback"].as_array_mut().map(|f| f.insert(0, json!(note)));
+            }
+        }
         request["command"] = json!(command);
         request["run_id"] = json!(attempt.id);
         write(&self.attempt_path(&attempt.id).join("request.json"), &request)?;
@@ -1300,6 +1335,20 @@ impl Engine {
             Ok(Value::Null)
         })?;
         self.launch(&attempt_id)
+    }
+    fn return_conflicted(&mut self, index: usize, git: &Value) -> Result<()> {
+        let main = git["main"].as_str().unwrap_or_default().to_owned();
+        let branch = git["branch"].clone();
+        self.change(|state| {
+            let task = &mut state.tasks[index];
+            let from = task.stage.clone();
+            task.stage = "implementation".into();
+            task.feedback = vec![format!("{main} changed since this branch was implemented and no longer merges into it cleanly. The next attempt starts with {main} merged into the branch; resolve the conflicts, commit, and make sure the work still meets every criterion")];
+            task.record("merge_conflict", "git", json!({"branch":branch,"main":main,"stage":"review"}));
+            task.record_phase(&from, "git");
+            Ok(Value::Null)
+        })
+        .map(drop)
     }
     fn observe(task: &mut Task, directory: &Path) -> Result<bool> {
         let attempt = task.attempts.last_mut().unwrap();
@@ -1406,7 +1455,6 @@ impl Engine {
         for (index, child) in children.iter().enumerate() {
             let mut value = base(child, false, false);
             value["cwd"] = json!(task.cwd);
-            value["writable"] = json!(task.writable);
             value["localKey"] = json!(index.to_string());
             let after: Vec<usize> = serde_json::from_value(child.get("after").cloned().unwrap_or(json!([])))?;
             value["after"] = json!(after.iter().map(|i| json!({"local":i.to_string()})).collect::<Vec<_>>());
@@ -1433,14 +1481,28 @@ impl Engine {
         let log = fs::read_to_string(directory.join("log.txt")).unwrap_or_default();
         let usage_reset = result.is_err().then(|| crate::telemetry::usage_reset(&log)).flatten();
         let mut state = self.state.clone();
+        let finding_words = state.limits(&state.tasks[index]).finding_words;
         let task = &mut state.tasks[index];
         Self::observe(task, &directory)?;
         let previous_stage = task.stage.clone();
         task.active = None;
         let current = task.attempts.last().unwrap().revision == task.revision;
+        let name = task.short_id.clone().unwrap_or_else(|| task.id.clone());
         let attempt = task.attempts.last_mut().unwrap();
         attempt.ended = exit["ended"].as_u64();
+        if attempt.stage == "implementation"
+            && let Some(git) = attempt.evidence.git.as_mut()
+        {
+            match crate::git::finish(git, &name) {
+                Ok(head) => {
+                    attempt.evidence.changes = crate::git::changes(git, &head).ok();
+                    git["head"] = json!(head);
+                }
+                Err(error) => git["error"] = json!(error.to_string()),
+            }
+        }
         attempt.evidence.usage = read(&directory.join("usage.json")).ok();
+        attempt.evidence.cost = crate::telemetry::reported_cost(&directory.join("events.jsonl"));
         Self::measure(attempt, &directory)?;
         let mut deploy = false;
         let mut notice = None;
@@ -1500,6 +1562,20 @@ impl Engine {
                         status => {
                             task.stage = next_stage(status).unwrap().into();
                             deploy = status == "accepted" && task.attributes.deploy;
+                            let git = task.attempts.iter().rev().find(|a| a.stage == "implementation" && a.evidence.git.is_some()).and_then(|a| a.evidence.git.clone());
+                            if status == "accepted"
+                                && let Some(git) = git
+                            {
+                                match crate::git::merge(&git, &format!("{name} {}", task.title)) {
+                                    Ok(commit) => task.record("merged", "git", json!({"branch":git["branch"],"into":git["main"],"commit":commit})),
+                                    Err(error) => {
+                                        let main = git["main"].as_str().unwrap_or_default();
+                                        task.stage = "implementation".into();
+                                        deploy = false;
+                                        task.feedback = vec![history::clip(&format!("The branch could not merge into {main}: {error}. The next attempt starts with {main} merged into the branch; resolve the conflicts and commit"), finding_words)];
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1524,7 +1600,6 @@ impl Engine {
         evidence::clean_scratch(&directory, task.attempts.last().unwrap());
         let task_id = task.id.clone();
         self.commit(state)?;
-        metrics::clean(&directory);
         if deploy {
             self.pending_deploy = Some(task_id);
         }
@@ -1536,16 +1611,6 @@ impl Engine {
         let after = read::<Value>(&directory.join("project-after.json")).ok();
         if before.is_some() || after.is_some() {
             attempt.evidence.project_size = Some(json!({"delta":metrics::size_delta(before.as_ref().unwrap_or(&Value::Null),after.as_ref().unwrap_or(&Value::Null)),"before":before,"after":after}));
-        }
-        if let Some(configuration) = &attempt.evidence.configuration
-            && directory.join("baseline.json").exists()
-            && directory.join("final-snapshot.json").exists()
-        {
-            let base: PathBuf = serde_json::from_value(configuration["cwd"].clone())?;
-            let changes = directory.join("changes.json");
-            let mut changes = if changes.exists() { read::<Value>(&changes)? } else { metrics::compare(read(&directory.join("baseline.json"))?, read(&directory.join("final-snapshot.json"))?, &base, &[]) };
-            changes["attribution"] = json!(if attempt.evidence.project_overlapping_attempts.is_empty() { "scoped_observation" } else { "ambiguous" });
-            attempt.evidence.changes = Some(changes);
         }
         Ok(())
     }

@@ -65,7 +65,7 @@ pub fn intervals(created: &Event, task: &Task, through: Option<u64>) -> (Value, 
     (json!({"through":since,"initialBoardPauseKnown":created.evidence["boardPaused"].is_boolean(),"milliseconds":totals}), (stage, revision, stopped, blocked))
 }
 fn wait_bucket(reason: &str) -> &'static str {
-    [("Waiting for writable scope ", "resource"), ("Waiting for ", "dependency"), ("Retry scheduled at ", "retry")].into_iter().find_map(|(prefix, bucket)| reason.starts_with(prefix).then_some(bucket)).unwrap_or("queue")
+    [("Waiting for ", "dependency"), ("Retry scheduled at ", "retry")].into_iter().find_map(|(prefix, bucket)| reason.starts_with(prefix).then_some(bucket)).unwrap_or("queue")
 }
 #[derive(Serialize, Deserialize)]
 pub struct Snapshot {
@@ -78,11 +78,6 @@ pub struct Snapshot {
     elapsed_ms: u64,
     #[serde(default)]
     roots: Vec<PathBuf>,
-}
-pub fn clean(directory: &Path) {
-    for name in ["baseline.json", "final-snapshot.json"] {
-        let _ = fs::remove_file(directory.join(name));
-    }
 }
 #[derive(Serialize, Deserialize)]
 struct Fingerprint {
@@ -139,23 +134,6 @@ pub fn capture(roots: &[PathBuf], data: &Path) -> Snapshot {
     snapshot.elapsed_ms = clock.elapsed().as_millis() as u64;
     snapshot
 }
-fn common_lines(left: &[u64], right: &[u64]) -> usize {
-    let prefix = left.iter().zip(right).take_while(|(a, b)| a == b).count();
-    let (left, right) = (&left[prefix..], &right[prefix..]);
-    let suffix = left.iter().rev().zip(right.iter().rev()).take_while(|(a, b)| a == b).count();
-    let (left, right) = (&left[..left.len() - suffix], &right[..right.len() - suffix]);
-    let (left, right) = if left.len() < right.len() { (right, left) } else { (left, right) };
-    let mut row = vec![0; right.len() + 1];
-    for a in left {
-        let mut previous = 0;
-        for (column, b) in right.iter().enumerate() {
-            let above = row[column + 1];
-            row[column + 1] = if a == b { previous + 1 } else { above.max(row[column]) };
-            previous = above;
-        }
-    }
-    prefix + suffix + row[right.len()]
-}
 fn category(path: &Path) -> &'static str {
     let parts: Vec<_> = path.iter().map(|part| part.to_string_lossy().to_ascii_lowercase()).collect();
     let has = |names: &[&str]| parts.iter().any(|part| names.contains(&part.as_str()));
@@ -170,50 +148,6 @@ fn category(path: &Path) -> &'static str {
     .into_iter()
     .find_map(|(category, matches)| matches.then_some(category))
     .unwrap_or("other")
-}
-pub fn compare(before: Snapshot, after: Snapshot, base: &Path, peers: &[String]) -> Value {
-    let clock = std::time::Instant::now();
-    let mut files = Vec::new();
-    let skipped: BTreeSet<_> = before.skipped.union(&after.skipped).collect();
-    let paths: BTreeSet<_> = before.files.keys().chain(after.files.keys()).collect();
-    for path in paths {
-        if skipped.iter().any(|root| crate::engine::covers(root, path)) {
-            continue;
-        }
-        let old = before.files.get(path);
-        let new = after.files.get(path);
-        if old.zip(new).is_some_and(|(a, b)| a.bytes == b.bytes) {
-            continue;
-        }
-        let counts = lines(old).zip(lines(new)).map(|(old, new)| {
-            let common = common_lines(old, new);
-            (new.len() - common, old.len() - common)
-        });
-        let whitespace_only = old
-            .zip(new)
-            .and_then(|(old, new)| old.trimmed.as_ref().zip(new.trimmed.as_ref()))
-            .map(|(old, new)| old.iter().filter(|line| **line != fingerprint(b"")).eq(new.iter().filter(|line| **line != fingerprint(b""))));
-        files.push(json!({"path":path,"category":category(path.strip_prefix(base).unwrap_or(path)),
-            "beforeFingerprint":old.map(|f| format!("fnv1a64:{:016x}",f.bytes)),
-            "afterFingerprint":new.map(|f| format!("fnv1a64:{:016x}",f.bytes)),
-            "added":counts.map(|c| c.0),"deleted":counts.map(|c| c.1),"whitespaceOnly":whitespace_only}));
-    }
-    json!({"definitionVersion":METRIC_DEFINITION_VERSION,"before":before.at,"after":after.at,"files":files,
-        "comparisonOverheadMs":clock.elapsed().as_millis(),"totals":footprint(files.iter()),"scopeSize":{"before":size(&before, base),"after":size(&after, base)},"skipped":skipped,"overlappingAttempts":peers,
-        "attribution":if peers.is_empty() {"scoped_observation"} else {"ambiguous"},
-        "limitation":"Endpoint observations cannot identify external edits or changes reverted within an attempt"})
-}
-fn lines(file: Option<&Fingerprint>) -> Option<&[u64]> {
-    file.map_or(Some(&[]), |file| file.lines.as_deref())
-}
-fn footprint<'a>(files: impl Iterator<Item = &'a Value> + Clone) -> Value {
-    let paths: BTreeSet<_> = files.clone().filter_map(|file| file["path"].as_str()).collect();
-    let total = files.clone().count();
-    let counts = files.filter_map(|file| file["added"].as_u64().zip(file["deleted"].as_u64()));
-    let known = counts.clone().count();
-    let (added, deleted) = counts.fold((0_u128, 0_u128), |(a, d), (add, del)| (a + u128::from(add), d + u128::from(del)));
-    json!({"uniqueFiles":paths.len(),"added":added,"deleted":deleted,"net":added as i128 - deleted as i128,
-        "churn":added + deleted,"unknownLineCounts":total-known})
 }
 
 const EXCLUDED: &[&str] = &[".git", "target", "node_modules", "dist", "build", "coverage", "vendor", "generated", ".venv", "__pycache__", "data", "tmp"];

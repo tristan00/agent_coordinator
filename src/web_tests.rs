@@ -237,3 +237,34 @@ fn deployment_event_reads_recorded_handoffs() {
     std::fs::write(temp.path().join("deployment.json"), "{broken").unwrap();
     assert!(deployment_event(temp.path()).is_null());
 }
+
+#[test]
+fn planner_calls_are_attributed_and_their_rejections_and_transcript_are_recorded() {
+    let mut site = Site::new();
+    let run = site._temp.dir("run");
+    fs::write(run.join("events.jsonl"), "{\"coordinatorAt\":5,\"type\":\"system\"}\n{\"type\":\"result\"}\n{\"type\":\"assi").unwrap();
+    let planned = crate::sessions::Request { kind: "initial".into(), text: "Build".into(), run, started: 1, planner_ended: None, exit_code: None, usage: None, ended: None, error: None, rejected: Vec::new() };
+    let session = crate::sessions::Session { id: "s1".into(), workspace: site.ws.clone(), root: None, status: "running".into(), requests: vec![planned], conversation: None, notified: Default::default(), created: 1 };
+    site.engine.state.sessions.insert("s1".into(), session);
+    let spec = site.spec("Planned");
+    site.send(api(Method::Post, "/s/s1/api/tasks", spec));
+    site.send(api(Method::Post, "/s/s1/api/tasks", json!({"title":"No cwd"})));
+    site.send(api(Method::Get, "/s/s1/api/nothing", json!({})));
+    site.send(request(Method::Post, "/api/tasks", &site.spec("By hand").to_string(), &[("Host", host().as_str()), ("Content-Type", "application/json"), ("X-Coordinator-Actor", "ui")]));
+    site.send(api(Method::Post, "/api/tasks", site.spec("By a worker")));
+    let actors: Vec<(String, Option<String>)> = site.engine.state.tasks.iter().map(|t| (t.title.clone(), t.history[0].actor.clone())).collect();
+    assert_eq!(actors, [("Planned".into(), Some("planner:s1".into())), ("By hand".into(), Some("ui".into())), ("By a worker".into(), Some("agent".into()))]);
+    assert!(site.engine.actor.is_none());
+    let rejected = &site.engine.state.sessions["s1"].requests[0].rejected;
+    assert_eq!(rejected.iter().map(|r| (r["method"].as_str().unwrap(), r["path"].as_str().unwrap())).collect::<Vec<_>>(), [("POST", "/api/tasks"), ("GET", "/api/nothing")]);
+    assert!(rejected[0]["error"].as_str().unwrap().contains("Choose exactly one grouping") || rejected[0]["error"].as_str().unwrap().contains("required"));
+    assert!(!rejected[0]["error"].as_str().unwrap().contains("Example body"));
+    let view = crate::sessions::view(&site.engine, "s1").unwrap();
+    assert_eq!(view["actions"].as_array().unwrap().iter().map(|a| (a["kind"].as_str().unwrap(), a["title"].as_str().unwrap())).collect::<Vec<_>>(), [("created", "Planned")]);
+    let first = site.get("/api/sessions/s1/requests/1/events").unwrap().unwrap();
+    assert_eq!((first["lines"].as_array().unwrap().len(), first["lines"][0]["coordinatorAt"].as_u64(), first["finished"].as_bool()), (2, Some(5), Some(false)));
+    let next = first["next"].as_u64().unwrap();
+    let rest = site.get(&format!("/api/sessions/s1/requests/1/events?after={next}")).unwrap().unwrap();
+    assert_eq!((rest["lines"].as_array().unwrap().len(), rest["next"].as_u64()), (0, Some(next)));
+    assert!(site.get("/api/sessions/s1/requests/2/events").is_err());
+}

@@ -2,6 +2,7 @@
   "planner": "claude_opus_5_5_medium",
   "worker": "claude_sonnet_5_5_medium",
   "updates": "events",
+  "plannerWakeMinutes": 30,
   "limits": {
     "words": 150,
     "titleWords": 15,

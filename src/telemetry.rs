@@ -22,6 +22,14 @@ pub fn resource_usage(path: &std::path::Path) -> Option<Value> {
         .collect();
     Some(json!({"source":"events.jsonl:turn.completed","fields":fields}))
 }
+pub fn reported_cost(path: &std::path::Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let reported = text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter_map(|e| e["total_cost_usd"].as_f64()).reduce(f64::max);
+    Some(match reported {
+        Some(usd) => json!({"usd":usd,"source":"provider_reported","field":"total_cost_usd"}),
+        None => json!({"usd":null,"source":"not_reported"}),
+    })
+}
 pub fn total(components: &Value) -> Option<u64> {
     let value = |key: &str| components["fields"][key]["value"].as_u64();
     value("input_tokens")?.checked_add(value("output_tokens")?)

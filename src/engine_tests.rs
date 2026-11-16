@@ -283,18 +283,6 @@ fn keyed_create_revises_the_task_with_the_same_key_in_the_workspace() {
 }
 
 #[test]
-fn writable_paths_resolve_inside_the_workspace_and_reject_parent_components() {
-    let mut board = Board::new();
-    let id = board.create(board.with("Writable", json!({"writable":["sub/dir","sub/dir","sub\\dir"]})));
-    assert_eq!(board.task(&id).writable, [board.ws.join("sub").join("dir")]);
-    assert!(board.fail(board.with("Escape", json!({"writable":["../escape"]}))).contains("without '..'"));
-    assert!(board.fail(board.with("Empty", json!({"writable":[""]}))).contains("without '..'"));
-    let absolute = board.temp.dir("shared");
-    let id = board.create(board.with("Absolute", json!({"writable":[absolute]})));
-    assert_eq!(board.task(&id).writable, [absolute]);
-}
-
-#[test]
 fn scope_paths_cover_case_insensitively_and_ignore_trailing_dots() {
     assert!(covers(Path::new("C:\\Work\\Repo"), Path::new("c:\\work\\repo\\src\\main.rs")));
     assert!(covers(Path::new("C:\\Work\\Repo."), Path::new("C:\\Work\\Repo\\x")));
@@ -1476,4 +1464,71 @@ fn saved_lanes_become_roles_once() {
     let roles: Vec<_> = engine.state.tasks.iter().map(|t| t.attributes.role).collect();
     assert_eq!(roles, [Role::BackendCode, Role::UiCode, Role::Audit, Role::Worker]);
     assert!(engine.state.tasks[2].read_only());
+}
+
+#[test]
+fn accepted_work_merges_its_branch_and_a_failed_merge_returns_the_task_to_implementation() {
+    let mut board = Board::new();
+    let repository = board.temp.dir("workspace/game");
+    let git = |args: &[&str]| crate::git::run(&repository, args).unwrap();
+    git(&["init", "-q", "-b", "main"]);
+    fs::write(repository.join("a.txt"), "one\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "Baseline"]);
+    let run_with_branch = |board: &mut Board, title: &str, file: &str, text: &str| -> String {
+        let id = board.create(board.with(title, json!({"cwd":repository})));
+        let name = board.task(&id).short_id.clone().unwrap();
+        let prepared = crate::git::prepare(&board.ws, &repository, &name, &[], "implementation").unwrap().unwrap();
+        fs::write(PathBuf::from(prepared["worktree"].as_str().unwrap()).join(file), text).unwrap();
+        board.dispatch(&id);
+        let index = board.engine.task(&id).unwrap();
+        board.mutate(|state| state.tasks[index].attempts.last_mut().unwrap().evidence.git = Some(prepared));
+        board.complete(&id, outcome("completed", &["passed"]));
+        id
+    };
+    let first = run_with_branch(&mut board, "Add b", "b.txt", "two\n");
+    assert!(board.latest(&first).evidence.git.as_ref().unwrap()["head"].is_string());
+    board.run(&first, outcome("accepted", &["passed"]));
+    assert_eq!(board.task(&first).stage, "done");
+    assert!(repository.join("b.txt").exists() && board.kinds(&first).contains(&"merged".to_owned()));
+    let second = run_with_branch(&mut board, "Change a", "a.txt", "task\n");
+    fs::write(repository.join("a.txt"), "main\n").unwrap();
+    git(&["commit", "-q", "-am", "Main moved"]);
+    board.run(&second, outcome("accepted", &["passed"]));
+    assert_eq!(board.task(&second).stage, "implementation");
+    assert!(board.task(&second).feedback[0].starts_with("The branch could not merge into main"));
+}
+
+#[test]
+fn stopped_tasks_and_fully_stopped_containers_leave_in_progress() {
+    let mut board = Board::new();
+    let id = board.add("Halted");
+    board.run(&id, rejected());
+    assert_eq!(board.task(&id).status(), "In progress");
+    board.engine.control(true, Some(&id)).unwrap();
+    assert_eq!(board.task(&id).status(), "Stopped");
+    let group = board.create(board.container("Group"));
+    let first = board.create(board.child("First", &group));
+    let second = board.create(board.child("Second", &group));
+    let status = |board: &Board, id: &str| board.engine.task_value(board.task(id), false).unwrap()["status"].clone();
+    board.engine.control(true, Some(&first)).unwrap();
+    assert_ne!(status(&board, &group), "Stopped");
+    board.accept(&second);
+    assert_eq!((status(&board, &group), status(&board, &second)), (json!("Stopped"), json!("Done")));
+    board.engine.control(false, Some(&first)).unwrap();
+    assert_ne!(status(&board, &group), "Stopped");
+}
+
+#[test]
+fn a_review_that_cannot_merge_main_goes_back_to_implementation() {
+    let mut board = Board::new();
+    let id = board.add("Conflicted");
+    board.run(&id, outcome("completed", &["passed"]));
+    assert_eq!(board.task(&id).stage, "review");
+    let index = board.engine.task(&id).unwrap();
+    board.engine.return_conflicted(index, &json!({"main":"main","branch":"task/R1-1","conflict":true})).unwrap();
+    let task = board.task(&id);
+    assert_eq!((task.stage.as_str(), task.status()), ("implementation", "In progress"));
+    assert!(task.feedback[0].starts_with("main changed since this branch was implemented"));
+    assert!(board.kinds(&id).contains(&"merge_conflict".to_owned()));
 }

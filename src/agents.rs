@@ -1,6 +1,6 @@
 use crate::{Result, require};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -113,11 +113,6 @@ pub fn resolve(defined: &BTreeMap<String, Agent>, id: &str, family: Option<Famil
 pub fn enabled(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> BTreeMap<String, Agent> {
     let source = if defined.is_empty() { catalog() } else { defined.clone() };
     source.into_iter().filter(|(_, agent)| !agent.retired && agent.validate().is_ok() && agent.allowed(family)).collect()
-}
-pub fn listing(defined: &BTreeMap<String, Agent>, family: Option<Family>) -> Value {
-    let mut all = catalog();
-    all.extend(defined.clone());
-    json!({"family":family,"agents":all.into_iter().filter(|(_, a)| !a.retired).map(|(id, a)| json!({"id":id,"allowed":a.allowed(family),"planner":!a.worker_only,"worker":!a.planner_only,"agent":a})).collect::<Vec<_>>()})
 }
 #[cfg(test)]
 #[path = "agents_tests.rs"]

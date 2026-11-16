@@ -1,6 +1,7 @@
 import React, {useState, useEffect, useRef, useCallback, useMemo} from 'react';
 import {createRoot} from 'react-dom/client';
 import Graph from './Graph';
+import Planner from './Planner';
 import {AnimatedCount} from './Activity';
 import TaskName, {matchesTask} from './TaskName';
 import {ScopeBar, usePreference} from './Controls';
@@ -12,13 +13,13 @@ import './redesign.css';
 const readPreference = key => { try { return localStorage.getItem(key); } catch { return null; } };
 const savePreference = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
 
-const STATUSES = ['To do', 'In progress', 'Blocked', 'Review', 'Done'];
-const ROLES = ['worker', 'analytics', 'backend-code', 'ui-code', 'design', 'optimization', 'test', 'docs', 'data', 'audit'];
+const STATUSES = ['To do', 'In progress', 'Blocked', 'Review', 'Done', 'Stopped'];
+const ROLES = ['worker', 'analytics', 'backend-code', 'ui-code', 'design', 'optimization', 'test', 'docs', 'data', 'audit', 'abstraction'];
 const NEEDS = ['network', 'browser', 'process', 'gpu'];
 const SIZES = ['small', 'medium', 'large'];
 const ARTIFACTS = ['none', 'candidate', 'report'];
 const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'xhigh'];
-const PAGES = ['Board', 'List', 'Graph', 'Analytics', 'Settings'];
+const PAGES = ['Board', 'List', 'Graph', 'Planner', 'Analytics', 'Settings'];
 const words = text => (text || '').trim().split(/\s+/).filter(Boolean).length;
 const workspaceOf = t => t.workspace ?? t.cwd;
 const limitsFor = (state, path) => ({...state.versions.limits, ...(Object.entries(state.config.workspaces || {}).find(([k]) => pathKey(k) === pathKey(path))?.[1]?.limits || {})});
@@ -28,7 +29,7 @@ const dependencyError = (links, reasons) => links.some(d => !dependencyTarget(d)
 const when = ms => (ms ? new Date(ms).toLocaleString() : '');
 
 async function api(path, method = 'GET', body) {
-  const response = await fetch(path, {method, headers: {'Content-Type': 'application/json'}, body: body === undefined ? undefined : JSON.stringify(body)});
+  const response = await fetch(path, {method, headers: {'Content-Type': 'application/json', 'X-Coordinator-Actor': 'ui'}, body: body === undefined ? undefined : JSON.stringify(body)});
   const value = await response.json();
   if (!response.ok) throw Error(value.error || `Request failed (${response.status})`);
   return value;
@@ -134,10 +135,11 @@ function App() {
         </header>
         {error && <p className="error" role="alert">{error}</p>}
         {state.error && <p className="error">Scheduler: {state.error}</p>}
-        {page !== 'Settings' && <ScopeBar workspaces={workspaces} workspace={workspaces.find(path => pathKey(path) === pathKey(workspace)) || ''} setWorkspace={chooseWorkspace} allTasks={tasks} workspaceNames={state.workspaceIds} query={query} setQuery={setQuery} filters={filters} setFilters={setFilters} tasks={scoped} count={visible.length} total={scoped.length} showFilters={page !== 'Analytics'} />}
+        {page !== 'Settings' && <ScopeBar workspaces={workspaces} workspace={workspaces.find(path => pathKey(path) === pathKey(workspace)) || ''} setWorkspace={chooseWorkspace} allTasks={tasks} workspaceNames={state.workspaceIds} query={query} setQuery={setQuery} filters={filters} setFilters={setFilters} tasks={scoped} count={visible.length} total={scoped.length} showFilters={page !== 'Analytics' && page !== 'Planner'} />}
         {page === 'Board' && <div className="board page-enter">{STATUSES.map(column)}</div>}
         {page === 'List' && <table className="list page-enter"><thead><tr><th>Task</th><th>Status</th><th>Role</th><th>Languages</th><th>Functions</th><th>Execution capabilities</th><th>Blocked by</th><th>State</th></tr></thead><tbody>{visible.map(t => <tr key={t.id}><td><button className="link" onClick={() => setSelected(t.id)}><TaskName task={t} /></button></td><td>{t.status}</td><td>{t.attributes.role}</td><td>{categoryText(t.attributes, 'languages')}</td><td>{categoryText(t.attributes, 'functions')}</td><td>{t.attributes.needs.join(', ') || 'none'}</td><td>{t.dependencies.map(d => byId[typeof d === 'string' ? d : d.target]?.title).filter(Boolean).join(', ')}</td><td className={`reason ${phase(t, state.paused).tone}`}>{phase(t, state.paused).text}</td></tr>)}</tbody></table>}
         {page === 'Graph' && <Graph key={workspace} activityEnabled={!offline && !state.paused} workspace={workspace} tasks={visible} allTasks={tasks} select={setSelected} />}
+        {page === 'Planner' && <Planner workspace={workspace} tasks={tasks} select={setSelected} api={api} names={state.workspaceIds} />}
         {page === 'Analytics' && <Analytics workspace={workspace} select={setSelected} names={state.workspaceIds} />}
         {page === 'Settings' && <Settings state={state} act={act} />}
       </main>
@@ -155,7 +157,7 @@ function Editor({task, tasks, state, workspace, close}) {
     languages: task?.attributes.languages || [], functions: task?.attributes.functions || [],
     size: task?.attributes.size || 'small', artifact: task?.attributes.artifact || 'none', deploy: !!task?.attributes.deploy,
     dependencies: task?.dependencies || [], after: task?.after || [], conflicts: task?.conflicts || [], related: task?.related || [], parent: task?.parent || '',
-    writable: (task?.writable || []).join('\n'), model: task?.model || '', effort: task?.effort || '',
+    model: task?.model || '', effort: task?.effort || '',
   }));
   const [error, setError] = useState('');
   const [grouping, setGrouping] = useState(task?.parent ? 'parent' : task?.standalone ? 'standalone' : '');
@@ -180,7 +182,7 @@ function Editor({task, tasks, state, workspace, close}) {
     const acceptance = form.acceptance.map(c => c.trim()).filter(Boolean);
     const body = {title: form.title, outcome: form.outcome, acceptance, cwd: form.cwd,
       dependencies: form.dependencies, after: form.after, conflicts: form.conflicts, related: form.related,
-      writable: form.writable.split('\n').map(w => w.trim()).filter(Boolean), model: form.model || null, effort: form.effort || null,
+      model: form.model || null, effort: form.effort || null,
       attributes: {languages: form.languages, functions: form.functions, role: form.role, needs: form.needs, priority: Number(form.priority), size: form.size, artifact: form.artifact, deploy: form.deploy}};
     if (!task || groupingChanged) Object.assign(body, grouping === 'parent' ? {parent: form.parent, standalone: false} : {parent: null, standalone: true});
     setBusy(true);
@@ -207,7 +209,6 @@ function Editor({task, tasks, state, workspace, close}) {
         <Dependencies value={form.dependencies} change={v => set('dependencies', v)} options={others.map(t => ({value: t.id, label: t.title}))} reasons={dependencyReasons(state)} invalid={setError} />
         <div className="row">{pick('after')}</div>
         <div className="row">{pick('conflicts')}{pick('related')}</div>
-        <label>Writable paths (one per line)<textarea rows="2" value={form.writable} onChange={e => set('writable', e.target.value)} /></label>
         <div className="row">
           <label>Model<input value={form.model} onChange={e => set('model', e.target.value)} placeholder="Default" /></label>
           <label>Effort<select value={form.effort} onChange={e => set('effort', e.target.value)}>{EFFORTS.map(v => <option key={v} value={v}>{v || 'Default'}</option>)}</select></label>

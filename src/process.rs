@@ -123,11 +123,6 @@ pub fn supervise(directory: &Path) -> Result<()> {
         if let Err(error) = crate::metrics::project_capture(directory, &request, false) {
             let _ = write(&directory.join("measurement-error.json"), &json!({"at":now(),"error":error.to_string()}));
         }
-        let scope: Vec<PathBuf> = serde_json::from_value(request["task"]["writable"].clone())?;
-        if !scope.is_empty() && !directory.join("baseline.json").exists() {
-            let data = directory.parent().and_then(Path::parent).ok_or("Missing data directory")?;
-            write(&directory.join("baseline.json"), &crate::metrics::capture(&scope, data))?;
-        }
         if directory.join("stop").exists() {
             return Ok(json!({"stopped":true}));
         }
@@ -172,13 +167,6 @@ pub fn supervise(directory: &Path) -> Result<()> {
     let mut outcome = run().unwrap_or_else(|error| json!({"error":error.to_string()}));
     job.drain()?;
     outcome["ended"] = json!(now());
-    if directory.join("baseline.json").exists()
-        && outcome["interrupted"] != true
-        && !directory.join("final-snapshot.json").exists()
-        && let Err(error) = capture_final(directory)
-    {
-        eprintln!("Could not record final scope snapshot: {error}");
-    }
     if outcome["interrupted"] != true
         && let Ok(request) = read::<Value>(&directory.join("request.json"))
         && let Err(error) = crate::metrics::project_capture(directory, &request, true)
@@ -191,15 +179,6 @@ pub fn supervise(directory: &Path) -> Result<()> {
         let _ = write(&directory.join("usage.json"), &Usage { total_tokens: crate::telemetry::total(&components), components: Some(components), source: "codex_completed_turn_events".into() });
     }
     write(&directory.join("exit.json"), &outcome)
-}
-fn capture_final(directory: &Path) -> Result<()> {
-    let request: Value = read(&directory.join("request.json"))?;
-    let scope: Vec<PathBuf> = serde_json::from_value(request["task"]["writable"].clone())?;
-    let data = directory.parent().and_then(Path::parent).ok_or("Missing data directory")?;
-    let snapshot = crate::metrics::capture(&scope, data);
-    write(&directory.join("final-snapshot.json"), &snapshot)?;
-    let base = Path::new(request["task"]["cwd"].as_str().ok_or("Missing cwd")?);
-    write(&directory.join("changes.json"), &crate::metrics::compare(read(&directory.join("baseline.json"))?, snapshot, base, &[]))
 }
 pub fn worker() -> Result<()> {
     let mut input = String::new();
@@ -254,8 +233,8 @@ fn task_view(request: &Value) -> Value {
     let task = &request["task"];
     let mut view = json!({"id":task["id"],"title":task["title"],"outcome":task["outcome"],"acceptance":task["acceptance"],"cwd":task["cwd"],
         "role":task["role"],"needs":task["needs"],"languages":task["languages"],"functions":task["functions"]});
-    for (key, value) in [("artifact", &task["artifact"]), ("writable", &task["writable"]), ("feedback", &request["feedback"]), ("dependencies", &request["dependencies"]),
-        ("scratch", &request["scratch"]), ("implementation", &request["implementation"]), ("recentAttempts", &request["recentAttempts"]), ("capabilities", &request["capabilities"])] {
+    for (key, value) in [("artifact", &task["artifact"]), ("feedback", &request["feedback"]), ("dependencies", &request["dependencies"]),
+        ("scratch", &request["scratch"]), ("implementation", &request["implementation"]), ("recentAttempts", &request["recentAttempts"]), ("capabilities", &request["capabilities"]), ("git", &request["git"])] {
         if !(value.is_null() || value.as_array().is_some_and(Vec::is_empty)) {
             view[key] = value.clone();
         }

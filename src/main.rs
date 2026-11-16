@@ -1,8 +1,10 @@
 mod adapters;
+mod api;
 mod agents;
 mod analytics;
 mod engine;
 mod evidence;
+mod git;
 mod history;
 mod kill_guard;
 mod metrics;

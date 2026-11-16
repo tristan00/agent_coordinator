@@ -58,9 +58,6 @@ struct UpdateQuery {
     after: Option<u64>,
     wait: u64,
 }
-fn schema_hint(error: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error + Send + Sync> {
-    format!("{error}. Allowed values and this workspace's limits: GET /api/task-schema?workspace=W").into()
-}
 fn update_query(url: &str) -> Result<UpdateQuery> {
     let mut query = UpdateQuery { workspace: None, after: None, wait: 0 };
     for pair in url.split_once('?').map_or("", |(_, query)| query).split('&').filter(|pair| !pair.is_empty()) {
@@ -80,11 +77,21 @@ struct Parked {
     query: UpdateQuery,
     until: Instant,
 }
+fn planner_route(url: &str) -> (Option<String>, String) {
+    if let Some(rest) = url.strip_prefix("/s/") {
+        let (id, tail) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+        if !id.is_empty() {
+            return (Some(decode(id)), if tail.starts_with('/') { tail.to_owned() } else { format!("/{tail}") });
+        }
+    }
+    (None, url.to_owned())
+}
 fn parkable(request: &Request, engine: &Engine, port: u16) -> Option<UpdateQuery> {
-    if request.method().as_str() != "GET" || request.url().split('?').next() != Some("/api/updates") || !authorized(request, port) {
+    let (_, url) = planner_route(request.url());
+    if request.method().as_str() != "GET" || url.split('?').next() != Some("/api/updates") || !authorized(request, port) {
         return None;
     }
-    update_query(request.url())
+    update_query(&url)
         .ok()
         .filter(|query| query.wait > 0 && engine.state.settings(query.workspace.as_deref()).updates == crate::history::Updates::Events && !engine.changed_since(query.workspace.as_deref(), query.after))
 }
@@ -100,7 +107,10 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
     if !authorized(&request, port) {
         return send(request, 403, json!({"error":"Invalid host or origin"}));
     }
-    let full = request.url().to_owned();
+    let (planner, full) = planner_route(request.url());
+    let ui = request.headers().iter().any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Coordinator-Actor") && h.value.as_str() == "ui");
+    let actor = planner.as_ref().map_or_else(|| if ui { "ui".to_owned() } else { "agent".to_owned() }, |id| format!("planner:{id}"));
+    let reject = |engine: &mut Engine, method: &str, error: &str| planner.as_ref().map_or(Ok(()), |id| crate::sessions::rejected(engine, id, method, &full, error));
     let url = full.split('?').next().unwrap().to_owned();
     let method = request.method().as_str().to_owned();
     let parts: Vec<_> = url.split('/').collect();
@@ -129,53 +139,67 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
         }
         return match get(engine, &parts, &full, error) {
             Ok(Some(value)) => send(request, 200, value),
-            Ok(None) => send(request, 404, json!({"error":"Not found"})),
-            Err(error) => send(request, 500, json!({"error":error.to_string()})),
+            Ok(None) => {
+                let _ = reject(engine, &method, "Not found");
+                send(request, 404, json!({"error":"Not found. GET /api lists every route"}))
+            }
+            Err(error) => {
+                let _ = reject(engine, &method, &error.to_string());
+                send(request, 500, json!({"error":error.to_string()}))
+            }
         };
     }
     if !request.headers().iter().any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Content-Type") && h.value.as_str().starts_with("application/json")) {
+        let _ = reject(engine, &method, "Use application/json");
         return send(request, 415, json!({"error":"Use application/json"}));
     }
     let outcome = (|| -> Result<Value> {
         let mut body = String::new();
         request.as_reader().read_to_string(&mut body)?;
         let input: Value = serde_json::from_str(if body.is_empty() { "{}" } else { &body })?;
-        match (method.as_str(), parts.as_slice()) {
-            ("POST", ["", "api", "deployment"]) => crate::redeploy::enqueue(input, &engine.directory, port),
-            ("POST", ["", "api", "deployment", "quiesce"]) => {
-                crate::require(input["expected"] == deployment()["digest"] && input["expected"].is_string(), "Running coordinator identity changed")?;
-                crate::redeploy::authorize_handoff(&engine.directory, &input)?;
-                *shutdown = true;
-                Ok(json!({"ready":true,"paused":engine.state.paused}))
-            }
-            ("POST", ["", "api", "analytics"]) => crate::analytics::report(&engine.state, input),
-            ("POST", ["", "api", "deployment", "handoff"]) => {
-                crate::require(input["expected"] == deployment()["digest"] && input["expected"].is_string(), "Running coordinator identity changed")?;
-                let event = handoff(engine, input["action"].as_str().ok_or("Missing deployment action")?, port)?;
-                *shutdown = true;
-                Ok(event)
-            }
-            ("POST", ["", "api", "wipe"]) => engine.wipe(),
-            ("POST", ["", "api", "sessions"]) => crate::sessions::create(engine, input),
-            ("POST", ["", "api", "sessions", id, "messages"]) => crate::sessions::message(engine, id, input),
-            ("POST", ["", "api", "sessions", id, "deliver"]) => crate::sessions::deliver_now(engine, id),
-            ("POST", ["", "api", "sessions", id, "stop"]) => crate::sessions::stop(engine, id),
-            ("POST", ["", "api", "tasks"]) => engine.create(input).map_err(schema_hint),
-            ("POST", ["", "api", "workspaces"]) => crate::workspace_prompts::create(engine, input, &crate::workspace_prompts::root()),
-            ("POST", ["", "api", "workspaces", "generate"]) => crate::workspace_prompts::generate(engine, input, &crate::workspace_prompts::root()),
-            ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input).map_err(schema_hint),
-            ("PATCH", ["", "api", "tasks", id]) => engine.edit(id, input),
-            ("POST", ["", "api", "tasks", id, "replan"]) => engine.request_replan(id, input),
-            ("DELETE", ["", "api", "tasks", id]) => engine.remove(id).map(|()| json!({"ok":true})),
-            ("PUT", ["", "api", "config"]) => engine.configure(input).map(|()| json!({"ok":true})),
-            ("POST", ["", "api", action @ ("stop" | "resume")]) => engine.control(*action == "stop", None).map(|()| json!({"ok":true})),
-            ("POST", ["", "api", "tasks", id, action @ ("stop" | "resume")]) => engine.control(*action == "stop", Some(id)).map(|()| json!({"ok":true})),
-            _ => Err("Unknown route".into()),
-        }
+        engine.actor = Some(actor);
+        let result = dispatch(engine, &method, &parts, input, port, shutdown);
+        engine.actor = None;
+        result
     })();
     match outcome {
         Ok(value) => send(request, if method == "POST" && url == "/api/tasks" { 201 } else { 200 }, value),
-        Err(error) => send(request, 400, json!({"error":error.to_string()})),
+        Err(error) => {
+            let _ = reject(engine, &method, &error.to_string());
+            send(request, 400, json!({"error":crate::api::hint(&method, &parts, &error.to_string())}))
+        }
+    }
+}
+pub(crate) fn dispatch(engine: &mut Engine, method: &str, parts: &[&str], input: Value, port: u16, shutdown: &mut bool) -> Result<Value> {
+    match (method, parts) {
+        ("POST", ["", "api", "deployment"]) => crate::redeploy::enqueue(input, &engine.directory, port),
+        ("POST", ["", "api", "deployment", "quiesce"]) => {
+            crate::require(input["expected"] == deployment()["digest"] && input["expected"].is_string(), "Running coordinator identity changed")?;
+            crate::redeploy::authorize_handoff(&engine.directory, &input)?;
+            *shutdown = true;
+            Ok(json!({"ready":true,"paused":engine.state.paused}))
+        }
+        ("POST", ["", "api", "analytics"]) => crate::analytics::report(&engine.state, input),
+        ("POST", ["", "api", "deployment", "handoff"]) => {
+            crate::require(input["expected"] == deployment()["digest"] && input["expected"].is_string(), "Running coordinator identity changed")?;
+            let event = handoff(engine, input["action"].as_str().ok_or("Missing deployment action")?, port)?;
+            *shutdown = true;
+            Ok(event)
+        }
+        ("POST", ["", "api", "wipe"]) => engine.wipe(),
+        ("POST", ["", "api", "sessions"]) => crate::sessions::create(engine, input),
+        ("POST", ["", "api", "sessions", id, "messages"]) => crate::sessions::message(engine, id, input),
+        ("POST", ["", "api", "sessions", id, "stop"]) => crate::sessions::stop(engine, id),
+        ("POST", ["", "api", "tasks"]) => engine.create(input),
+        ("POST", ["", "api", "workspaces"]) => crate::workspace_prompts::create(engine, input, &crate::workspace_prompts::root()),
+        ("POST", ["", "api", "tasks", "batch"]) => engine.create_batch(input),
+        ("PATCH", ["", "api", "tasks", id]) => engine.edit(id, input),
+        ("POST", ["", "api", "tasks", id, "replan"]) => engine.request_replan(id, input),
+        ("DELETE", ["", "api", "tasks", id]) => engine.remove(id).map(|()| json!({"ok":true})),
+        ("PUT", ["", "api", "config"]) => engine.configure(input).map(|()| json!({"ok":true})),
+        ("POST", ["", "api", action @ ("stop" | "resume")]) => engine.control(*action == "stop", None).map(|()| json!({"ok":true})),
+        ("POST", ["", "api", "tasks", id, action @ ("stop" | "resume")]) => engine.control(*action == "stop", Some(id)).map(|()| json!({"ok":true})),
+        _ => Err("Unknown route".into()),
     }
 }
 fn handoff(engine: &mut Engine, action: &str, port: u16) -> Result<Value> {
@@ -210,6 +234,7 @@ fn handoff(engine: &mut Engine, action: &str, port: u16) -> Result<Value> {
 }
 fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<Option<Value>> {
     let value = match parts {
+        ["", "api"] => crate::api::index(),
         ["", "api", "updates"] => {
             let query = update_query(full)?;
             engine.updates(query.workspace.as_deref(), query.after, error)
@@ -218,12 +243,12 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
         ["", "api", "tasks"] => engine.scoped_tasks(update_query(full)?.workspace.as_deref())?,
         ["", "api", "task-schema"] => engine.state.task_schema(update_query(full)?.workspace.as_deref()),
         ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
-        ["", "api", "prompt-candidates"] => crate::workspace_prompts::catalog(&crate::workspace_prompts::root())?,
         ["", "api", "workspaces", "defaults"] => crate::workspace_prompts::defaults(&crate::workspace_prompts::root())?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
         ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
         ["", "api", "sessions"] => crate::sessions::list(engine)?,
         ["", "api", "sessions", id] => crate::sessions::view(engine, id)?,
+        ["", "api", "sessions", id, "requests", number, "events"] => crate::sessions::transcript(engine, id, number, update_query(full)?.after.unwrap_or(0))?,
         ["", "api", "kill-guard"] => json!({"directory":crate::kill_guard::install(&engine.directory)?,"variable":crate::kill_guard::VARIABLE}),
         ["", "api", "state"] => {
             engine.sync_waiting()?;

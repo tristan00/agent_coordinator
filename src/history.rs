@@ -47,10 +47,16 @@ pub struct WorkspaceSettings {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub agents: std::collections::BTreeMap<String, crate::agents::Agent>,
     pub prompts: Option<crate::workspace_prompts::Selection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_wake_minutes: Option<u64>,
 }
 impl WorkspaceSettings {
+    pub fn wake_minutes(&self) -> u64 {
+        self.planner_wake_minutes.unwrap_or(30)
+    }
     pub fn validate(&self, family: Option<crate::agents::Family>) -> Result<()> {
         self.limits.validate()?;
+        crate::require(self.wake_minutes() > 0, "plannerWakeMinutes must be at least 1")?;
         crate::require(!self.agent("planner", family)?.worker_only, format!("Agent {} can only be a worker", self.planner.as_deref().unwrap_or_default()))?;
         crate::require(!self.agent("worker", family)?.planner_only, format!("Agent {} can only be a planner", self.worker.as_deref().unwrap_or_default()))
     }
@@ -85,8 +91,9 @@ pub enum Role {
     Docs,
     Data,
     Audit,
+    Abstraction,
 }
-pub const ROLES: [&str; 10] = ["worker", "analytics", "backend-code", "ui-code", "design", "optimization", "test", "docs", "data", "audit"];
+pub const ROLES: [&str; 11] = ["worker", "analytics", "backend-code", "ui-code", "design", "optimization", "test", "docs", "data", "audit", "abstraction"];
 impl Role {
     pub fn name(self) -> &'static str {
         ROLES[self as usize]
@@ -197,6 +204,8 @@ pub struct Event {
     pub kind: String,
     provenance: String,
     pub evidence: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 impl Event {
     pub fn new(task: &crate::engine::Task, kind: &str, source: &str, evidence: Value) -> Self {
@@ -210,6 +219,7 @@ impl Event {
             kind: kind.into(),
             provenance: source.into(),
             evidence,
+            actor: None,
         }
     }
     pub fn attempt(mut self, id: &str, revision: u64, at: Option<u64>) -> Self {
@@ -229,6 +239,8 @@ pub struct AttemptEvidence {
     pub project_size: Option<Value>,
     pub usage: Option<Usage>,
     pub cost: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<Value>,
     pub overlapping_attempts: Vec<String>,
     pub project_overlapping_attempts: Vec<String>,
 }
