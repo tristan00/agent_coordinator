@@ -9,7 +9,7 @@ fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name, value).unwrap()
 }
 fn send(request: Request, status: u16, value: Value) -> Result<()> {
-    let response = Response::from_string(value.to_string()).with_status_code(status).with_header(header("Content-Type", "application/json")).with_header(header("Cache-Control", "no-store"));
+    let response = Response::from_string(value.to_string()).with_status_code(status).with_header(header("Content-Type", "application/json")).with_header(header("Cache-Control", "no-store")).with_header(header("Connection", "close"));
     let _ = request.respond(response);
     Ok(())
 }
@@ -123,7 +123,7 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
         };
         if let Some((body, mime)) = asset {
             request.respond(
-                Response::from_string(body).with_header(header("Content-Type", mime)).with_header(header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'")),
+                Response::from_string(body).with_header(header("Content-Type", mime)).with_header(header("Cache-Control", "no-cache")).with_header(header("Connection", "close")).with_header(header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'")),
             )?;
             return Ok(());
         }
@@ -132,10 +132,10 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
         {
             let file = engine.attempt_path(id).join("log.txt");
             if file.exists() {
-                request.respond(Response::from_file(File::open(file)?).with_header(header("Content-Type", "text/plain; charset=utf-8")))?;
+                request.respond(Response::from_file(File::open(file)?).with_header(header("Content-Type", "text/plain; charset=utf-8")).with_header(header("Connection", "close")))?;
                 return Ok(());
             }
-            return Ok(request.respond(Response::from_string("Worker has not produced a log yet."))?);
+            return Ok(request.respond(Response::from_string("Worker has not produced a log yet.").with_header(header("Connection", "close")))?);
         }
         return match get(engine, &parts, &full, error) {
             Ok(Some(value)) => send(request, 200, value),
@@ -384,29 +384,43 @@ fn notify(engine: &mut Engine) {
         }
     }
 }
-pub fn serve() -> Result<()> {
+pub fn serve(inherited: usize) -> Result<()> {
     let directory = data_directory()?;
     let _guard = lock(&directory.join("server.lock"))?;
     let mut engine = Engine::new(directory)?;
     let server = Server::http(format!("127.0.0.1:{}", std::env::var("PORT").unwrap_or_else(|_| "4242".into())))?;
     let port = server.server_addr().to_ip().unwrap().port();
     write(&engine.directory.join("port.json"), &port)?;
-    println!("Coordinator: http://127.0.0.1:{port}");
+    println!("Coordinator: http://127.0.0.1:{port} (closed {inherited} inherited sockets)");
     let mut last_tick = Instant::now();
     let mut error = String::new();
     let mut shutdown = false;
     let mut parked = Vec::new();
     while !shutdown {
-        if let Some(request) = server.recv_timeout(Duration::from_millis(100))? {
+        let mut next = server.recv_timeout(Duration::from_millis(100))?;
+        while let Some(request) = next.take() {
+            let started = Instant::now();
+            let label = format!("{} {}", request.method(), request.url().split('?').next().unwrap_or_default());
             if let Some(query) = parkable(&request, &engine, port) {
                 let until = Instant::now() + Duration::from_secs(query.wait);
                 parked.push(Parked { request, query, until });
             } else if let Err(failure) = handle(request, &mut engine, port, &error, &mut shutdown) {
                 eprintln!("{failure}");
             }
+            slow(&engine.directory, &label, started);
+            if !shutdown {
+                next = server.try_recv()?;
+            }
         }
         if !shutdown && last_tick.elapsed() >= Duration::from_millis(100) {
-            error = engine.tick().and_then(|()| crate::sessions::tick(&mut engine)).err().map(|e| e.to_string()).unwrap_or_default();
+            let started = Instant::now();
+            error = engine.tick().err().map(|e| e.to_string()).unwrap_or_default();
+            slow(&engine.directory, "scheduler", started);
+            let started = Instant::now();
+            if let Err(failure) = crate::sessions::tick(&mut engine) {
+                error = failure.to_string();
+            }
+            slow(&engine.directory, "planner sessions", started);
             last_tick = Instant::now();
             if let Some(id) = engine.pending_deploy.take() {
                 match handoff(&mut engine, &id, port) {
@@ -419,6 +433,13 @@ pub fn serve() -> Result<()> {
         parked = release(parked, &engine, &error, shutdown);
     }
     Ok(())
+}
+fn slow(directory: &Path, what: &str, started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_secs(1) {
+        let line = json!({"at":crate::now(),"what":what,"ms":elapsed.as_millis() as u64}).to_string() + "\n";
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(directory.join("slow.jsonl")).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
 }
 pub(crate) fn deployment_reviewed(task: &Task) -> bool {
     task.stage == "done" && task.attempts.iter().rev().any(|attempt| attempt.revision == task.revision && attempt.stage == "review" && attempt.result.as_ref().is_some_and(|result| result["status"] == "accepted"))

@@ -51,6 +51,7 @@ fn main() -> Result<()> {
     if let Some(tool) = kill_guard::tool() {
         kill_guard::run(tool);
     }
+    let inherited = process::close_inherited_sockets();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--identity") => {
@@ -66,6 +67,6 @@ fn main() -> Result<()> {
         Some("--planner") => sessions::run(Path::new(args.get(2).ok_or("Missing planner run directory")?)),
         Some("--deploy") => web::deploy(args.get(2).ok_or("Supply a task ID or rollback")?),
         Some("--finish-deploy") => web::finish_deploy(),
-        _ => web::serve(),
+        _ => web::serve(inherited),
     }
 }

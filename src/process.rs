@@ -15,6 +15,36 @@ use windows_sys::Win32::{
         JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     },
 };
+fn sockets() -> Vec<usize> {
+    use windows_sys::Win32::Foundation::GetHandleInformation;
+    use windows_sys::Win32::Networking::WinSock::{SO_TYPE, SOCKET, SOL_SOCKET, WSADATA, WSAStartup, getsockopt};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    let mut data: WSADATA = unsafe { std::mem::zeroed() };
+    unsafe { WSAStartup(0x202, &mut data) };
+    let mut total = 0u32;
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut total) };
+    let (mut seen, mut found) = (0u32, Vec::new());
+    let mut value = 4usize;
+    while seen < total && value < 1 << 24 {
+        let mut flags = 0u32;
+        if unsafe { GetHandleInformation(value as HANDLE, &mut flags) } != 0 {
+            seen += 1;
+            let (mut kind, mut length) = (0i32, 4i32);
+            if unsafe { getsockopt(value as SOCKET, SOL_SOCKET, SO_TYPE, (&mut kind as *mut i32).cast(), &mut length) } == 0 {
+                found.push(value);
+            }
+        }
+        value += 4;
+    }
+    found
+}
+pub fn close_inherited_sockets() -> usize {
+    let found = sockets();
+    for socket in &found {
+        unsafe { windows_sys::Win32::Networking::WinSock::closesocket(*socket as windows_sys::Win32::Networking::WinSock::SOCKET) };
+    }
+    found.len()
+}
 pub fn command(program: &str) -> Command {
     let mut command = Command::new(program);
     command.creation_flags(0x08000000);

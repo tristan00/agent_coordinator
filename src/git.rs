@@ -102,9 +102,32 @@ pub fn merge(git: &Value, message: &str) -> Result<String> {
         let _ = run(repository, &["merge", "--abort"]);
         return Err(error);
     }
-    let _ = run(repository, &["worktree", "remove", "--force", worktree]);
-    let _ = run(repository, &["branch", "-D", branch]);
-    run(repository, &["rev-parse", "HEAD"])
+    let head = run(repository, &["rev-parse", "HEAD"])?;
+    discard(repository, Path::new(worktree), branch);
+    Ok(head)
+}
+fn discard(repository: &Path, worktree: &Path, branch: &str) {
+    let (repository, worktree, branch) = (repository.to_path_buf(), worktree.to_path_buf(), branch.to_owned());
+    let trash = PathBuf::from(format!("{}.removed-{}", shown(&worktree), crate::now()));
+    if std::fs::rename(&worktree, &trash).is_ok() {
+        let _ = run(&repository, &["worktree", "prune"]);
+        let _ = run(&repository, &["branch", "-D", &branch]);
+        if let Some(parent) = worktree.parent().map(Path::to_path_buf) {
+            std::thread::spawn(move || sweep(&parent));
+        }
+    } else {
+        std::thread::spawn(move || {
+            let _ = run(&repository, &["worktree", "remove", "--force", &shown(&worktree)]);
+            let _ = run(&repository, &["branch", "-D", &branch]);
+        });
+    }
+}
+pub fn sweep(worktrees: &Path) {
+    for entry in std::fs::read_dir(worktrees).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().contains(".removed-") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
