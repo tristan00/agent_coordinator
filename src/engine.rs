@@ -164,6 +164,7 @@ impl Task {
         match self.stage.as_str() {
             "done" => "Done",
             "review" => "Review",
+            _ if self.blocked && self.active.is_none() => "Blocked",
             _ if self.active.is_some() || !self.attempts.is_empty() || self.stage == "replan" => "In progress",
             _ => "To do",
         }

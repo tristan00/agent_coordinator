@@ -46,20 +46,6 @@ fn csv(value: &str) -> String {
     }
 }
 
-fn redact(value: String) -> String {
-    let mut output = value;
-    for marker in ["Bearer ", "HARNESS_RUN_TOKEN=", "HARNESS_API_TOKEN=", "HARNESS_JUDGMENT_TOKEN="] {
-        while let Some(start) = output.find(marker) {
-            let value_start = start + marker.len();
-            let end = output[value_start..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-                .map_or(output.len(), |offset| value_start + offset);
-            output.replace_range(value_start..end, "[REDACTED]");
-        }
-    }
-    output
-}
-
 fn event_record(event: &Value) -> Option<(&'static str, String, String, String)> {
     let item = &event["item"];
     if event["type"] == "item.completed" {
@@ -136,7 +122,7 @@ pub fn capture_agent_activity(directory: &Path, request: &Value) -> crate::Resul
         let target = event["item"]["command"].as_str().unwrap_or_default();
         writeln!(output, "{},{},{},{},{},{},{},{},{},{}",
             csv(&timestamp), csv(task), csv(task_id), csv(run), csv(agent), csv(kind),
-            csv(&operation), csv(&status), csv(target), csv(&redact(details)))?;
+            csv(&operation), csv(&status), csv(target), csv(&details))?;
     }
     output.sync_data()?;
     Ok(())

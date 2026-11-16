@@ -191,6 +191,10 @@ pub fn agents_guide(workspace: &Path, port: u16, updates: crate::history::Update
          Keep everything you create under `{w}`: code, data, downloads, scripts, logs and scratch files. \
          Do not write to the system temp folder or any folder outside this workspace. \
          `TEMP`, `TMP` and `TMPDIR` already point to a private folder under `{w}\\tmp`, so `/tmp` and temp-file libraries stay inside the workspace.\n\n\
+         ## Track the work with git\n\n\
+         Each request folder is a git repository; if it is not one yet, run `git init` there and add a `.gitignore` for build output, downloads and scratch files. \
+         When you finish your work, commit only the files you changed, with a message that starts with your task's short id. \
+         Reviewers use `git log` and `git diff` to see what each task changed. Never rewrite history or commit another agent's changes; if git reports a lock, wait and retry.\n\n\
          ## Delivering results\n\n\
          Each request runs in its own request folder inside this workspace, and names a deliverable folder inside that request folder. \
          `GET /api/sessions/{{id}}` shows them as `workspace` and `deliverable`. \
@@ -198,7 +202,7 @@ pub fn agents_guide(workspace: &Path, port: u16, updates: crate::history::Update
          - The deliverable folder is copied out by itself, so it must contain everything the result needs and work without anything outside it, \
          including the rest of the workspace. Use paths relative to the folder.\n\
          - Whenever the deliverable folder holds a complete, working version, `POST /api/sessions/{{id}}/deliver` with the body `{{}}`. \
-         Each delivery replaces the previous one, so deliver the first working version early and again after each improvement.\n\
+         Each delivery is kept as a new numbered copy, so deliver the first working version early and again after each improvement.\n\
          - Planners have the session id in `$COORDINATOR_SESSION`.\n\
          - When the planner ends its turn, the coordinator makes one final delivery once no task can still run. \
          If the request is stopped first, only what was already delivered is handed in.\n\

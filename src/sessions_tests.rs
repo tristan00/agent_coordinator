@@ -86,6 +86,34 @@ fn the_session_stays_open_while_tasks_can_still_run_and_follow_ups_resume_it() {
 }
 
 #[test]
+fn an_idle_planner_is_resumed_once_with_tasks_that_need_a_decision() {
+    let temp = Temp::new();
+    let (mut engine, source) = setup(&temp, "exit 0");
+    let case = source.join("case");
+    let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First","output":temp.path().join("out"),"deliverable":"submission"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.create(json!({"title":"Needs a call","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();
+    engine.change(|state| {
+        let task = &mut state.tasks[0];
+        task.blocked = true;
+        task.failure = "Replanned work failed again; a decision is needed".into();
+        Ok(Value::Null)
+    }).unwrap();
+    assert_eq!(engine.state.tasks[0].status(), "Blocked");
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    let session = &engine.state.sessions[&id];
+    assert_eq!((session.status.as_str(), session.requests.len()), ("running", 2));
+    let wake: Value = read(&session.requests[1].run.join("request.json")).unwrap();
+    let prompt = wake["prompt"].as_str().unwrap();
+    assert!(prompt.starts_with("These tasks are blocked and need your decision") && prompt.contains("Needs a call") && prompt.contains("a decision is needed"));
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    assert_eq!((engine.state.sessions[&id].status.as_str(), engine.state.sessions[&id].requests.len()), ("waiting", 2));
+}
+
+#[test]
 fn deliveries_copy_snapshots_and_stop_ends_the_session() {
     let temp = Temp::new();
     let (mut engine, source) = setup(&temp, "exit 0");

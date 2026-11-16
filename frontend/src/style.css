@@ -31,7 +31,7 @@ main { padding: 16px 24px; min-width: 0; }
 .pill.warn { color: var(--warn); }
 .filters { display: flex; gap: 12px; align-items: center; margin: 14px 0; flex-wrap: wrap; }
 .filters input[type=search] { max-width: 320px; }
-.board { display: grid; grid-template-columns: repeat(4, minmax(200px, 1fr)); gap: 12px; align-items: start; }
+.board { display: grid; grid-template-columns: repeat(5, minmax(180px, 1fr)); gap: 12px; align-items: start; }
 .column { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
 .column h2 { font-size: 13px; margin: 0; display: flex; justify-content: space-between; color: var(--muted); }
 .task { border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 6px; padding: 8px; background: var(--bg); }

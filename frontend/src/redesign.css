@@ -123,7 +123,7 @@ dialog.drawer > * { margin: 0; }
 .badge { display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 99px; font-size: 11.5px; font-weight: 700; background: var(--soft); color: var(--muted); }
 .badge.live, .badge.status-inprogress { background: color-mix(in srgb, var(--live) 20%, transparent); color: var(--live); }
 .badge.good, .badge.status-done { background: color-mix(in srgb, var(--good) 20%, transparent); color: var(--good); }
-.badge.bad { background: color-mix(in srgb, var(--bad) 20%, transparent); color: var(--bad); }
+.badge.bad, .badge.status-blocked { background: color-mix(in srgb, var(--bad) 20%, transparent); color: var(--bad); }
 .badge.status-review { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
 .stat-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .stat { padding: 9px 11px; border-radius: 9px; background: var(--bg); border: 1px solid color-mix(in srgb, var(--line) 45%, transparent); }

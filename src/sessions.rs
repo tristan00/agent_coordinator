@@ -36,6 +36,8 @@ pub struct Session {
     pub outbox: Vec<Value>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub retry_at: u64,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub decisions: BTreeSet<String>,
     pub created: u64,
 }
 
@@ -80,6 +82,22 @@ pub fn can_still_run(task: &Task) -> bool {
     !task.container() && (task.active.is_some() || !(task.stage == "done" || task.stopped || task.blocked))
 }
 
+pub fn needs_decision(task: &Task) -> bool {
+    !task.container() && task.blocked && task.active.is_none() && !task.stopped && task.stage != "done"
+}
+
+fn decision_key(task: &Task) -> String {
+    format!("{}:{}", task.id, task.attempts.len())
+}
+
+fn decision_prompt(tasks: &[&Task]) -> String {
+    let list: Vec<String> = tasks.iter().map(|t| format!("- {} {} (GET $COORDINATOR_URL/api/tasks/{}): {}", t.short_id.as_deref().unwrap_or(&t.id), t.title, t.id, t.failure)).collect();
+    format!(
+        "These tasks are blocked and need your decision:\n{}\n\nFor each one, correct it, ask for a replan, resume it, replace it with new tasks or delete it. Then keep leading the request.",
+        list.join("\n")
+    )
+}
+
 pub fn create(engine: &mut Engine, input: Value) -> Result<Value> {
     let source = workspace(Path::new(input["workspace"].as_str().ok_or("workspace is required")?))?;
     let settings = engine.state.config.workspaces.get(&source).cloned().ok_or_else(|| format!("{} is not a configured workspace", source.display()))?;
@@ -105,19 +123,19 @@ pub fn create(engine: &mut Engine, input: Value) -> Result<Value> {
     require(!engine.state.sessions.values().any(|s| s.workspace == directory && s.status == "running"), "A session is already running in this workspace")?;
     fs::create_dir_all(&output)?;
     let id = id();
-    let session = Session { id: id.clone(), workspace: directory.clone(), root: Some(source.clone()), output, deliverable: deliverable.to_string_lossy().replace('\\', "/"), callback, status: "running".into(), requests: Vec::new(), deliveries: 0, conversation: None, outbox: Vec::new(), retry_at: 0, created: now() };
+    let session = Session { id: id.clone(), workspace: directory.clone(), root: Some(source.clone()), output, deliverable: deliverable.to_string_lossy().replace('\\', "/"), callback, status: "running".into(), requests: Vec::new(), deliveries: 0, conversation: None, outbox: Vec::new(), retry_at: 0, decisions: BTreeSet::new(), created: now() };
     engine.change(|state| {
         state.sessions.insert(id.clone(), session);
         Ok(Value::Null)
     })?;
-    start(engine, &id, text)?;
+    start(engine, &id, text, false)?;
     view(engine, &id)
 }
 
 pub fn message(engine: &mut Engine, id: &str, input: Value) -> Result<Value> {
     let text = input["request"].as_str().filter(|text| !text.trim().is_empty()).ok_or("request text is required")?.to_owned();
     require(session(engine, id)?.status == "waiting", "The session is still working on its current request")?;
-    start(engine, id, text)?;
+    start(engine, id, text, false)?;
     view(engine, id)
 }
 
@@ -132,12 +150,12 @@ fn prompt(session: &Session, text: &str, first: bool, instructions: &str) -> Str
     format!(
         "You are the planner of the agent coordinator for the request folder {w}, inside the workspace {root}, which is your working directory.\n\
          Plan the request as coordinator tasks; workers implement and review them. The coordinator is at $COORDINATOR_URL and the request folder is $COORDINATOR_WORKSPACE (W). GET $COORDINATOR_URL/api/task-schema?workspace=W lists the task fields and limits, GET $COORDINATOR_URL/api/tasks?workspace=W lists your tasks, and POST $COORDINATOR_URL/api/tasks creates one.\n\
-         The deliverable is the folder {deliverable}. Whenever it holds a complete version, POST an empty JSON object to $COORDINATOR_URL/api/sessions/$COORDINATOR_SESSION/deliver; each delivery replaces the previous one. When you end your turn the request finishes once no task can still run, and a final delivery is made then.\n\
+         The deliverable is the folder {deliverable}. Whenever it holds a complete version, POST an empty JSON object to $COORDINATOR_URL/api/sessions/$COORDINATOR_SESSION/deliver; each delivery is kept as a new numbered copy. When you end your turn the request finishes once no task can still run, and a final delivery is made then. If a task is blocked and needs your decision while you are not running, the coordinator resumes you with it.\n\
          No one is available to answer questions during the work; make decisions yourself.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}"
     )
 }
 
-fn start(engine: &mut Engine, id: &str, text: String) -> Result<()> {
+fn start(engine: &mut Engine, id: &str, text: String, wake: bool) -> Result<()> {
     let session = session(engine, id)?.clone();
     let settings = engine.state.settings(Some(&session.workspace));
     let agent = settings.agent("planner", engine.state.family)?;
@@ -145,7 +163,8 @@ fn start(engine: &mut Engine, id: &str, text: String) -> Result<()> {
     let run = engine.directory.join("sessions").join(id).join((session.requests.len() + 1).to_string());
     fs::create_dir_all(&run)?;
     let port: u16 = read(&engine.directory.join("port.json")).unwrap_or(4242);
-    write(&run.join("request.json"), &json!({"session":id,"workspace":session.workspace,"root":session.root.as_ref().unwrap_or(&session.workspace),"prompt":prompt(&session, &text, session.requests.is_empty(), &instructions),"agent":agent,
+    let text_prompt = if wake { text.clone() } else { prompt(&session, &text, session.requests.is_empty(), &instructions) };
+    write(&run.join("request.json"), &json!({"session":id,"workspace":session.workspace,"root":session.root.as_ref().unwrap_or(&session.workspace),"prompt":text_prompt,"agent":agent,
         "conversation":session.conversation,"command":engine.state.config.planner,"url":format!("http://127.0.0.1:{port}")}))?;
     write(&run.join("launch-intent.json"), &json!({"at":now()}))?;
     let request = Request { text, run: run.clone(), started: now(), planner_ended: None, exit_code: None, usage: None, ended: None, delivery: None, error: None };
@@ -280,6 +299,17 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
                 r.error = exit["error"].as_str().map(str::to_owned);
                 Ok(Value::Null)
             })?;
+            continue;
+        }
+        let blocked: Vec<&Task> = engine.state.tasks.iter().filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && needs_decision(t) && !session.decisions.contains(&decision_key(t))).collect();
+        if !blocked.is_empty() {
+            let keys: Vec<String> = blocked.iter().map(|t| decision_key(t)).collect();
+            let text = decision_prompt(&blocked);
+            engine.change(|state| {
+                state.sessions.get_mut(&id).ok_or("Unknown session")?.decisions.extend(keys);
+                Ok(Value::Null)
+            })?;
+            start(engine, &id, text, true)?;
             continue;
         }
         if engine.state.tasks.iter().any(|t| engine.state.in_scope(t, Some(&session.workspace)) && can_still_run(t)) {

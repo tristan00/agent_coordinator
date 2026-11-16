@@ -111,7 +111,7 @@ fn capture_agent_activity_appends_workspace_scoped_csv_rows() {
     let attempt = temp.dir("attempt");
     fs::write(
         attempt.join("events.jsonl"),
-        r#"{"type":"item.completed","timestamp":"2026-11-13T23:00:00Z","item":{"type":"command_execution","command":"python run.py","exit_code":0,"aggregated_output":"ok"}}"#,
+        r#"{"type":"item.completed","timestamp":"2026-11-13T23:00:00Z","item":{"type":"command_execution","command":"python run.py","exit_code":0,"aggregated_output":"Authorization: Bearer abc"}}"#,
     ).unwrap();
     let request = json!({
         "run_id":"run-1",
@@ -122,6 +122,7 @@ fn capture_agent_activity_appends_workspace_scoped_csv_rows() {
     let csv = fs::read_to_string(workspace.join("agent_activity.csv")).unwrap();
     assert!(csv.starts_with("timestamp,task,task_id,run_id,agent,kind,operation,status,target,details\n"));
     assert!(csv.contains("2026-11-13T23:00:00Z,Build game,task-1,run-1,test-agent,command,python run.py,0"));
+    assert!(csv.contains("Authorization: Bearer abc"));
 }
 
 #[test]

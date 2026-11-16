@@ -72,7 +72,7 @@ export function display(field, t) {
 }
 
 const PALETTE = ['#6e9bff', '#f2b45a', '#5ccf8d', '#f27b8a', '#b48cf2', '#4fc8e8', '#f59a5b', '#7fd4c1', '#d9d36a', '#e88ad6'];
-const TONES = {'To do': '#8b95a7', 'In progress': '#4fa8ff', Review: '#f2b45a', Done: '#5ccf8d', Running: '#4fa8ff', Stopped: '#8b95a7', Idle: '#6e7a8f', 'Needs decision': '#f27b8a'};
+const TONES = {'To do': '#8b95a7', 'In progress': '#4fa8ff', Blocked: '#f27b8a', Review: '#f2b45a', Done: '#5ccf8d', Running: '#4fa8ff', Stopped: '#8b95a7', Idle: '#6e7a8f', 'Needs decision': '#f27b8a'};
 
 export function colorScale(field, tasks) {
   if (!field) return null;

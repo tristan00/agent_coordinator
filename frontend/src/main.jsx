@@ -12,7 +12,7 @@ import './redesign.css';
 const readPreference = key => { try { return localStorage.getItem(key); } catch { return null; } };
 const savePreference = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
 
-const STATUSES = ['To do', 'In progress', 'Review', 'Done'];
+const STATUSES = ['To do', 'In progress', 'Blocked', 'Review', 'Done'];
 const ROLES = ['worker', 'analytics', 'backend-code', 'ui-code', 'design', 'optimization', 'test', 'docs', 'data', 'audit'];
 const NEEDS = ['network', 'browser', 'process', 'gpu'];
 const SIZES = ['small', 'medium', 'large'];
