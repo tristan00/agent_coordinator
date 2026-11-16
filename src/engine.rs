@@ -144,6 +144,16 @@ impl Task {
     pub fn read_only(&self) -> bool {
         matches!(self.attributes.role, Role::Audit | Role::Playtest)
     }
+    pub fn failed_attempts(&self) -> usize {
+        self.attempts
+            .iter()
+            .filter(|a| a.error.is_none() && match a.stage.as_str() {
+                "review" => a.status() == Some("rejected"),
+                "implementation" => a.result.is_some() && a.status() != Some("completed"),
+                _ => false,
+            })
+            .count()
+    }
     pub(crate) fn worker_model(&self) -> Option<&str> {
         self.attributes.model.as_deref().filter(|_| self.stage == "implementation")
     }
@@ -1254,7 +1264,7 @@ impl Engine {
         let home = produced.filter(|_| stage == "review").map_or_else(|| directory.clone(), |a| self.attempt_path(&a.id));
         let settings = self.state.settings(task.workspace.as_deref());
         settings.validate(self.state.family)?;
-        let (worker, agent) = settings.task_agent(task.worker_model(), self.state.family)?;
+        let (worker, agent) = settings.stage_agent(task.worker_model(), stage, task.failed_attempts(), self.state.family)?;
         let protocol = crate::workspace_prompts::worker(&crate::workspace_prompts::root(), &settings, task.attributes.role, stage)?;
         let mut request = json!({"stage":stage,"task":{"id":task.id,"revision":task.revision,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,
             "workspace":task.workspace,"cwd":task.workdir(),"model":agent.model,"effort":agent.effort,"role":task.attributes.role,"needs":task.attributes.needs,"artifact":evidence::artifact_name(task.attributes.artifact).map(|name| home.join(name)),
@@ -1286,7 +1296,7 @@ impl Engine {
             command[0] = std::env::current_exe()?.to_string_lossy().into_owned();
         }
         let workspace_settings = self.state.settings(task.workspace.as_deref());
-        let (worker, agent) = workspace_settings.task_agent(task.worker_model(), self.state.family)?;
+        let (worker, agent) = workspace_settings.stage_agent(task.worker_model(), &stage, task.failed_attempts(), self.state.family)?;
         if !process::local_agent(registered) {
             require(command.iter().any(|arg| arg == "{model}") && command.iter().any(|arg| arg.contains("{effort}")), "Worker command requires explicit {model} and {effort} placeholders")?;
         }

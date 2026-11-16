@@ -136,3 +136,19 @@ fn events_number_sequentially_and_take_attempt_details() {
     let unchanged = Event::new(&task, "x", "test", Value::Null);
     assert_eq!(unchanged.clone().attempt("a3", 1, None).at, unchanged.at);
 }
+
+#[test]
+fn reviews_use_the_review_model_and_implementation_escalates_after_a_failure() {
+    let settings: WorkspaceSettings = serde_json::from_value(serde_json::json!({"planner":"claude_opus_5_5_medium","worker":"claude_sonnet_5_5_medium","reviewer":"claude_opus_5_5_medium","escalation":"claude_opus_5_5_medium","escalateAfter":1})).unwrap();
+    let family = Some(crate::agents::Family::Claude);
+    settings.validate(family).unwrap();
+    let pick = |requested: Option<&str>, stage: &str, failures: usize| settings.stage_agent(requested, stage, failures, family).unwrap().0;
+    assert_eq!(pick(None, "review", 0), "claude_opus_5_5_medium");
+    assert_eq!(pick(None, "implementation", 0), "claude_sonnet_5_5_medium");
+    assert_eq!(pick(None, "implementation", 1), "claude_opus_5_5_medium");
+    assert_eq!(pick(None, "replan", 3), "claude_sonnet_5_5_medium");
+    assert_eq!(pick(Some("claude_sonnet_5_5_medium"), "implementation", 2), "claude_sonnet_5_5_medium");
+    let plain: WorkspaceSettings = serde_json::from_value(serde_json::json!({"planner":"claude_opus_5_5_medium","worker":"claude_sonnet_5_5_medium"})).unwrap();
+    assert_eq!(plain.stage_agent(None, "review", 5, family).unwrap().0, "claude_sonnet_5_5_medium");
+    assert!(plain.task_agent(Some("claude_opus_5_5_medium"), family).is_err());
+}

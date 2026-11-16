@@ -51,6 +51,12 @@ pub struct WorkspaceSettings {
     pub planner_wake_minutes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compute_alert_cpu_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalate_after: Option<u64>,
 }
 impl WorkspaceSettings {
     pub fn wake_minutes(&self) -> u64 {
@@ -63,6 +69,10 @@ impl WorkspaceSettings {
         self.limits.validate()?;
         crate::require(self.wake_minutes() > 0, "plannerWakeMinutes must be at least 1")?;
         crate::require(self.compute_alert_seconds() > 0.0, "computeAlertCpuMinutes must be at least 1")?;
+        crate::require(self.escalate_after.is_none_or(|n| n > 0), "escalateAfter must be at least 1")?;
+        for id in self.reviewer.iter().chain(&self.escalation) {
+            crate::agents::resolve(&self.agents, id, family)?;
+        }
         crate::require(!self.agent("planner", family)?.worker_only, format!("Agent {} can only be a worker", self.planner.as_deref().unwrap_or_default()))?;
         crate::require(!self.agent("worker", family)?.planner_only, format!("Agent {} can only be a planner", self.worker.as_deref().unwrap_or_default()))
     }
@@ -77,6 +87,17 @@ impl WorkspaceSettings {
         let agent = crate::agents::resolve(&self.agents, id, family)?;
         crate::require(!agent.planner_only, format!("Agent {id} can only be a planner"))?;
         Ok((id.to_owned(), agent))
+    }
+    pub fn stage_agent(&self, requested: Option<&str>, stage: &str, failures: usize, family: Option<crate::agents::Family>) -> Result<(String, crate::agents::Agent)> {
+        let chosen = match stage {
+            "review" => self.reviewer.as_deref(),
+            "implementation" if requested.is_none() && failures as u64 >= self.escalate_after.unwrap_or(1) => self.escalation.as_deref(),
+            _ => None,
+        };
+        match chosen {
+            Some(id) => Ok((id.to_owned(), crate::agents::resolve(&self.agents, id, family)?)),
+            None => self.task_agent(requested, family),
+        }
     }
     pub fn agent(&self, role: &str, family: Option<crate::agents::Family>) -> Result<crate::agents::Agent> {
         let id = if role == "planner" { &self.planner } else { &self.worker };

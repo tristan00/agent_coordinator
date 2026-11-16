@@ -4,6 +4,9 @@
   "updates": "events",
   "plannerWakeMinutes": 30,
   "computeAlertCpuMinutes": 120,
+  "reviewer": "claude_opus_5_5_medium",
+  "escalation": "claude_opus_5_5_medium",
+  "escalateAfter": 1,
   "limits": {
     "words": 150,
     "titleWords": 15,

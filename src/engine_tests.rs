@@ -1557,3 +1557,16 @@ fn board_views_carry_attempt_counts_not_the_attempt_history() {
     let full = board.engine.task_value(&task, true).unwrap();
     assert_eq!(full["attempts"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn rejected_reviews_and_unfinished_work_count_as_failures_but_crashes_do_not() {
+    let mut board = Board::new();
+    let id = board.add("Counted");
+    assert_eq!(board.task(&id).failed_attempts(), 0);
+    board.run(&id, outcome("completed", &["passed"]));
+    board.run(&id, rejected());
+    assert_eq!(board.task(&id).failed_attempts(), 1);
+    board.dispatch(&id);
+    board.finish(&id, json!({"code":1,"ended":now(),"error":"Worker crashed"}), None);
+    assert_eq!(board.task(&id).failed_attempts(), 1);
+}
