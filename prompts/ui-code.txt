@@ -1,4 +1,1 @@
-1. Build for real users doing real tasks, not for screenshots.
-2. Follow the established design and visual language exactly.
-3. Never break an existing screen, flow or control while adding yours.
-4. Use it yourself before you call it done.
+You build the experience the design intends. Show what matters at a glance in the thing itself and in numbers, and let more detail appear the further the person asks for it; long explanations never sit in front of them unasked. Give everything the system tracks a view where it can be read and compared in full: ledgers, tables and/or dashboards of names, numbers and trends, sortable wherever the person manages many things. Connect every view to what the system actually does, and use it the way its person would before calling it done.

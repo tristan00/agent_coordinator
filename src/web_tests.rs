@@ -244,7 +244,7 @@ fn planner_calls_are_attributed_and_their_rejections_and_transcript_are_recorded
     let run = site._temp.dir("run");
     fs::write(run.join("events.jsonl"), "{\"coordinatorAt\":5,\"type\":\"system\"}\n{\"type\":\"result\"}\n{\"type\":\"assi").unwrap();
     let planned = crate::sessions::Request { kind: "initial".into(), text: "Build".into(), run, started: 1, planner_ended: None, exit_code: None, usage: None, ended: None, error: None, rejected: Vec::new() };
-    let session = crate::sessions::Session { id: "s1".into(), workspace: site.ws.clone(), root: None, status: "running".into(), requests: vec![planned], conversation: None, notified: Default::default(), created: 1 };
+    let session = crate::sessions::Session { id: "s1".into(), workspace: site.ws.clone(), root: None, status: "running".into(), requests: vec![planned], conversation: None, notified: Default::default(), wake_error: None, created: 1 };
     site.engine.state.sessions.insert("s1".into(), session);
     let spec = site.spec("Planned");
     site.send(api(Method::Post, "/s/s1/api/tasks", spec));

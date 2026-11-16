@@ -259,7 +259,7 @@ pub fn external() -> Result<()> {
 fn action(request: &Value, stage: &str) -> String {
     if stage == "replan" {
         return format!(
-            "This task is blocked or failed review repeatedly. Inspect task.cwd read-only and recentAttempts, then return a plan that can succeed with the listed capabilities. Prefer splitting into small isolated children: one concern and one role each, at most {} runnable criteria, title under {} words, under {} words. Order siblings with after indices. Dependencies require target/reason records: uses_artifact, uses_api, uses_schema or uses_data; use after, or nothing otherwise. Child dependency targets may be sibling indices or existing task IDs. Preserve existing dependencies on rewrites. With no children, the plan replaces the task definition. Never put task ids, hashes or coordination instructions in text. Return held only when a decision only the user can make is required; name it in one finding.",
+            "This task is blocked or keeps failing review. Read task.cwd and recentAttempts without editing, then return a plan that can succeed with the listed capabilities: a rewritten task, or smaller children with one concern and one role each. Keep each within {} criteria, {}-word titles and {} words. Order children with after; add a dependency only for a real artifact, API, schema or data link, targeting a sibling index or an existing task id, and keep existing ones. Keep ids and coordination out of the text. Return held only for a decision only the user can make.",
             limit(request, "criteria"),
             limit(request, "titleWords"),
             limit(request, "words")
@@ -267,13 +267,13 @@ fn action(request: &Value, stage: &str) -> String {
     }
     match stage {
         "review" => {
-            "Independently verify the implementation in task.cwd against each acceptance criterion, read-only. Run the checks yourself; do not trust the implementation summary. Return criteria with one outcome per criterion in order. accepted only if every criterion passed. rejected if any failed; each finding states the failing behavior for the whole class of inputs. blocked only if a required check cannot run in the available environment."
+            "Check the work in task.cwd against each criterion yourself, without editing it or trusting its summary. Report one result per criterion, in order: accepted if all pass; rejected if any fail, saying what fails and when; blocked only if a check can't run here."
         }
         _ if request["readOnly"] == true => {
-            "Perform the read-only audit of task.cwd against the acceptance criteria. Write the report to the absolute path in task.artifact. Return criteria with one outcome per criterion in order; completed only if every criterion passed."
+            "Inspect task.cwd against the criteria without editing it, and write the report to task.artifact. Report one result per criterion, in order: completed only if all pass."
         }
         _ => {
-            "Implement the task outcome in task.cwd and run checks proving each acceptance criterion. If feedback lists failed criteria, fix the cause for the whole class of inputs, not only the cited example. Use scratch for disposable files. If task.artifact is set, write that exact absolute path. Return criteria with one outcome per criterion in order; completed only if every criterion passed. Otherwise return blocked with a blocker kind and one finding."
+            "Deliver the outcome in task.cwd and check each acceptance criterion. When feedback names a failure, fix its cause, not just the example. Put throwaway files in scratch, and anything requested in task.artifact. Report one result per criterion, in order: completed if all pass, otherwise blocked with the reason."
         }
     }
     .into()

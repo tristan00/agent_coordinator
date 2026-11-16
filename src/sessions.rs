@@ -25,6 +25,8 @@ pub struct Session {
     pub conversation: Option<String>,
     #[serde(default, alias = "decisions", skip_serializing_if = "BTreeSet::is_empty")]
     pub notified: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_error: Option<String>,
     pub created: u64,
 }
 
@@ -145,7 +147,7 @@ pub fn create(engine: &mut Engine, input: Value) -> Result<Value> {
     require(!engine.state.sessions.values().any(|s| s.workspace == directory && s.status == "running"), "A session is already running in this directory")?;
     repository(&directory)?;
     let id = id();
-    let session = Session { id: id.clone(), workspace: directory.clone(), root: Some(source.clone()), status: "running".into(), requests: Vec::new(), conversation: None, notified: BTreeSet::new(), created: now() };
+    let session = Session { id: id.clone(), workspace: directory.clone(), root: Some(source.clone()), status: "running".into(), requests: Vec::new(), conversation: None, notified: BTreeSet::new(), wake_error: None, created: now() };
     engine.change(|state| {
         state.sessions.insert(id.clone(), session);
         Ok(Value::Null)
@@ -175,16 +177,13 @@ pub fn message(engine: &mut Engine, id: &str, input: Value) -> Result<Value> {
 
 fn prompt(session: &Session, text: &str, first: bool, instructions: &str, minutes: u64) -> String {
     if !first {
-        return format!("New request from the same user. The workspace and request folder are unchanged.\n\n{text}");
+        return format!("New request in the same folder:\n\n{text}");
     }
     let clean = |path: &Path| path.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
     let w = clean(&session.workspace);
     let root = clean(session.root.as_deref().unwrap_or(&session.workspace));
     format!(
-        "You are the planner of the agent coordinator for the request folder {w}, inside the workspace {root}, which is your working directory.\n\
-         Plan the request as coordinator tasks; workers implement and review them. The coordinator is at $COORDINATOR_URL and the request folder is $COORDINATOR_WORKSPACE (W). GET $COORDINATOR_URL/api/task-schema?workspace=W lists the task fields and limits, GET $COORDINATOR_URL/api/tasks?workspace=W lists your tasks, and POST $COORDINATOR_URL/api/tasks creates one.\n\
-         The request folder is the result. Once your tasks are in place, end your turn; do not wait for or poll them. The coordinator resumes you when a task needs your decision, every {minutes} minutes while work runs with what finished in the meantime, and when nothing more can run; the request finishes when you end a turn with no task left that can run.\n\
-         No one is available to answer questions during the work; make decisions yourself.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}"
+        "You plan the request in {w}, inside the workspace {root}. Create tasks through the coordinator at $COORDINATOR_URL; AGENTS.md lists its endpoints. When your tasks are in place, end your turn. The coordinator brings you results every {minutes} minutes, decisions as they come up, and a final check when nothing more can run.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}"
     )
 }
 
@@ -300,11 +299,19 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
             let summary = board(&scoped, since);
             let text = wake_prompt(&finished.iter().map(|(_, t)| *t).collect::<Vec<_>>(), &blocked.iter().map(|(_, t)| *t).collect::<Vec<_>>(), summary, idle, minutes);
             let keys: Vec<String> = finished.into_iter().chain(blocked).map(|(k, _)| k).collect();
-            engine.change(|state| {
-                state.sessions.get_mut(&id).ok_or("Unknown session")?.notified.extend(keys);
-                Ok(Value::Null)
-            })?;
-            start(engine, &id, text, "wake")?;
+            match start(engine, &id, text, "wake") {
+                Ok(()) => engine.change(|state| {
+                    let s = state.sessions.get_mut(&id).ok_or("Unknown session")?;
+                    s.notified.extend(keys);
+                    s.wake_error = None;
+                    Ok(Value::Null)
+                })?,
+                Err(error) if session.wake_error.as_deref() != Some(error.to_string().as_str()) => engine.change(|state| {
+                    state.sessions.get_mut(&id).ok_or("Unknown session")?.wake_error = Some(error.to_string());
+                    Ok(Value::Null)
+                })?,
+                Err(_) => Value::Null,
+            };
             continue;
         }
         if !idle {

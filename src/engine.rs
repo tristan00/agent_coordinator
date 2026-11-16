@@ -142,7 +142,7 @@ impl Task {
         self.acceptance.is_empty()
     }
     pub fn read_only(&self) -> bool {
-        self.attributes.role == Role::Audit
+        matches!(self.attributes.role, Role::Audit | Role::Playtest)
     }
     pub(crate) fn worker_model(&self) -> Option<&str> {
         self.attributes.model.as_deref().filter(|_| self.stage == "implementation")
@@ -535,7 +535,7 @@ impl State {
         })
     }
     pub fn task_schema(&self, key: Option<&Path>) -> Value {
-        json!({"roles":history::ROLES,"roleNotes":{"worker":"General worker; the default when no other role fits","audit":"Read-only: inspects and reports, never edits files","abstraction":"Finds the principles behind examples and what else they cover"},"sizes":history::SIZES,"needs":history::NEEDS,"artifacts":history::ARTIFACTS,
+        json!({"roles":history::ROLES,"roleNotes":{"worker":"Default when no other role fits","analytics":"Reports what data shows","backend-code":"Builds system logic and interfaces","ui-code":"Builds screens and controls","design":"Decides how the product looks and feels","optimization":"Makes things faster or cheaper","test":"Finds and reproduces failures","docs":"Writes how to install, run and use","data":"Fetches and prepares data, with sources","audit":"Read-only: inspects and reports","abstraction":"Finds the principles behind examples","playtest":"Plays it as its person would","research":"Finds what is known, with sources","art":"Makes what people see and hear"},"sizes":history::SIZES,"needs":history::NEEDS,"artifacts":history::ARTIFACTS,
             "priority":"0 (highest) to 3; omitted means 2","dependencyReasons":DEPENDENCY_REASONS,"classifications":history::classification_schema(),"limits":self.settings(key).limits.value()})
     }
     pub fn models(&self, key: Option<&Path>) -> Value {

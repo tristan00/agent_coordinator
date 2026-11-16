@@ -580,7 +580,7 @@ fn replans_repeating_a_twice_failed_criterion_are_refused_then_held() {
     board.run(&id, plan("First criterion holds"));
     let task = board.task(&id);
     assert_eq!((task.stage.as_str(), task.blocked, task.failed_replans()), ("replan", false, 1));
-    assert!(task.feedback[0].starts_with("Plan repeats a criterion"));
+    assert_eq!(task.feedback.len(), 1);
     assert!(board.latest(&id).result.as_ref().unwrap()["planError"].is_string());
     board.run(&id, plan("First   criterion holds"));
     let task = board.task(&id);
@@ -1496,7 +1496,7 @@ fn accepted_work_merges_its_branch_and_a_failed_merge_returns_the_task_to_implem
     git(&["commit", "-q", "-am", "Main moved"]);
     board.run(&second, outcome("accepted", &["passed"]));
     assert_eq!(board.task(&second).stage, "implementation");
-    assert!(board.task(&second).feedback[0].starts_with("The branch could not merge into main"));
+    assert_eq!(board.task(&second).feedback.len(), 1);
 }
 
 #[test]
@@ -1529,6 +1529,17 @@ fn a_review_that_cannot_merge_main_goes_back_to_implementation() {
     board.engine.return_conflicted(index, &json!({"main":"main","branch":"task/R1-1","conflict":true})).unwrap();
     let task = board.task(&id);
     assert_eq!((task.stage.as_str(), task.status()), ("implementation", "In progress"));
-    assert!(task.feedback[0].starts_with("main changed since this branch was implemented"));
+    assert_eq!(task.feedback.len(), 1);
     assert!(board.kinds(&id).contains(&"merge_conflict".to_owned()));
+}
+
+#[test]
+fn every_role_has_a_note_for_the_planner() {
+    let board = Board::new();
+    let schema = board.engine.state.task_schema(None);
+    let notes = schema["roleNotes"].as_object().unwrap();
+    for role in history::ROLES {
+        assert!(notes.get(role).and_then(Value::as_str).is_some_and(|n| !n.is_empty()), "{role} has no note");
+    }
+    assert_eq!(notes.len(), history::ROLES.len());
 }

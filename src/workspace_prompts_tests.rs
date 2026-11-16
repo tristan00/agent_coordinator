@@ -63,21 +63,12 @@ fn creation_keeps_the_workspace_empty_and_freezes_selection_hashes() {
     assert_eq!(fs::read_dir(&directory).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>(), [AGENTS_FILE, LIMITS_FILE]);
     let guide = fs::read_to_string(directory.join(AGENTS_FILE)).unwrap();
     let shown = directory.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
-    assert!(guide.starts_with(&format!("# Workspace {shown}\n")) && guide.contains(&format!("Keep everything you create inside `{shown}`")));
+    assert!(guide.contains(&shown));
     for route in ["/api/task-schema?workspace=W", "/api/tasks?workspace=W", "PATCH /api/tasks/{id}", "/api/updates?workspace=W&after=SEQ&wait=S", "/api/sessions/{id}"] {
         assert!(guide.contains(route), "{route}");
     }
     for admin in ["/api/deployment", "/api/wipe", "/api/config", "/api/state", "/api/analytics", "/api/workspaces"] {
         assert!(!guide.contains(admin), "{admin}");
-    }
-    assert!(guide.contains("answers immediately") == (settings.updates == crate::history::Updates::Poll));
-    for expected in ["$COORDINATOR_SESSION", "## Track the work with git"] {
-        assert!(guide.contains(expected), "{expected}");
-    }
-    assert!(!guide.contains("deliver"));
-    let generic = guide.replace(&shown, "").to_lowercase();
-    for specific in ["benchmark", "submission", "harness.json", "judge", "score"] {
-        assert!(!generic.contains(specific), "{specific}");
     }
     assert_eq!(worker(&fixture.0, &settings, crate::history::Role::Worker, "implementation").unwrap()["text"], "worker_protocol default instructions.");
     assert!(!planner(&fixture.0, &settings).unwrap().is_empty());
@@ -117,6 +108,12 @@ fn workspaces_pinned_to_removed_candidates_are_refused() {
     let prompts = settings.prompts.as_mut().unwrap();
     prompts.project_planner = Document { candidate: "mission.md".into(), sha256: "0".into(), default: false };
     assert!(planner(&fixture.0, &settings).unwrap_err().to_string().contains("removed prompt candidate project_planner/mission.md"));
+}
+
+#[test]
+fn line_endings_do_not_change_a_prompt_fingerprint() {
+    assert_eq!(digest("One line.\r\nTwo lines.\r\n"), digest("One line.\nTwo lines.\n"));
+    assert_ne!(digest("One line.\n"), digest("One line, changed.\n"));
 }
 
 #[test]

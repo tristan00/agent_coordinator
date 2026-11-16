@@ -92,8 +92,11 @@ pub enum Role {
     Data,
     Audit,
     Abstraction,
+    Playtest,
+    Research,
+    Art,
 }
-pub const ROLES: [&str; 11] = ["worker", "analytics", "backend-code", "ui-code", "design", "optimization", "test", "docs", "data", "audit", "abstraction"];
+pub const ROLES: [&str; 14] = ["worker", "analytics", "backend-code", "ui-code", "design", "optimization", "test", "docs", "data", "audit", "abstraction", "playtest", "research", "art"];
 impl Role {
     pub fn name(self) -> &'static str {
         ROLES[self as usize]

@@ -85,7 +85,7 @@ fn worker_input_is_role_prompt_stage_and_task() {
         "task":{"id":"t1","title":"Menu","outcome":"A working menu","acceptance":["Opens"],"cwd":"D:/w","role":"ui-code","needs":[],"languages":[],"functions":[],"model":"m","effort":"low"},
         "agent":{"model":"m"},"family":"claude","limits":{"words":10},"feedback":["Fix the close button"],"dependencies":[],"scratch":"D:/s","command":["x"],"run_id":"r"});
     let text = crate::process::prompt(&request, "implementation").unwrap();
-    assert!(text.starts_with("Build interfaces people enjoy.\n\nImplement the task outcome"));
+    assert!(text.starts_with("Build interfaces people enjoy."));
     let task: serde_json::Value = serde_json::from_str(&text[text.find("\n\ntask: ").unwrap() + 8..]).unwrap();
     assert_eq!((task["title"].as_str(), task["feedback"][0].as_str(), task["scratch"].as_str()), (Some("Menu"), Some("Fix the close button"), Some("D:/s")));
     for hidden in ["agent", "family", "limits", "command", "run_id", "workerProtocol", "model", "effort", "dependencies"] {

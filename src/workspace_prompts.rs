@@ -72,7 +72,7 @@ pub fn text(path: &Path) -> Result<String> {
     Ok(text)
 }
 fn digest(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    format!("{:x}", Sha256::digest(text.replace("\r\n", "\n").as_bytes()))
 }
 fn selected(root: &Path, settings: &WorkspaceSettings, role: &str) -> Result<(Document, String)> {
     let prompts = settings.prompts.as_ref().ok_or("Workspace prompt selections are required")?;
@@ -147,6 +147,8 @@ pub fn agents_guide(workspace: &Path, port: u16, updates: crate::history::Update
          Keep everything you create inside `{w}`. Temp files already go to `{w}\\tmp`.\n\n\
          ## Track the work with git\n\n\
          Commit your work as you go. Each task works on its own branch, and the coordinator merges it when the task is accepted.\n\n\
+         ## Checks cost compute\n\n\
+         Every check costs compute. Use the cheapest one that can answer the question, and save full runs for the end.\n\n\
          ## Coordinator endpoints for this workspace\n\n\
          Base URL: `http://127.0.0.1:{port}` (planners also have it in `$COORDINATOR_URL`). \
          Send request bodies as JSON with `Content-Type: application/json`. \

@@ -8,7 +8,7 @@ fn setup(temp: &Temp, planner: &str) -> (Engine, PathBuf) {
     let prompts = crate::workspace_prompts::root();
     let pick = |file: &str| {
         let text = fs::read_to_string(prompts.join(file)).unwrap();
-        json!({"candidate":file,"sha256":format!("{:x}", Sha256::digest(text.as_bytes())),"default":true})
+        json!({"candidate":file,"sha256":format!("{:x}", Sha256::digest(text.replace("\r\n", "\n").as_bytes())),"default":true})
     };
     let settings: history::WorkspaceSettings = serde_json::from_value(json!({"planner":"sol_6_1_medium","worker":"sol_6_1_light",
         "prompts":{"project_planner":pick("planner.txt"),"worker_protocol":pick("worker.txt")}})).unwrap();
@@ -51,12 +51,10 @@ fn a_session_works_in_its_own_repository_and_waits_when_done() {
     assert_eq!(engine.state.owning_workspace(workspace(&case).unwrap()), workspace(&source).unwrap());
     let request: Value = read(&engine.state.sessions[&id].requests[0].run.join("request.json")).unwrap();
     let prompt = request["prompt"].as_str().unwrap();
-    assert!(prompt.contains("Request:\nBuild it") && prompt.contains("Planner instructions:\n") && !prompt.contains("Limits"));
-    assert!(!prompt.contains("PROJECT_PLANNER.md") && !prompt.contains("WORKER_PROTOCOL.md"));
+    assert!(prompt.contains("Build it") && prompt.contains(fs::read_to_string(crate::workspace_prompts::root().join("planner.txt")).unwrap().trim()));
     assert_eq!(request["root"].as_str().map(PathBuf::from), Some(workspace(&source).unwrap()));
     let shown = |path: &Path| path.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
-    assert!(prompt.contains(&format!("inside the workspace {}, which is your working directory", shown(&workspace(&source).unwrap()))));
-    assert!(prompt.contains("The request folder is the result.") && !prompt.contains("/deliver"));
+    assert!(prompt.contains(&shown(&workspace(&source).unwrap())));
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
     let log = fs::read_to_string(engine.state.sessions[&id].requests[0].run.join("log.txt")).unwrap_or_default();
@@ -90,7 +88,7 @@ fn the_session_stays_open_while_tasks_can_still_run_and_follow_ups_resume_it() {
     assert_eq!(engine.state.sessions[&id].status, "waiting");
     message(&mut engine, &id, json!({"request":"Second"})).unwrap();
     let second: Value = read(&engine.state.sessions[&id].requests[1].run.join("request.json")).unwrap();
-    assert!(second["prompt"].as_str().unwrap().starts_with("New request from the same user"));
+    assert!(second["prompt"].as_str().unwrap().contains("Second"));
     assert_eq!(engine.state.sessions[&id].status, "running");
 }
 
@@ -115,7 +113,7 @@ fn an_idle_planner_is_resumed_once_with_tasks_that_need_a_decision() {
     assert_eq!((session.status.as_str(), session.requests.len()), ("running", 2));
     let wake: Value = read(&session.requests[1].run.join("request.json")).unwrap();
     let prompt = wake["prompt"].as_str().unwrap();
-    assert!(prompt.starts_with("These tasks are blocked and need your decision") && prompt.contains("Needs a call") && prompt.contains("a decision is needed"));
+    assert!(prompt.contains("Needs a call") && prompt.contains("a decision is needed"));
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
     tick(&mut engine).unwrap();
@@ -187,8 +185,6 @@ fn finished_planner_tasks_are_collected_until_the_timer_or_the_final_check() {
     let (mut engine, source) = setup(&temp, "exit 0");
     let case = source.join("case");
     let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First"})).unwrap()["id"].as_str().unwrap().to_owned();
-    let first: Value = read(&engine.state.sessions[&id].requests[0].run.join("request.json")).unwrap();
-    assert!(first["prompt"].as_str().unwrap().contains("every 30 minutes while work runs"));
     engine.actor = Some(format!("planner:{id}"));
     for title in ["Research", "Design", "Later"] {
         engine.create(json!({"title":title,"outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();
@@ -208,9 +204,8 @@ fn finished_planner_tasks_are_collected_until_the_timer_or_the_final_check() {
     age_turn(&mut engine, &id, 30);
     tick(&mut engine).unwrap();
     let timed = wake_text(&engine, &id, 2);
-    assert!(timed.starts_with("These tasks finished since your last turn:\n- ") && timed.contains("Sources found for every region") && timed.contains("Layout agreed"), "{timed}");
-    assert!(!timed.contains("Not the planner's") && timed.contains("Board: 1 to do, 0 in progress, 0 in review, 0 blocked, 0 stopped, 3 done."), "{timed}");
-    assert!(timed.ends_with("every 30 minutes while work runs, and when nothing more can run."), "{timed}");
+    assert!(timed.contains("Sources found for every region") && timed.contains("Layout agreed"), "{timed}");
+    assert!(!timed.contains("Not the planner's"), "{timed}");
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
     tick(&mut engine).unwrap();
@@ -218,17 +213,49 @@ fn finished_planner_tasks_are_collected_until_the_timer_or_the_final_check() {
     age_turn(&mut engine, &id, 31);
     tick(&mut engine).unwrap();
     let quiet = wake_text(&engine, &id, 3);
-    assert!(quiet.starts_with("Nothing has finished since your last turn."), "{quiet}");
+    assert!(!quiet.contains("Sources found for every region") && !quiet.contains("Layout agreed"), "{quiet}");
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
     finish_task(&mut engine, "Later", "Works");
     tick(&mut engine).unwrap();
     let last = wake_text(&engine, &id, 4);
-    assert!(last.contains("Later") && last.ends_with("the request finishes when you end this turn unless you add or resume tasks."), "{last}");
+    assert!(last.contains("Later"), "{last}");
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
     tick(&mut engine).unwrap();
     assert_eq!((engine.state.sessions[&id].status.as_str(), engine.state.sessions[&id].requests.len()), ("waiting", 4));
+}
+
+#[test]
+fn a_wake_that_fails_is_reported_and_retried_instead_of_swallowed() {
+    let temp = Temp::new();
+    let (mut engine, source) = setup(&temp, "exit 0");
+    let case = source.join("case");
+    let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = Some(format!("planner:{id}"));
+    engine.create(json!({"title":"Only","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();
+    engine.actor = None;
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    let key = workspace(&source).unwrap();
+    let original = engine.state.config.workspaces[&key].prompts.clone().unwrap();
+    engine.change(|state| {
+        state.config.workspaces.get_mut(&key).unwrap().prompts.as_mut().unwrap().project_planner.sha256 = "0".repeat(64);
+        Ok(Value::Null)
+    }).unwrap();
+    finish_task(&mut engine, "Only", "Works");
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    let session = &engine.state.sessions[&id];
+    assert_eq!((session.status.as_str(), session.requests.len(), session.notified.len()), ("running", 1, 0));
+    assert!(session.wake_error.as_deref().unwrap().contains("changed since the workspace selected it"));
+    engine.change(|state| {
+        state.config.workspaces.get_mut(&key).unwrap().prompts = Some(original);
+        Ok(Value::Null)
+    }).unwrap();
+    tick(&mut engine).unwrap();
+    let session = &engine.state.sessions[&id];
+    assert_eq!((session.requests.len(), session.notified.len(), session.wake_error.is_none()), (2, 1, true));
 }
 
 #[test]

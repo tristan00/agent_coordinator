@@ -2,3 +2,4 @@
 2. Give every interface clear inputs, outputs and contracts.
 3. Handle invalid input, failures and edge cases on purpose, with explicit errors.
 4. Never let a bad case fail silently.
+5. Once it works, abstract and simplify: merge what repeats and remove what the behavior doesn't need.

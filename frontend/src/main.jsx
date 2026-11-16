@@ -14,7 +14,7 @@ const readPreference = key => { try { return localStorage.getItem(key); } catch 
 const savePreference = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
 
 const STATUSES = ['To do', 'In progress', 'Blocked', 'Review', 'Done', 'Stopped'];
-const ROLES = ['worker', 'analytics', 'backend-code', 'ui-code', 'design', 'optimization', 'test', 'docs', 'data', 'audit', 'abstraction'];
+const ROLES = ['worker', 'analytics', 'backend-code', 'ui-code', 'design', 'optimization', 'test', 'docs', 'data', 'audit', 'abstraction', 'playtest', 'research', 'art'];
 const NEEDS = ['network', 'browser', 'process', 'gpu'];
 const SIZES = ['small', 'medium', 'large'];
 const ARTIFACTS = ['none', 'candidate', 'report'];

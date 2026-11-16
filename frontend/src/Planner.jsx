@@ -219,6 +219,7 @@ export default function Planner({workspace, tasks, select, api, names}) {
         <button className="danger" disabled={session.status !== 'running'} onClick={() => window.confirm('Stop this planner session and its tasks?') && api(`/api/sessions/${session.id}/stop`, 'POST', {}).catch(e => setError(e.message))}>Stop session</button>
       </div>
       {error && <p className="error">{error}</p>}
+      {session.wake_error && <p className="error" role="alert">The coordinator could not wake the planner: {session.wake_error}</p>}
       {dialog === 'request' && <div className="pl-box pl-dialog"><div className="pl-row"><h4>Requests</h4><span className="spacer" /><button onClick={() => setDialog(null)}>Close</button></div>
         {session.requests.map((r, i) => <div key={i}><b>{i + 1} · {KIND_WORDS[r.kind] || 'Initial'}</b> <span className="muted">{new Date(r.started).toLocaleString()}</span><pre className="pl-output">{r.text}</pre></div>)}</div>}
       {dialog === 'follow' && <FollowUp session={session} api={api} close={() => setDialog(null)} />}
