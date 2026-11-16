@@ -75,7 +75,7 @@ fn creation_keeps_the_workspace_empty_and_freezes_selection_hashes() {
     assert_eq!(fs::read_dir(&directory).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>(), [AGENTS_FILE, LIMITS_FILE]);
     let guide = fs::read_to_string(directory.join(AGENTS_FILE)).unwrap();
     let shown = directory.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
-    assert!(guide.starts_with(&format!("# Workspace {shown}\n")) && guide.contains(&format!("Keep everything you create under `{shown}`")));
+    assert!(guide.starts_with(&format!("# Workspace {shown}\n")) && guide.contains(&format!("Keep everything you create inside `{shown}`")));
     for route in ["/api/task-schema?workspace=W", "/api/tasks?workspace=W", "PATCH /api/tasks/{id}", "/api/updates?workspace=W&after=SEQ&wait=S", "/api/sessions/{id}/deliver"] {
         assert!(guide.contains(route), "{route}");
     }
@@ -83,7 +83,7 @@ fn creation_keeps_the_workspace_empty_and_freezes_selection_hashes() {
         assert!(!guide.contains(admin), "{admin}");
     }
     assert!(guide.contains("answers immediately") == (settings.updates == crate::history::Updates::Poll));
-    for delivery in ["## Delivering results", "must contain everything the result needs and work without anything outside it","POST /api/sessions/{id}/deliver` with the body `{}`", "$COORDINATOR_SESSION", "only what was already delivered is handed in", "`node_modules`"] {
+    for delivery in ["## Delivering results", "keep it self-contained", "POST /api/sessions/{id}/deliver` and the body `{}`", "$COORDINATOR_SESSION", "`node_modules`", "## Track the work with git"] {
         assert!(guide.contains(delivery), "{delivery}");
     }
     let generic = guide.replace(&shown, "").to_lowercase();

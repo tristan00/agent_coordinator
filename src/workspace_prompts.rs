@@ -183,30 +183,17 @@ pub fn agents_guide(workspace: &Path, port: u16, updates: crate::history::Update
         crate::history::Updates::Events => "holds the request until something in the workspace changes or S seconds pass",
         crate::history::Updates::Poll => "answers immediately in this workspace, so call it again to follow progress",
     };
-    let skipped = crate::sessions::SKIPPED.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
     format!(
         "# Workspace {w}\n\n\
          Every agent working in this workspace starts in this folder.\n\n\
          ## Keep your work in this workspace\n\n\
-         Keep everything you create under `{w}`: code, data, downloads, scripts, logs and scratch files. \
-         Do not write to the system temp folder or any folder outside this workspace. \
-         `TEMP`, `TMP` and `TMPDIR` already point to a private folder under `{w}\\tmp`, so `/tmp` and temp-file libraries stay inside the workspace.\n\n\
+         Keep everything you create inside `{w}`. Temp files already go to `{w}\\tmp`.\n\n\
          ## Track the work with git\n\n\
-         Each request folder is a git repository; if it is not one yet, run `git init` there and add a `.gitignore` for build output, downloads and scratch files. \
-         When you finish your work, commit only the files you changed, with a message that starts with your task's short id. \
-         Reviewers use `git log` and `git diff` to see what each task changed. Never rewrite history or commit another agent's changes; if git reports a lock, wait and retry.\n\n\
+         Commit your own changes to git, starting the message with your task's short id.\n\n\
          ## Delivering results\n\n\
-         Each request runs in its own request folder inside this workspace, and names a deliverable folder inside that request folder. \
-         `GET /api/sessions/{{id}}` shows them as `workspace` and `deliverable`. \
-         Results leave the workspace only by delivery: the coordinator copies the deliverable folder out.\n\n\
-         - The deliverable folder is copied out by itself, so it must contain everything the result needs and work without anything outside it, \
-         including the rest of the workspace. Use paths relative to the folder.\n\
-         - Whenever the deliverable folder holds a complete, working version, `POST /api/sessions/{{id}}/deliver` with the body `{{}}`. \
-         Each delivery is kept as a new numbered copy, so deliver the first working version early and again after each improvement.\n\
-         - Planners have the session id in `$COORDINATOR_SESSION`.\n\
-         - When the planner ends its turn, the coordinator makes one final delivery once no task can still run. \
-         If the request is stopped first, only what was already delivered is handed in.\n\
-         - The copy leaves out symbolic links, `.pyc` files, `{LIMITS_FILE}` at the top of the folder, and folders named {skipped}.\n\n\
+         Only the deliverable folder leaves the workspace, so keep it self-contained. \
+         Deliver each working version with `POST /api/sessions/{{id}}/deliver` and the body `{{}}`; every delivery is kept. \
+         Build and dependency folders such as `target` and `node_modules` are not copied.\n\n\
          ## Coordinator endpoints for this workspace\n\n\
          Base URL: `http://127.0.0.1:{port}` (planners also have it in `$COORDINATOR_URL`). \
          Send request bodies as JSON with `Content-Type: application/json`. \
