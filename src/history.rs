@@ -49,14 +49,20 @@ pub struct WorkspaceSettings {
     pub prompts: Option<crate::workspace_prompts::Selection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub planner_wake_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_alert_cpu_minutes: Option<u64>,
 }
 impl WorkspaceSettings {
     pub fn wake_minutes(&self) -> u64 {
         self.planner_wake_minutes.unwrap_or(30)
     }
+    pub fn compute_alert_seconds(&self) -> f64 {
+        self.compute_alert_cpu_minutes.unwrap_or(120) as f64 * 60.0
+    }
     pub fn validate(&self, family: Option<crate::agents::Family>) -> Result<()> {
         self.limits.validate()?;
         crate::require(self.wake_minutes() > 0, "plannerWakeMinutes must be at least 1")?;
+        crate::require(self.compute_alert_seconds() > 0.0, "computeAlertCpuMinutes must be at least 1")?;
         crate::require(!self.agent("planner", family)?.worker_only, format!("Agent {} can only be a worker", self.planner.as_deref().unwrap_or_default()))?;
         crate::require(!self.agent("worker", family)?.planner_only, format!("Agent {} can only be a planner", self.worker.as_deref().unwrap_or_default()))
     }
@@ -244,6 +250,8 @@ pub struct AttemptEvidence {
     pub cost: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_seconds: Option<f64>,
     pub overlapping_attempts: Vec<String>,
     pub project_overlapping_attempts: Vec<String>,
 }

@@ -3,6 +3,7 @@
   "worker": "claude_sonnet_5_5_medium",
   "updates": "events",
   "plannerWakeMinutes": 30,
+  "computeAlertCpuMinutes": 120,
   "limits": {
     "words": 150,
     "titleWords": 15,

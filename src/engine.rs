@@ -1503,6 +1503,7 @@ impl Engine {
         }
         attempt.evidence.usage = read(&directory.join("usage.json")).ok();
         attempt.evidence.cost = crate::telemetry::reported_cost(&directory.join("events.jsonl"));
+        attempt.evidence.cpu_seconds = process::cpu_seconds(&directory);
         Self::measure(attempt, &directory)?;
         let mut deploy = false;
         let mut notice = None;

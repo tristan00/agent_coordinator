@@ -77,7 +77,11 @@ fn label(task: &Task) -> String {
     format!("{} {}", task.short_id.as_deref().unwrap_or(&task.id), task.title)
 }
 
-fn board(scoped: &[&Task], since: u64) -> String {
+fn hours(seconds: f64) -> String {
+    format!("{:.1} CPU-hours", seconds / 3600.0)
+}
+
+fn board(scoped: &[&Task], since: u64, live: &dyn Fn(&Task) -> Option<f64>) -> String {
     let now = now();
     let work: Vec<&&Task> = scoped.iter().filter(|t| !t.container()).collect();
     let counts: Vec<String> = [("To do", "to do"), ("In progress", "in progress"), ("Review", "in review"), ("Blocked", "blocked"), ("Stopped", "stopped"), ("Done", "done")]
@@ -89,7 +93,8 @@ fn board(scoped: &[&Task], since: u64) -> String {
         .iter()
         .filter_map(|t| {
             let attempt = t.attempts.iter().rev().find(|a| Some(&a.id) == t.active.as_ref())?;
-            Some(format!("{} ({}, {} min)", label(t), attempt.stage, now.saturating_sub(attempt.started) / 60_000))
+            let cpu = live(t).map(|c| format!(", {}", hours(c))).unwrap_or_default();
+            Some(format!("{} ({}, {} min{cpu})", label(t), attempt.stage, now.saturating_sub(attempt.started) / 60_000))
         })
         .collect();
     if !running.is_empty() {
@@ -107,22 +112,28 @@ fn board(scoped: &[&Task], since: u64) -> String {
     let unreported = costs.iter().filter(|c| c.is_none()).count();
     let spent: f64 = costs.iter().flatten().sum();
     lines.push(format!("Worker cost so far: ${spent:.2}{}.", if unreported > 0 { format!(" ({unreported} attempts did not report a cost)") } else { String::new() }));
+    let cpu: f64 = work.iter().flat_map(|t| t.attempts.iter().filter(|a| a.ended.is_some())).filter_map(|a| a.evidence.cpu_seconds).sum::<f64>() + work.iter().filter_map(|t| live(t)).sum::<f64>();
+    lines.push(format!("Worker compute so far: {}.", hours(cpu)));
     lines.join("\n")
 }
 
-fn wake_prompt(finished: &[&Task], blocked: &[&Task], board: String, idle: bool, minutes: u64) -> String {
+fn wake_prompt(finished: &[&Task], blocked: &[&Task], heavy: &[(&Task, f64)], board: String, idle: bool, minutes: u64) -> String {
     let line = |t: &Task, detail: &str| format!("- {} (GET $COORDINATOR_URL/api/tasks/{}): {detail}", label(t), t.id);
     let result = |t: &Task| t.attempts.iter().rev().find(|a| a.stage == "review" && a.status() == Some("accepted")).and_then(|a| a.result.as_ref()?["summary"].as_str().map(str::to_owned)).unwrap_or_else(|| "accepted".into());
     let mut parts = Vec::new();
     if !finished.is_empty() {
         let list: Vec<String> = finished.iter().map(|t| line(t, &result(t))).collect();
         parts.push(format!("These tasks finished since your last turn:\n{}\n\nCompare what they produced with your target and change, add or remove tasks where the plan no longer leads to it.", list.join("\n")));
-    } else if blocked.is_empty() {
+    } else if blocked.is_empty() && heavy.is_empty() {
         parts.push("Nothing has finished since your last turn. Check that the work in progress still leads to your target.".to_owned());
     }
     if !blocked.is_empty() {
         let list: Vec<String> = blocked.iter().map(|t| line(t, &t.failure)).collect();
         parts.push(format!("These tasks are blocked and need your decision:\n{}\n\nFor each one, correct it, ask for a replan, resume it, replace it with new tasks or delete it.", list.join("\n")));
+    }
+    if !heavy.is_empty() {
+        let list: Vec<String> = heavy.iter().map(|(t, c)| line(t, &format!("{} so far", hours(*c)))).collect();
+        parts.push(format!("These tasks are using a lot of compute:\n{}\n\nDecide whether that work is worth it; you can stop, change or replan it.", list.join("\n")));
     }
     parts.push(board);
     parts.push(if idle {
@@ -295,10 +306,18 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
         let halted = scoped.iter().any(|t| !t.container() && engine.state.halted(t));
         let since = request.planner_ended.unwrap_or(request.started);
         let due = now().saturating_sub(since) >= minutes.saturating_mul(60_000);
-        if !blocked.is_empty() || (idle && !finished.is_empty() && !halted) || (!idle && due) {
-            let summary = board(&scoped, since);
-            let text = wake_prompt(&finished.iter().map(|(_, t)| *t).collect::<Vec<_>>(), &blocked.iter().map(|(_, t)| *t).collect::<Vec<_>>(), summary, idle, minutes);
-            let keys: Vec<String> = finished.into_iter().chain(blocked).map(|(k, _)| k).collect();
+        let directory = engine.directory.join("attempts");
+        let live = |t: &Task| t.active.as_ref().and_then(|a| crate::process::cpu_seconds(&directory.join(a)));
+        let alert = engine.state.settings(Some(&session.workspace)).compute_alert_seconds();
+        let heavy: Vec<(String, &Task, f64)> = scoped
+            .iter()
+            .filter_map(|t| Some((format!("cpu:{}", t.active.as_ref()?), *t, live(t)?)))
+            .filter(|(k, _, c)| *c >= alert && !session.notified.contains(k))
+            .collect();
+        if !blocked.is_empty() || !heavy.is_empty() || (idle && !finished.is_empty() && !halted) || (!idle && due) {
+            let summary = board(&scoped, since, &live);
+            let text = wake_prompt(&finished.iter().map(|(_, t)| *t).collect::<Vec<_>>(), &blocked.iter().map(|(_, t)| *t).collect::<Vec<_>>(), &heavy.iter().map(|(_, t, c)| (*t, *c)).collect::<Vec<_>>(), summary, idle, minutes);
+            let keys: Vec<String> = finished.into_iter().chain(blocked).map(|(k, _)| k).chain(heavy.into_iter().map(|(k, _, _)| k)).collect();
             match start(engine, &id, text, "wake") {
                 Ok(()) => engine.change(|state| {
                     let s = state.sessions.get_mut(&id).ok_or("Unknown session")?;

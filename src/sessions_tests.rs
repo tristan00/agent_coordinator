@@ -282,3 +282,41 @@ fn planner_output_lines_get_the_time_they_arrived() {
     assert_eq!(stamped(b"{}", 7), b"{\"coordinatorAt\":7}\n");
     assert_eq!(stamped(b"plain text", 7), b"plain text\n");
 }
+
+#[test]
+fn a_task_using_a_lot_of_compute_wakes_the_planner_once() {
+    let temp = Temp::new();
+    let (mut engine, source) = setup(&temp, "exit 0");
+    let case = source.join("case");
+    let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = Some(format!("planner:{id}"));
+    engine.create(json!({"title":"Train the policy","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();
+    engine.create(json!({"title":"Light work","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();
+    engine.actor = None;
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    let busy = |engine: &mut Engine, title: &str, attempt: &str, seconds: f64| {
+        let (title, attempt) = (title.to_owned(), attempt.to_owned());
+        write(&engine.attempt_path(&attempt).join("cpu.json"), &json!({"cpuSeconds":seconds,"at":1})).unwrap();
+        engine.change(move |state| {
+            let t = state.tasks.iter_mut().find(|t| t.title == title).unwrap();
+            t.attempts.push(crate::engine::Attempt { id: attempt.clone(), revision: 0, stage: "implementation".into(), started: now(), ended: None, result: None, error: None, evidence: Default::default() });
+            t.active = Some(attempt);
+            Ok(Value::Null)
+        }).unwrap();
+    };
+    busy(&mut engine, "Light work", "light", 600.0);
+    tick(&mut engine).unwrap();
+    assert_eq!(engine.state.sessions[&id].requests.len(), 1);
+    busy(&mut engine, "Train the policy", "heavy", 10.0 * 3600.0);
+    tick(&mut engine).unwrap();
+    let session = &engine.state.sessions[&id];
+    assert_eq!(session.requests.len(), 2);
+    assert!(session.notified.contains("cpu:heavy") && !session.notified.contains("cpu:light"));
+    let text = wake_text(&engine, &id, 2);
+    assert!(text.contains("Train the policy") && text.contains("10.0") && text.contains("0.2"), "{text}");
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    assert_eq!(engine.state.sessions[&id].requests.len(), 2);
+}

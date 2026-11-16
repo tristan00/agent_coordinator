@@ -42,6 +42,14 @@ pub fn local_agent(args: &[String]) -> bool {
 fn job_result(status: i32) -> Result<()> {
     if status == 0 { Err(std::io::Error::last_os_error().into()) } else { Ok(()) }
 }
+pub(crate) fn record_cpu(job: &Job, directory: &Path) {
+    if let Ok(seconds) = job.cpu_seconds() {
+        let _ = write(&directory.join("cpu.json"), &json!({"cpuSeconds":seconds,"at":now()}));
+    }
+}
+pub fn cpu_seconds(directory: &Path) -> Option<f64> {
+    read::<Value>(&directory.join("cpu.json")).ok()?["cpuSeconds"].as_f64()
+}
 pub(crate) struct Job(HANDLE);
 impl Job {
     pub(crate) fn new() -> Result<Self> {
@@ -61,6 +69,13 @@ impl Job {
     }
     pub(crate) fn contain(&self, child: &Child) -> Result<()> {
         job_result(unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as _) })
+    }
+    pub(crate) fn cpu_seconds(&self) -> Result<f64> {
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        job_result(unsafe {
+            QueryInformationJobObject(self.0, JobObjectBasicAccountingInformation, (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(), std::mem::size_of_val(&info) as u32, std::ptr::null_mut())
+        })?;
+        Ok((info.TotalUserTime + info.TotalKernelTime) as f64 / 10_000_000.0)
     }
     pub(crate) fn drain(&self) -> Result<()> {
         let mut terminated = false;
@@ -153,6 +168,7 @@ pub fn supervise(directory: &Path) -> Result<()> {
         write(&directory.join("run.json"), &json!({"supervisor":std::process::id(),"worker":child.id(),"started":now()}))?;
         forward_input(&mut child, serde_json::to_vec(&request)?);
         let mut stopped = false;
+        let mut ticks = 0u64;
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(json!({"code":status.code(),"stopped":stopped}));
@@ -161,11 +177,16 @@ pub fn supervise(directory: &Path) -> Result<()> {
                 job.stop()?;
                 stopped = true;
             }
+            if ticks % 50 == 0 {
+                record_cpu(&job, directory);
+            }
+            ticks += 1;
             thread::sleep(Duration::from_millis(100));
         }
     };
     let mut outcome = run().unwrap_or_else(|error| json!({"error":error.to_string()}));
     job.drain()?;
+    record_cpu(&job, directory);
     outcome["ended"] = json!(now());
     if outcome["interrupted"] != true
         && let Ok(request) = read::<Value>(&directory.join("request.json"))
@@ -391,3 +412,7 @@ fn record_codex_launch(stderr: impl Read, path: &Path, mut evidence: Observed) -
     }
     Ok(tokens.filter(|_| evidence.cli_version.is_some()))
 }
+
+#[cfg(test)]
+#[path = "process_tests.rs"]
+mod tests;
