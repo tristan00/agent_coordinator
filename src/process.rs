@@ -135,9 +135,6 @@ pub fn supervise(directory: &Path) -> Result<()> {
             std::fs::create_dir_all(directory.join("scratch"))?;
             std::fs::create_dir_all(directory.join("deliverables"))?;
         }
-        if let Err(error) = crate::metrics::project_capture(directory, &request, false) {
-            let _ = write(&directory.join("measurement-error.json"), &json!({"at":now(),"error":error.to_string()}));
-        }
         if directory.join("stop").exists() {
             return Ok(json!({"stopped":true}));
         }
@@ -188,12 +185,6 @@ pub fn supervise(directory: &Path) -> Result<()> {
     job.drain()?;
     record_cpu(&job, directory);
     outcome["ended"] = json!(now());
-    if outcome["interrupted"] != true
-        && let Ok(request) = read::<Value>(&directory.join("request.json"))
-        && let Err(error) = crate::metrics::project_capture(directory, &request, true)
-    {
-        let _ = write(&directory.join("measurement-error.json"), &json!({"at":now(),"error":error.to_string()}));
-    }
     if !directory.join("usage.json").exists()
         && let Some(components) = crate::telemetry::resource_usage(&directory.join("events.jsonl"))
     {

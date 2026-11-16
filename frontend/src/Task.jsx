@@ -2,7 +2,7 @@ import React, {useEffect, useRef, useState} from 'react';
 import {Archive, ArrowRight, CheckCircle2, ChevronRight, CircleDashed, Clock, Coins, ExternalLink, GitBranch, Layers, Link2, ListChecks, Pause, Pencil, Play, RefreshCw, RotateCcw, ScrollText, Timer, X, XCircle} from 'lucide-react';
 import {BorderBeam} from './Activity';
 import TaskName from './TaskName';
-import {attemptMs, categoryName, compact, duration, failed, leadMs, phase, tokens, workMs, waitMs} from './fields';
+import {attemptCount, attemptMs, categoryName, compact, duration, failed, leadMs, phase, tokens, workMs, waitMs} from './fields';
 
 const ROLE_HUE = {worker: 220, analytics: 190, 'backend-code': 222, 'ui-code': 280, design: 320, optimization: 30, test: 140, docs: 40, data: 160, audit: 12};
 const roleStyle = role => ({'--tag-hue': ROLE_HUE[role] ?? 220});
@@ -25,7 +25,7 @@ function useTicker(active) {
 
 export function TaskCard({task: t, paused, offline, open}) {
   const p = phase(t, paused);
-  const work = t.attempts?.length ? workMs(t) : null;
+  const work = attemptCount(t) ? workMs(t) : null;
   const tags = [...(t.attributes.languages || []).map(v => ['lang', v]), ...(t.attributes.functions || []).map(v => ['fn', v])];
   return <article className={`card tone-${p.tone || 'idle'} ${t.stopped ? 'is-stopped' : ''}`} role="button" tabIndex={0} aria-label={`${t.shortId || ''} ${t.title}. ${t.status}. ${p.text}`}
     onClick={() => open(t.id)} onKeyDown={e => {if (e.key === 'Enter' || e.key === ' ') {e.preventDefault(); open(t.id);}}}>
@@ -36,7 +36,7 @@ export function TaskCard({task: t, paused, offline, open}) {
       {t.container && <span className="mini-badge" title="Container"><Layers size={12} aria-hidden="true" />{t.children.length}</span>}
       {t.parent && <span className="mini-badge" title="Child task"><GitBranch size={12} aria-hidden="true" />child</span>}
       <span className="spacer" />
-      {!!t.attempts?.length && <span className="mini-stat" title="Attempts"><RotateCcw size={12} aria-hidden="true" />{t.attempts.length}</span>}
+      {!!attemptCount(t) && <span className="mini-stat" title="Attempts"><RotateCcw size={12} aria-hidden="true" />{attemptCount(t)}</span>}
     </header>
     <h3 className="card-title">{t.title}</h3>
     <div className="card-tags">

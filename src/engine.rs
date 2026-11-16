@@ -1010,7 +1010,19 @@ impl Engine {
     pub fn task_value(&self, task: &Task, detailed: bool) -> Result<Value> {
         let mut value = serde_json::to_value(task)?;
         if !detailed {
-            value.as_object_mut().unwrap().remove("history");
+            let object = value.as_object_mut().unwrap();
+            object.remove("history");
+            object.remove("attempts");
+            let ended: Vec<&Attempt> = task.attempts.iter().filter(|a| a.ended.is_some()).collect();
+            let failed = |a: &Attempt| a.error.is_some() || (a.ended.is_some() && a.result.is_some() && a.status() != Some("completed"));
+            let active = task.attempts.iter().find(|a| Some(&a.id) == task.active.as_ref());
+            value["summary"] = json!({
+                "attempts":task.attempts.len(),
+                "failures":task.attempts.iter().filter(|a| failed(a)).count(),
+                "workMs":ended.iter().map(|a| a.ended.unwrap_or(a.started).saturating_sub(a.started)).sum::<u64>(),
+                "activeStarted":active.map(|a| a.started),
+                "tokens":task.attempts.iter().filter_map(|a| a.evidence.usage.as_ref().and_then(|u| u.total_tokens)).sum::<u64>(),
+            });
         }
         let blocks: Vec<_> = self.state.tasks.iter().filter(|t| t.dependencies.iter().any(|d| d.target == task.id)).map(|t| &t.id).collect();
         value["status"] = json!(if self.state.halted(task) { "Stopped" } else { task.status() });
@@ -1504,7 +1516,6 @@ impl Engine {
         attempt.evidence.usage = read(&directory.join("usage.json")).ok();
         attempt.evidence.cost = crate::telemetry::reported_cost(&directory.join("events.jsonl"));
         attempt.evidence.cpu_seconds = process::cpu_seconds(&directory);
-        Self::measure(attempt, &directory)?;
         let mut deploy = false;
         let mut notice = None;
         match (stopped, result) {
@@ -1605,14 +1616,6 @@ impl Engine {
             self.pending_deploy = Some(task_id);
         }
         self.notices.extend(notice);
-        Ok(())
-    }
-    fn measure(attempt: &mut Attempt, directory: &Path) -> Result<()> {
-        let before = read::<Value>(&directory.join("project-before.json")).ok();
-        let after = read::<Value>(&directory.join("project-after.json")).ok();
-        if before.is_some() || after.is_some() {
-            attempt.evidence.project_size = Some(json!({"delta":metrics::size_delta(before.as_ref().unwrap_or(&Value::Null),after.as_ref().unwrap_or(&Value::Null)),"before":before,"after":after}));
-        }
         Ok(())
     }
     fn poll_attempt(&mut self, index: usize) -> Result<()> {

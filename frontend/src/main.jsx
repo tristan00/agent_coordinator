@@ -91,6 +91,7 @@ function App() {
   const [selected, setSelected] = useState(null);
   const [editor, setEditor] = useState(null);
   const [error, setError] = useState('');
+  const [detail, setDetail] = useState(null);
   const refresh = useCallback(async () => {
     try { setState(await api('/api/state')); setOffline(''); } catch (e) { setOffline(e.message); }
   }, []);
@@ -105,6 +106,13 @@ function App() {
     try { await api(path, method, body); await refresh(); return true; } catch (e) { setError(e.message); return false; }
   }
   const tasks = state?.tasks || [];
+  const sequence = state?.sequence;
+  useEffect(() => {
+    if (!selected) { setDetail(null); return; }
+    let live = true;
+    api(`/api/tasks/${selected}`).then(t => { if (live) setDetail(t); }).catch(() => {});
+    return () => { live = false; };
+  }, [selected, sequence]);
   const byId = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
   const workspaces = [...new Map([...Object.keys(state?.config?.workspaces || {}), ...tasks.map(workspaceOf)].filter(Boolean).map(path => [pathKey(path), path.replace(/^\\\\\?\\/, '')])).values()].sort();
   const scoped = tasks.filter(t => !workspace || within(workspaceOf(t), workspace));
@@ -143,7 +151,7 @@ function App() {
         {page === 'Analytics' && <Analytics workspace={workspace} select={setSelected} names={state.workspaceIds} />}
         {page === 'Settings' && <Settings state={state} act={act} />}
       </main>
-      {selected && byId[selected] && <Detail task={byId[selected]} byId={byId} paused={state.paused} wordLimit={limitsFor(state, workspaceOf(byId[selected])).words} reasons={dependencyReasons(state)} close={() => setSelected(null)} select={setSelected} act={act} edit={t => { setSelected(null); setEditor({task: t}); }} />}
+      {selected && detail?.id === selected && <Detail task={detail} byId={byId} paused={state.paused} wordLimit={limitsFor(state, workspaceOf(byId[selected])).words} reasons={dependencyReasons(state)} close={() => setSelected(null)} select={setSelected} act={act} edit={t => { setSelected(null); setEditor({task: t}); }} />}
       {editor && !editor.grouped && <Editor {...editor} tasks={tasks} state={state} workspace={workspace} close={() => { setEditor(null); refresh(); }} />}
       {editor?.grouped && <GroupEditor tasks={tasks} state={state} workspace={workspace} close={() => { setEditor(null); refresh(); }} />}
     </div>

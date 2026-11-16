@@ -255,7 +255,7 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
             let tasks = engine.state.tasks.iter().map(|task| engine.task_value(task, false)).collect::<Result<Vec<_>>>()?;
             let state = &engine.state;
             let workspace_ids: serde_json::Map<String, Value> = state.workspace_ids.iter().map(|(path, id)| (path.to_string_lossy().into_owned(), json!(id.abbreviation))).collect();
-            json!({"tasks":tasks,"workspaceIds":workspace_ids,"paused":state.paused,"holdUntil":state.hold_until,"controls":state.controls,"config":state.config,"error":error,
+            json!({"tasks":tasks,"sequence":state.sequence,"workspaceIds":workspace_ids,"paused":state.paused,"holdUntil":state.hold_until,"controls":state.controls,"config":state.config,"error":error,
                 "dataDirectory":engine.directory,"deployment":deployment(),"deploymentEvent":deployment_event(&engine.directory),"versions":crate::history::versions()})
         }
         ["", "api", "tasks", id] => match engine.task(id) {

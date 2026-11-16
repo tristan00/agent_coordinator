@@ -245,7 +245,6 @@ pub struct AttemptEvidence {
     pub observed: Option<Observed>,
     pub launch: Option<Launch>,
     pub changes: Option<Value>,
-    pub project_size: Option<Value>,
     pub usage: Option<Usage>,
     pub cost: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

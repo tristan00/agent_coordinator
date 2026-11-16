@@ -1,7 +1,6 @@
 use super::*;
 use crate::engine::{Attempt, Task};
 use crate::history::Launch;
-use crate::test_support::Temp;
 
 fn task(stage: &str) -> Task {
     serde_json::from_value(json!({"id":"t","title":"T","outcome":"O","cwd":"C:\\","acceptance":["c"],"dependencies":[],
@@ -14,34 +13,6 @@ fn push(task: &mut Task, kind: &str, at: u64, evidence: Value) {
 }
 fn totals(task: &Task) -> Value {
     lifecycle(task)["intervals"]["milliseconds"].clone()
-}
-
-#[test]
-fn fingerprint_is_fnv1a_64() {
-    assert_eq!(fingerprint(b""), 0xcbf29ce484222325);
-    assert_eq!(fingerprint(b"a"), 0xaf63dc4c8601ec8c);
-    assert_ne!(fingerprint(b"ab"), fingerprint(b"ba"));
-}
-
-
-#[test]
-fn categories_follow_documented_precedence() {
-    let cases = [
-        ("src/main.rs", "source"),
-        ("src/engine_tests.rs", "test"),
-        ("web/app.js", "ui"),
-        ("target/debug/x.rs", "generated"),
-        ("README.md", "other"),
-        ("frontend/src/a.test.ts", "test"),
-        ("tests/node_modules/x.js", "generated"),
-        ("lib.rs", "source"),
-        ("page.HTML", "ui"),
-        ("Src/Main.RS", "source"),
-        ("docs/notes.txt", "other"),
-    ];
-    for (path, expected) in cases {
-        assert_eq!(category(Path::new(path)), expected, "{path}");
-    }
 }
 
 #[test]
@@ -101,107 +72,4 @@ fn lifecycle_counts_board_pauses_blocks_and_censoring() {
     assert!(lifecycle(&stale)["acceptedAt"].is_null());
     assert_eq!(lifecycle(&stale)["intervals"]["initialBoardPauseKnown"], false);
     assert!(lifecycle(&task("implementation"))["intervals"].is_null());
-}
-
-fn workspace() -> (Temp, PathBuf) {
-    let temp = Temp::new();
-    let ws = temp.dir("ws");
-    fs::create_dir_all(ws.join("src")).unwrap();
-    fs::write(ws.join("src").join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
-    fs::write(ws.join("notes.txt"), "hello").unwrap();
-    fs::write(ws.join("bin.dat"), [0u8, 1, 2]).unwrap();
-    fs::write(ws.join("w.rs"), "a\nb\n").unwrap();
-    (temp, ws)
-}
-
-#[test]
-fn capture_records_text_and_binary_files_and_excludes_runtime_trees() {
-    let (temp, ws) = workspace();
-    for excluded in ["node_modules", "Data", "runtime-data-7", "board"] {
-        fs::create_dir_all(ws.join(excluded)).unwrap();
-        fs::write(ws.join(excluded).join("f.txt"), "x").unwrap();
-    }
-    let snapshot = capture(&[ws.clone(), temp.path().join("absent")], &ws.join("board"));
-    let files: Vec<_> = snapshot.files.keys().map(|p| p.strip_prefix(&ws).unwrap().to_path_buf()).collect();
-    assert_eq!(files, [PathBuf::from("bin.dat"), PathBuf::from("notes.txt"), PathBuf::from("src").join("a.rs"), PathBuf::from("w.rs")]);
-    assert!(snapshot.files[&ws.join("bin.dat")].lines.is_none());
-    assert_eq!(snapshot.files[&ws.join("notes.txt")].lines.as_deref(), Some(&[fingerprint(b"hello")][..]));
-    assert_eq!(snapshot.excluded.len(), 4);
-    assert!(snapshot.skipped.is_empty());
-}
-
-
-
-#[test]
-fn size_counts_lines_by_category() {
-    let temp = Temp::new();
-    let ws = temp.dir("ws");
-    fs::create_dir_all(ws.join("src")).unwrap();
-    fs::create_dir_all(ws.join("web")).unwrap();
-    fs::write(ws.join("src").join("a.rs"), "x\n\n  \ny\n").unwrap();
-    fs::write(ws.join("web").join("index.html"), "<p>\n").unwrap();
-    fs::write(ws.join("blob.bin"), [0u8, 0, 1]).unwrap();
-    let value = size(&capture(std::slice::from_ref(&ws), &temp.path().join("data")), &ws);
-    assert_eq!(value["byCategory"]["source"], json!({"files":1,"textFiles":1,"binaryOrNonUtf8Files":0,"physicalLines":4,"nonblankLines":2}));
-    assert_eq!(value["byCategory"]["ui"]["physicalLines"], 1);
-    assert_eq!(value["byCategory"]["other"], json!({"files":1,"textFiles":0,"binaryOrNonUtf8Files":1,"physicalLines":0,"nonblankLines":0}));
-    assert_eq!(value["status"], "measured");
-    assert_eq!(value["fingerprints"].as_object().unwrap().len(), 3);
-    fs::create_dir_all(ws.join("node_modules")).unwrap();
-    let partial = size(&capture(std::slice::from_ref(&ws), &temp.path().join("data")), &ws);
-    assert_eq!(partial["status"], "partial");
-}
-
-#[test]
-fn size_delta_compares_matching_rule_sets_only() {
-    let temp = Temp::new();
-    let ws = temp.dir("ws");
-    fs::write(ws.join("a.rs"), "x\n").unwrap();
-    let before = size(&capture(std::slice::from_ref(&ws), Path::new("Z:\\")), &ws);
-    fs::write(ws.join("b.rs"), "y\nz\n").unwrap();
-    let after = size(&capture(std::slice::from_ref(&ws), Path::new("Z:\\")), &ws);
-    let delta = size_delta(&before, &after);
-    assert_eq!(delta["includedCategories"]["source"], json!({"files":1,"physicalLines":2,"nonblankLines":2}));
-    assert_eq!(delta["includedCategories"]["ui"]["files"], 0);
-    assert_eq!(delta["status"], "measured");
-    assert!(size_delta(&Value::Null, &after).is_null());
-    assert!(size_delta(&before, &Value::Null).is_null());
-    let mut changed = after.clone();
-    changed["rules"]["version"] = json!(2);
-    assert!(size_delta(&before, &changed).is_null());
-    let mut partial = after;
-    partial["status"] = json!("partial");
-    assert_eq!(size_delta(&before, &partial)["status"], "partial");
-}
-
-#[test]
-fn project_capture_writes_each_endpoint_once() {
-    let temp = Temp::new();
-    let ws = temp.dir("ws");
-    fs::write(ws.join("a.rs"), "x\n").unwrap();
-    let directory = temp.dir("data/attempts/a1");
-    let request = json!({"task":{"workspaceId":ws,"cwd":"ignored"}});
-    project_capture(&directory, &request, false).unwrap();
-    let before: Value = crate::read(&directory.join("project-before.json")).unwrap();
-    assert_eq!(before["byCategory"]["source"]["files"], 1);
-    fs::write(directory.join("project-before.json"), "{\"kept\":true}").unwrap();
-    project_capture(&directory, &request, false).unwrap();
-    assert_eq!(crate::read::<Value>(&directory.join("project-before.json")).unwrap(), json!({"kept":true}));
-    project_capture(&directory, &json!({"task":{"cwd":ws}}), true).unwrap();
-    assert!(directory.join("project-after.json").exists());
-    assert!(project_capture(&directory, &json!({"task":{}}), true).is_err());
-    assert!(project_capture(&directory, &json!({"task":{"workspaceId":ws.join("absent")}}), true).is_err());
-}
-
-#[test]
-fn snapshots_round_trip_through_json_with_defaults() {
-    let (_temp, ws) = workspace();
-    let snapshot = capture(std::slice::from_ref(&ws), Path::new("Z:\\"));
-    let files = snapshot.files.len();
-    let mut value = serde_json::to_value(&snapshot).unwrap();
-    for field in ["excluded", "elapsed_ms", "roots"] {
-        value.as_object_mut().unwrap().remove(field);
-    }
-    let restored: Snapshot = serde_json::from_value(value).unwrap();
-    assert_eq!((restored.files.len(), restored.elapsed_ms, restored.roots.len()), (files, 0, 0));
 }

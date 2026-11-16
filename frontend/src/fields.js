@@ -15,10 +15,11 @@ export function duration(ms) {
 export const compact = n => n == null || !Number.isFinite(n) ? '—' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}k` : String(n);
 
 export const attemptMs = (t, a, now = Date.now()) => (a.ended ?? (t.active === a.id ? now : a.started)) - a.started;
-export const workMs = (t, now) => sum((t.attempts || []).map(a => attemptMs(t, a, now))) || null;
+export const workMs = (t, now = Date.now()) => t.attempts ? sum(t.attempts.map(a => attemptMs(t, a, now))) || null : (t.summary ? t.summary.workMs + (t.summary.activeStarted ? now - t.summary.activeStarted : 0) : 0) || null;
+export const attemptCount = t => t.attempts?.length ?? t.summary?.attempts ?? 0;
 export const leadMs = (t, now = Date.now()) => t.analytics?.leadMs ?? (t.analytics?.createdAt ? now - t.analytics.createdAt : null);
 export const waitMs = t => t.analytics?.intervals?.milliseconds ? sum(Object.values(t.analytics.intervals.milliseconds)) : null;
-export const tokens = t => sum((t.attempts || []).map(a => a.evidence?.usage?.totalTokens || 0));
+export const tokens = t => t.attempts ? sum(t.attempts.map(a => a.evidence?.usage?.totalTokens || 0)) : t.summary?.tokens || 0;
 export const failed = a => !!a.error || (a.ended && a.result && a.result.status !== 'completed');
 export const pathKey = p => (p || '').replace(/^\\\\\?\\/, '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
 export const within = (path, scope) => { const p = pathKey(path), s = pathKey(scope); return p === s || p.startsWith(`${s}/`); };
@@ -50,11 +51,11 @@ export const FIELDS = [
   category('model', 'Model', 'Execution', t => t.models?.length ? [...new Set(t.models.map(m => m.model))] : ['Not run yet']),
   category('grouping', 'Grouping', 'Structure', t => [t.container ? 'Container' : t.parent ? 'Child' : 'Standalone']),
   category('workspace', 'Workspace', 'Structure', t => [workspaceName(t)]),
-  number('work', 'Working time', 'Execution', t => t.attempts?.length ? workMs(t) : null, duration),
+  number('work', 'Working time', 'Execution', t => attemptCount(t) ? workMs(t) : null, duration),
   number('lead', 'Lead time', 'Execution', t => leadMs(t), duration),
   number('wait', 'Waiting time', 'Execution', waitMs, duration),
-  number('attempts', 'Attempts', 'Execution', t => t.attempts?.length || 0),
-  number('failures', 'Failed attempts', 'Execution', t => (t.attempts || []).filter(failed).length),
+  number('attempts', 'Attempts', 'Execution', attemptCount),
+  number('failures', 'Failed attempts', 'Execution', t => t.attempts ? t.attempts.filter(failed).length : t.summary?.failures || 0),
   number('tokens', 'Tokens', 'Execution', t => tokens(t) || null, compact),
   number('revision', 'Revision', 'Structure', t => t.revision),
   number('words', 'Definition words', 'Structure', t => t.definitionWords),

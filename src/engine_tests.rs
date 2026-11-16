@@ -1543,3 +1543,17 @@ fn every_role_has_a_note_for_the_planner() {
     }
     assert_eq!(notes.len(), history::ROLES.len());
 }
+
+#[test]
+fn board_views_carry_attempt_counts_not_the_attempt_history() {
+    let mut board = Board::new();
+    let id = board.add("Summarised");
+    board.run(&id, rejected());
+    board.run(&id, outcome("completed", &["passed"]));
+    let task = board.task(&id).clone();
+    let brief = board.engine.task_value(&task, false).unwrap();
+    assert!(brief.get("attempts").is_none() && brief.get("history").is_none());
+    assert_eq!((brief["summary"]["attempts"].as_u64(), brief["summary"]["failures"].as_u64()), (Some(2), Some(1)));
+    let full = board.engine.task_value(&task, true).unwrap();
+    assert_eq!(full["attempts"].as_array().unwrap().len(), 2);
+}
