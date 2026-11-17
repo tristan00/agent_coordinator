@@ -115,9 +115,16 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
     let method = request.method().as_str().to_owned();
     let parts: Vec<_> = url.split('/').collect();
     if method == "GET" {
-        if url == "/" {
-            let location = engine.service.url.clone();
-            request.respond(Response::from_string(format!("The board moved to {location}")).with_status_code(302).with_header(header("Location", &location)).with_header(header("Connection", "close")))?;
+        let asset = match url.as_str() {
+            "/" => Some((include_str!("../web/index.html"), "text/html; charset=utf-8")),
+            "/app.js" => Some((include_str!("../web/app.js"), "text/javascript")),
+            "/style.css" => Some((include_str!("../web/style.css"), "text/css")),
+            _ => None,
+        };
+        if let Some((body, mime)) = asset {
+            request.respond(
+                Response::from_string(body).with_header(header("Content-Type", mime)).with_header(header("Cache-Control", "no-cache")).with_header(header("Connection", "close")).with_header(header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'")),
+            )?;
             return Ok(());
         }
         if let ["", "api", "attempts", id, "log"] = parts.as_slice()
@@ -172,6 +179,7 @@ pub(crate) fn dispatch(engine: &mut Engine, method: &str, parts: &[&str], input:
             *shutdown = true;
             Ok(json!({"ready":true,"paused":engine.state.paused}))
         }
+        ("POST", ["", "api", "analytics"]) => crate::analytics::report(&engine.state, input),
         ("POST", ["", "api", "deployment", "handoff"]) => {
             crate::require(input["expected"] == deployment()["digest"] && input["expected"].is_string(), "Running coordinator identity changed")?;
             let event = handoff(engine, input["action"].as_str().ok_or("Missing deployment action")?, port)?;
@@ -234,6 +242,7 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
         ["", "api", "agents"] => engine.state.models(update_query(full)?.workspace.as_deref()),
         ["", "api", "tasks"] => engine.scoped_tasks(update_query(full)?.workspace.as_deref())?,
         ["", "api", "task-schema"] => engine.state.task_schema(update_query(full)?.workspace.as_deref()),
+        ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
         ["", "api", "workspaces", "defaults"] => crate::workspace_prompts::defaults(&crate::workspace_prompts::root())?,
         ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
         ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
@@ -381,7 +390,6 @@ pub fn serve(inherited: usize) -> Result<()> {
     let mut engine = Engine::new(directory)?;
     let server = Server::http(format!("127.0.0.1:{}", std::env::var("PORT").unwrap_or_else(|_| "4242".into())))?;
     let port = server.server_addr().to_ip().unwrap().port();
-    engine.port = port;
     write(&engine.directory.join("port.json"), &port)?;
     println!("Coordinator: http://127.0.0.1:{port} (closed {inherited} inherited sockets)");
     let mut last_tick = Instant::now();
@@ -421,9 +429,6 @@ pub fn serve(inherited: usize) -> Result<()> {
                 }
             }
             notify(&mut engine);
-            if let Err(failure) = engine.announce(&error) {
-                error = failure.to_string();
-            }
         }
         parked = release(parked, &engine, &error, shutdown);
     }

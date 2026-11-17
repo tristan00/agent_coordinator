@@ -1,17 +1,16 @@
 mod adapters;
 mod api;
 mod agents;
-mod client;
+mod analytics;
 mod engine;
 mod evidence;
 mod git;
 mod history;
 mod kill_guard;
-mod migrate;
+mod metrics;
 mod process;
 mod redeploy;
 mod sessions;
-mod task_service;
 mod telemetry;
 #[cfg(test)]
 mod test_support;

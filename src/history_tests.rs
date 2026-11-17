@@ -72,17 +72,27 @@ fn workspace_settings_reject_unknown_fields_and_default_to_polling() {
 }
 
 #[test]
-fn attributes_parse_defaults_and_reject_unknown_values() {
+fn attributes_validate_priority_deploy_and_classifications() {
     let parse = |value: Value| serde_json::from_value::<Attributes>(value);
     let defaults = parse(json!({})).unwrap();
+    defaults.validate().unwrap();
     assert_eq!(defaults.priority(), 2);
     assert!(defaults.role == Role::Worker && defaults.size == Size::Small && defaults.artifact == Artifact::None && !defaults.deploy);
+    parse(json!({"priority":0})).unwrap().validate().unwrap();
+    parse(json!({"priority":3})).unwrap().validate().unwrap();
+    assert!(parse(json!({"priority":4})).unwrap().validate().is_err());
+    assert!(parse(json!({"deploy":true})).unwrap().validate().is_err());
+    assert!(parse(json!({"deploy":true,"artifact":"report"})).unwrap().validate().is_err());
+    parse(json!({"deploy":true,"artifact":"candidate"})).unwrap().validate().unwrap();
     assert!(parse(json!({"languages":["cobol"]})).is_err());
     assert!(parse(json!({"functions":["Testing"]})).is_err());
     assert!(parse(json!({"role":"marketing"})).is_err());
     assert!(parse(json!({"needs":["quantum"]})).is_err());
-    let attributes = parse(json!({"languages":["rust","css","rust"],"functions":["testing"]})).unwrap();
+    let mut attributes = parse(json!({"languages":["rust","css","rust"],"functions":["testing"]})).unwrap();
     assert_eq!(attributes.languages.iter().map(String::as_str).collect::<Vec<_>>(), ["css", "rust"]);
+    attributes.validate().unwrap();
+    attributes.languages.insert("cobol".into());
+    assert!(attributes.validate().is_err());
 }
 
 #[test]

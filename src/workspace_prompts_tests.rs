@@ -14,7 +14,7 @@ fn workspace_agents_are_explicit_and_preserve_exact_model_effort_pairs() {
     assert!(WorkspaceSettings::default().validate(family).is_err());
 }
 
-struct Fixture(PathBuf, crate::test_support::Temp);
+struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("workspace-prompts-{}", crate::engine::id())).join("prompts");
@@ -23,9 +23,9 @@ impl Fixture {
             fs::write(path.join(default_file(kind)), format!("{kind} default instructions.")).unwrap();
         }
         fs::write(path.join("settings.json"), r#"{"planner":"sol_6_1_light","worker":"sol_6_1_light","updates":"events"}"#).unwrap();
-        Self(path, crate::test_support::Temp::new())
+        Self(path)
     }
-    fn engine(&self) -> Engine { self.1.open(self.0.join("board")).unwrap() }
+    fn engine(&self) -> Engine { Engine::new(self.0.join("board")).unwrap() }
     fn input(&self, name: &str) -> Value {
         json!({"path":self.0.join(name),"settings":{"planner":"sol_6_1_light","worker":"sol_6_1_light"}})
     }
@@ -58,9 +58,8 @@ fn creation_keeps_the_workspace_empty_and_freezes_selection_hashes() {
     let result = create(&mut engine, fixture.input("first"), &fixture.0).unwrap();
     let directory = PathBuf::from(result["workspace"].as_str().unwrap());
     let settings: WorkspaceSettings = serde_json::from_value(result["settings"].clone()).unwrap();
-    let registered = engine.service.call("GET", "/api/workspaces", None, "test").unwrap();
-    let entry = registered.as_array().unwrap().iter().find(|w| w["path"] == serde_json::json!(directory)).unwrap().clone();
-    assert_eq!((entry["name"].as_str(), entry["next"].as_u64()), (Some("FIR"), Some(0)));
+    assert_eq!(engine.state.workspace_ids[&directory].abbreviation, "FIR");
+    assert_eq!(engine.state.workspace_ids[&directory].next, 0);
     assert_eq!(fs::read_dir(&directory).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>(), [AGENTS_FILE, LIMITS_FILE]);
     let guide = fs::read_to_string(directory.join(AGENTS_FILE)).unwrap();
     let shown = directory.to_string_lossy().trim_start_matches(r"\\?\").to_owned();

@@ -1,8 +1,6 @@
-use crate::history::{self, Artifact, AttemptEvidence, Attributes, Event, Need, Role};
-use crate::client::{attempt_note, stage_label};
-use crate::task_service::Service;
-use crate::{Result, evidence, lock, now, process, read, require, write};
-use serde::{Deserialize, Serialize};
+use crate::history::{self, Artifact, AttemptEvidence, Attributes, Event, Need, Role, Size};
+use crate::{Result, evidence, lock, metrics, now, process, read, require, write};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -54,6 +52,11 @@ pub struct Dependency {
     pub target: String,
     pub reason: Option<DependencyReason>,
 }
+fn dependencies(value: &Value) -> Result<Vec<Dependency>> {
+    let links: Vec<Dependency> = serde_json::from_value(value.clone()).map_err(|e| format!("{e}; use after, or nothing"))?;
+    require(links.iter().all(|d| d.reason.is_some()), "Dependencies require a typed reason; use after, or nothing")?;
+    Ok(links)
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Attempt {
     pub id: String,
@@ -88,6 +91,10 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refinements: Vec<String>,
     pub cwd: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub attributes: Attributes,
     #[serde(default)]
@@ -179,8 +186,8 @@ impl Task {
             normalized(&self.outcome),
             self.acceptance.iter().map(|c| normalized(c)).collect::<Vec<_>>(),
             dependencies,
-            self.attributes.model,
-            self.attributes.effort,
+            self.model,
+            self.effort,
             self.cwd,
             self.attributes.role,
             self.attributes.needs,
@@ -190,7 +197,7 @@ impl Task {
     fn snapshot(&self) -> Value {
         json!({"title":self.title,"outcome":self.outcome,"acceptance":self.acceptance,"cwd":self.cwd,"workspaceId":self.workspace,"key":self.key,
             "dependencies":self.dependencies,"after":self.after,"parent":self.parent,"standalone":self.standalone,"conflicts":self.conflicts,"related":self.related,
-            "attributes":self.attributes,"definitionWords":self.definition_words()})
+            "model":self.model,"effort":self.effort,"attributes":self.attributes,"definitionWords":self.definition_words()})
     }
     pub fn record(&mut self, kind: &str, source: &str, evidence: Value) {
         self.history.push(Event::new(self, kind, source, evidence));
@@ -236,43 +243,96 @@ impl Task {
             .count()
     }
 }
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Definition {
-    id: String,
-    short_id: String,
-    workspace: PathBuf,
-    key: Option<String>,
-    title: String,
-    outcome: String,
-    acceptance: Vec<String>,
-    cwd: String,
-    attributes: Attributes,
-    parent: Option<String>,
-    standalone: bool,
-    dependencies: Vec<Dependency>,
-    after: Vec<String>,
-    conflicts: Vec<String>,
-    related: Vec<String>,
-    status: String,
-    archived: bool,
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(value: D) -> std::result::Result<Option<Option<T>>, D::Error> {
+    Ok(Some(Option::deserialize(value)?))
 }
-impl Definition {
-    fn apply(&self, task: &mut Task) {
-        task.short_id = Some(self.short_id.clone());
-        task.workspace = Some(self.workspace.clone());
-        task.key = self.key.clone();
-        task.title = self.title.clone();
-        task.outcome = self.outcome.clone();
-        task.acceptance = self.acceptance.clone();
-        task.cwd = self.cwd.clone();
-        task.attributes = self.attributes.clone();
-        task.parent = self.parent.clone();
-        task.standalone = self.standalone;
-        task.dependencies = self.dependencies.clone();
-        task.after = self.after.clone();
-        task.conflicts = self.conflicts.clone();
-        task.related = self.related.clone();
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Input {
+    key: Option<String>,
+    title: Option<String>,
+    outcome: Option<String>,
+    cwd: Option<String>,
+    acceptance: Option<Vec<String>>,
+    dependencies: Option<Vec<Dependency>>,
+    after: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    parent: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    standalone: Option<Option<bool>>,
+    conflicts: Option<Vec<String>>,
+    related: Option<Vec<String>>,
+    supersedes: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    effort: Option<Option<String>>,
+    attributes: Option<Value>,
+}
+impl Input {
+    fn parse(mut value: Value) -> Result<Self> {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("reason");
+        }
+        if let Some(value) = value.get("dependencies") {
+            dependencies(value)?;
+        }
+        if let Some(attributes) = value.get("attributes").and_then(Value::as_object) {
+            let unknown: Vec<_> = attributes.keys().filter(|k| !Attributes::FIELDS.contains(&k.as_str())).collect();
+            require(unknown.is_empty(), "Unknown attribute; use role, needs, languages, functions, priority, size, artifact or deploy")?;
+        }
+        serde_json::from_value(value).map_err(|e| format!("{e}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, attributes").into())
+    }
+    fn grouping(&self) -> Result<()> {
+        require(self.parent.as_ref().is_some_and(Option::is_some) ^ (self.standalone == Some(Some(true))), "Choose exactly one grouping: parent container or standalone true")?;
+        require(self.standalone != Some(None), "standalone must be a boolean")
+    }
+    fn apply(self, task: &mut Task) -> Result<()> {
+        if self.parent.is_some() || self.standalone.is_some() {
+            self.grouping()?;
+            task.parent = self.parent.clone().flatten();
+            task.standalone = self.standalone == Some(Some(true));
+        }
+        let text = |s: String| s.trim().to_owned();
+        if let Some(v) = self.title {
+            task.title = text(v);
+        }
+        if let Some(v) = self.outcome {
+            task.outcome = text(v);
+        }
+        if let Some(v) = self.acceptance {
+            task.acceptance = v.into_iter().map(text).collect();
+        }
+        if let Some(v) = self.cwd {
+            task.cwd = v;
+            task.workspace = Some(workspace(Path::new(&task.cwd))?);
+        }
+        if let Some(value) = self.dependencies {
+            task.dependencies = value;
+        }
+        for (field, value) in [(&mut task.after, self.after), (&mut task.conflicts, self.conflicts), (&mut task.related, self.related)] {
+            if let Some(mut value) = value {
+                value.dedup();
+                *field = value;
+            }
+        }
+        if let Some(v) = self.model {
+            task.model = v.filter(|m| !m.trim().is_empty());
+        }
+        if let Some(v) = self.effort {
+            task.effort = v;
+        }
+        if let Some(v) = self.attributes {
+            let mut merged = serde_json::to_value(&task.attributes)?;
+            match (merged.as_object_mut(), v.as_object()) {
+                (Some(base), Some(changes)) => base.extend(changes.clone()),
+                _ => merged = v,
+            }
+            task.attributes = serde_json::from_value(merged)?;
+            task.attributes.needs.sort();
+            task.attributes.needs.dedup();
+        }
+        Ok(())
     }
 }
 fn validate_workdir(path: &Path) -> Result<()> {
@@ -307,19 +367,6 @@ pub fn linked_file(path: &Path) -> bool {
     let Ok(file) = fs::OpenOptions::new().access_mode(0).open(path) else { return false };
     unsafe { info::<FILE_STANDARD_INFO>(&file, FileStandardInfo) }.is_some_and(|i| i.NumberOfLinks >= 2) && unsafe { info::<FILE_ID_INFO>(&file, FileIdInfo) }.is_some()
 }
-pub fn lock_reason(stage: &str) -> &'static str {
-    match stage {
-        "review" => "Reviewing",
-        "replan" => "Replanning",
-        _ => "Implementing",
-    }
-}
-pub fn path_key(path: &str) -> String {
-    path.strip_prefix(r"\\?\").unwrap_or(path).replace('/', "\\").trim_end_matches('\\').to_lowercase()
-}
-fn default_tasks() -> String {
-    "http://127.0.0.1:4243".into()
-}
 fn default_capabilities() -> Vec<Need> {
     vec![Need::Network]
 }
@@ -333,8 +380,6 @@ pub struct Config {
     pub capabilities: Vec<Need>,
     #[serde(default)]
     pub notify: Vec<String>,
-    #[serde(default = "default_tasks")]
-    pub tasks: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub planner: Vec<String>,
     #[serde(default)]
@@ -356,6 +401,8 @@ impl Config {
 pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) family: Option<crate::agents::Family>,
+    #[serde(default)]
+    batches: std::collections::BTreeMap<String, Value>,
     #[serde(default, rename = "schemaVersion")]
     schema_version: Option<u32>,
     pub paused: bool,
@@ -375,19 +422,88 @@ pub struct State {
     pub workspace_ids: BTreeMap<PathBuf, WorkspaceId>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sessions: BTreeMap<String, crate::sessions::Session>,
-    #[serde(default)]
-    pub outbox: Vec<Value>,
-    #[serde(default)]
-    pub cursor: u64,
-    #[serde(default, rename = "tasksMigrated")]
-    pub tasks_migrated: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceId {
     pub abbreviation: String,
     pub next: u64,
 }
+pub fn abbreviation(directory: &Path) -> String {
+    let name = directory.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut words: Vec<String> = Vec::new();
+    let mut previous: Option<char> = None;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            let joined = previous.is_some_and(|p| p.is_ascii_alphanumeric() && p.is_ascii_digit() == c.is_ascii_digit() && !(p.is_ascii_lowercase() && c.is_ascii_uppercase()));
+            if !joined {
+                words.push(String::new());
+            }
+            words.last_mut().unwrap().push(c.to_ascii_uppercase());
+        }
+        previous = Some(c);
+    }
+    let base: String = match words.as_slice() {
+        [] => "W".into(),
+        [only] if !only.starts_with(|c: char| c.is_ascii_digit()) => only.chars().take(3).collect(),
+        _ => words.iter().map(|word| if word.starts_with(|c: char| c.is_ascii_digit()) { word.clone() } else { word[..1].to_owned() }).collect(),
+    };
+    base.chars().take(4).collect()
+}
+fn letters(mut n: u64) -> String {
+    let mut text = Vec::new();
+    loop {
+        text.push(b'A' + (n % 26) as u8);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    text.reverse();
+    String::from_utf8(text).unwrap()
+}
 impl State {
+    pub(crate) fn short_name(&mut self, directory: &Path) -> String {
+        if !self.workspace_ids.contains_key(directory) {
+            let base = abbreviation(directory);
+            let taken: HashSet<&str> = self.workspace_ids.values().map(|w| w.abbreviation.as_str()).collect();
+            let chosen = std::iter::once(base.clone())
+                .chain((0..).map(|n| {
+                    let suffix = letters(n);
+                    base.chars().take(4usize.saturating_sub(suffix.len())).chain(suffix.chars()).collect()
+                }))
+                .find(|candidate: &String| !taken.contains(candidate.as_str()))
+                .unwrap();
+            self.workspace_ids.insert(directory.to_path_buf(), WorkspaceId { abbreviation: chosen, next: 0 });
+        }
+        self.workspace_ids[directory].abbreviation.clone()
+    }
+    pub(crate) fn next_short_id(&mut self, directory: &Path) -> String {
+        self.short_name(directory);
+        let entry = self.workspace_ids.get_mut(directory).unwrap();
+        entry.next += 1;
+        format!("{}-{}", entry.abbreviation, entry.next)
+    }
+    fn assign_short_ids(&mut self) {
+        let order = |id: &str| -> (u64, u64, u64) {
+            let parts: Vec<u64> = id.split('-').filter_map(|part| part.parse().ok()).collect();
+            (parts.first().copied().unwrap_or(0), parts.get(1).copied().unwrap_or(0), parts.get(2).copied().unwrap_or(0))
+        };
+        let mut missing: Vec<(bool, usize)> = (0..self.tasks.len())
+            .filter(|&i| self.tasks[i].short_id.is_none())
+            .map(|i| (false, i))
+            .chain((0..self.archived.len()).filter(|&i| self.archived[i].short_id.is_none()).map(|i| (true, i)))
+            .collect();
+        missing.sort_by_key(|&(archived, i)| order(&if archived { &self.archived[i] } else { &self.tasks[i] }.id));
+        for (archived, i) in missing {
+            let task = if archived { &self.archived[i] } else { &self.tasks[i] };
+            let directory = task.workspace.clone().unwrap_or_else(|| PathBuf::from(&task.cwd));
+            let short_id = self.next_short_id(&directory);
+            if archived { &mut self.archived[i] } else { &mut self.tasks[i] }.short_id = Some(short_id);
+        }
+        for directory in self.config.workspaces.keys().cloned().collect::<Vec<_>>() {
+            self.short_name(&directory);
+        }
+    }
     pub fn index(&self, id: &str) -> Result<usize> {
         self.tasks.iter().position(|task| task.id == id).ok_or_else(|| format!("Task not found: {id}").into())
     }
@@ -444,6 +560,27 @@ impl State {
     pub fn limits(&self, task: &Task) -> history::Limits {
         let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
         self.settings(key.as_deref()).limits
+    }
+    pub fn check_definition(&self, task: &Task) -> Result<()> {
+        let limits = self.limits(task);
+        require(!(task.title.is_empty() || task.outcome.is_empty() || task.cwd.trim().is_empty()), "Title, outcome and cwd are required")?;
+        require(history::words(&task.title) <= limits.title_words, format!("Title exceeds {} words", limits.title_words))?;
+        require(task.acceptance.len() <= limits.criteria, format!("At most {} acceptance criteria; split the work into child tasks under a container", limits.criteria))?;
+        require(!task.acceptance.iter().any(|c| c.is_empty()), "Acceptance criteria must not be blank")?;
+        require(task.definition_words() <= limits.words, format!("Definition exceeds {} words; split the work into child tasks under a container", limits.words))?;
+        require(![&task.title, &task.outcome].into_iter().chain(&task.acceptance).any(|t| history::coordination_prose(t)), "Task ids, digests and AGENTS.md belong in relations and worker protocol, not task prose")?;
+        require(!(task.attributes.size == Size::Large && !task.container()), "Large work must be a container with child tasks")?;
+        require(!(task.container() && task.attributes.artifact != Artifact::None), "Containers produce no artifact; children do")?;
+        task.attributes.validate()?;
+        if let Some(model) = task.attributes.model.as_deref() {
+            require(!task.container(), "Containers run no worker; set model on their children")?;
+            let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
+            self.settings(key.as_deref()).task_agent(Some(model), self.family)?;
+        }
+        task.effort.as_deref().map(history::effort).transpose()?;
+        let missing: Vec<_> = task.attributes.needs.iter().filter(|need| !self.config.capabilities.contains(need)).collect();
+        require(missing.is_empty(), format!("No worker provides {}; choose a verification the workers can run", serde_json::to_string(&missing)?))?;
+        validate_workdir(task.workdir())
     }
     fn check_relations(&self, task: &Task) -> Result<()> {
         require(!(task.parent.is_some() && task.standalone), "Choose exactly one grouping: parent container or standalone true")?;
@@ -522,107 +659,168 @@ impl State {
         }
         found
     }
-    pub fn adopt(&mut self, value: &Value, source: &str, actor: Option<&str>) -> Result<()> {
-        self.adopt_with(value, source, actor, &Value::Null)
-    }
-    pub fn adopt_with(&mut self, value: &Value, source: &str, actor: Option<&str>, evidence: &Value) -> Result<()> {
-        let definition: Definition = serde_json::from_value(value.clone()).map_err(|e| format!("Task service sent an unreadable task: {e}"))?;
-        let stamp = |task: &mut Task| {
-            if let Some(actor) = actor
-                && let Some(event) = task.history.last_mut()
-                && event.actor.is_none()
-            {
-                event.actor = Some(actor.to_owned());
-            }
-        };
-        let position = self.tasks.iter().position(|t| t.id == definition.id);
-        if definition.archived {
-            if let Some(index) = position {
-                let mut task = self.tasks.remove(index);
-                match source {
-                    "superseded" => task.record("superseded", "create", json!({"by":evidence["by"]})),
-                    _ => task.record(if task.stage == "done" { "archived" } else { "abandoned" }, source, Value::Null),
-                }
-                stamp(&mut task);
-                self.archived.push(task);
-            }
-            return Ok(());
+    fn insert(&mut self, value: Value, parent_override: Option<String>) -> Result<String> {
+        let mut input = Input::parse(value)?;
+        if let Some(parent) = parent_override {
+            input.parent = Some(Some(parent));
+            input.standalone = None;
         }
-        let Some(index) = position else {
-            let mut task: Task = serde_json::from_value(
-                json!({"id":definition.id,"title":"","outcome":"","cwd":definition.cwd,"acceptance":[],"dependencies":[],"stage":"implementation","stopped":false,"attempts":[],"active":null,"feedback":[],"failure":"","retryAt":0}),
-            )?;
-            definition.apply(&mut task);
-            if definition.status == "Done" {
-                task.stage = "done".into();
+        input.grouping()?;
+        let key = input.key.as_ref().map(|key| key.trim().to_owned());
+        require(!key.as_ref().is_some_and(String::is_empty), "Task key must not be blank")?;
+        let cwd = input.cwd.clone().ok_or("cwd is required")?;
+        let directory = workspace(Path::new(&cwd))?;
+        let run_directory = directory.clone();
+        let directory = self.owning_workspace(directory);
+        if let Some(key) = &key
+            && let Some(index) = self.tasks.iter().position(|task| task.key.as_ref() == Some(key) && task.workspace.as_ref() == Some(&directory) && (directory == run_directory || task.cwd == cwd))
+        {
+            let id = self.tasks[index].id.clone();
+            self.revise(index, input, "keyed_create")?;
+            return Ok(id);
+        }
+        let supersedes = input.supersedes.clone().unwrap_or_default();
+        let mut task: Task = serde_json::from_value(
+            json!({"id":id(),"title":"","outcome":"","cwd":cwd,"acceptance":[],"dependencies":[],"stage":"implementation","stopped":false,"attempts":[],"active":null,"feedback":[],"failure":"","retryAt":0,"key":key,"workspace":directory}),
+        )?;
+        input.apply(&mut task)?;
+        task.workspace = task.workspace.take().map(|directory| self.owning_workspace(directory));
+        self.check_definition(&task)?;
+        self.check_relations(&task)?;
+        if let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id)) {
+            require(parent.stage != "done", "Cannot add work under a completed container")?;
+        }
+        let directory = task.workspace.clone().unwrap_or_else(|| PathBuf::from(&task.cwd));
+        task.short_id = Some(self.next_short_id(&directory));
+        let id = task.id.clone();
+        for old in &supersedes {
+            let index = self.index(old)?;
+            require(self.tasks[index].active.is_none() && self.children(old).next().is_none(), "Superseded tasks must be idle and have no children")?;
+            for other in &mut self.tasks {
+                let before = other.snapshot();
+                for link in other.dependencies.iter_mut().filter(|d| &d.target == old) {
+                    link.target = id.clone();
+                }
+                for list in [&mut other.after] {
+                    for entry in list.iter_mut().filter(|entry| *entry == old) {
+                        *entry = id.clone();
+                    }
+                }
+                if before != other.snapshot() {
+                    other.record("rewired", "supersession", json!({"before":before,"after":other.snapshot()}));
+                }
             }
-            let mut snapshot = task.snapshot();
-            if let Some(retired) = evidence.get("supersedes") {
-                snapshot["supersedes"] = retired.clone();
+            let mut retired = self.tasks.remove(index);
+            retired.record("superseded", "create", json!({"by":id}));
+            self.archived.push(retired);
+        }
+        let mut snapshot = task.snapshot();
+        snapshot["supersedes"] = json!(supersedes);
+        task.record("created", "create", snapshot);
+        self.tasks.push(task);
+        for task in &self.tasks {
+            self.check_relations(task)?;
+        }
+        Ok(id)
+    }
+    fn insert_children(&mut self, parent: &str, children: &[Value]) -> Result<Value> {
+        require(!children.is_empty(), "Children are required")?;
+        let mut mapping = serde_json::Map::new();
+        let mut definitions = Vec::new();
+        for child in children {
+            let mut value = child.clone();
+            let object = value.as_object_mut().ok_or("Child must be an object")?;
+            let key = object.remove("localKey").and_then(|v| v.as_str().map(str::to_owned)).ok_or("Child localKey is required")?;
+            require(!key.trim().is_empty() && !mapping.contains_key(&key), "Child local keys must be nonblank and unique")?;
+            require(!object.contains_key("key") && !object.contains_key("supersedes") && !object.contains_key("parent") && !object.contains_key("standalone"), "Children inherit grouping and cannot replace tasks")?;
+            object.entry("cwd").or_insert(json!(self.get(parent).ok_or("Missing container")?.cwd));
+            let mut initial = value.clone();
+            for field in ["dependencies", "after", "conflicts", "related"] {
+                initial.as_object_mut().unwrap().remove(field);
             }
-            task.record("created", source, snapshot);
-            stamp(&mut task);
-            self.tasks.push(task);
-            return Ok(());
+            let id = self.insert(initial, Some(parent.to_owned()))?;
+            mapping.insert(key, json!(id));
+            definitions.push((id, value));
+        }
+        let resolve = |target: &mut Value| -> Result<()> {
+            if let Some(object) = target.as_object() {
+                require(object.len() == 1, "Sibling reference must contain only local")?;
+                let key = object.get("local").and_then(Value::as_str).ok_or("Sibling reference requires local key")?;
+                *target = mapping.get(key).cloned().ok_or("Unknown sibling local key")?;
+            }
+            require(target.is_string(), "Reference must be a task ID or local reference")
         };
+        for (id, mut value) in definitions {
+            if let Some(links) = value.get_mut("dependencies") {
+                for link in links.as_array_mut().ok_or("Dependencies must be an array")? {
+                    resolve(link.get_mut("target").ok_or("Dependency target is required")?)?;
+                }
+            }
+            for field in ["after", "conflicts", "related"] {
+                if let Some(links) = value.get_mut(field) {
+                    for target in links.as_array_mut().ok_or("Relations must be arrays")? {
+                        resolve(target)?;
+                    }
+                }
+            }
+            let index = self.index(&id)?;
+            Input::parse(value)?.apply(&mut self.tasks[index])?;
+            self.tasks[index].workspace = self.tasks[index].workspace.clone().map(|directory| self.owning_workspace(directory));
+            self.check_definition(&self.tasks[index])?;
+            let snapshot = self.tasks[index].snapshot();
+            self.tasks[index].history.clear();
+            self.tasks[index].record("created", "create", snapshot);
+        }
+        for task in &self.tasks {
+            self.check_relations(task)?;
+        }
+        Ok(Value::Object(mapping))
+    }
+    fn revise(&mut self, index: usize, input: Input, source: &str) -> Result<()> {
+        require(input.supersedes.is_none(), "supersedes applies only when creating a task")?;
         let previous = self.tasks[index].clone();
         let mut task = previous.clone();
-        definition.apply(&mut task);
-        if task.snapshot() == previous.snapshot() && task.short_id == previous.short_id {
+        input.apply(&mut task)?;
+        task.workspace = task.workspace.take().map(|directory| self.owning_workspace(directory));
+        if task.parent != previous.parent
+            && let Some(parent) = task.parent.as_deref().and_then(|id| self.get(id))
+        {
+            require(parent.stage != "done", "Cannot add work under a completed container")?;
+        }
+        if task.snapshot() == previous.snapshot() {
             return Ok(());
         }
-        let corrective = source != "rewired" && (task.signature() != previous.signature() || (previous.stage == "replan" && !task.refinements.is_empty()));
+        require(previous.active.is_none(), "Stop the task and wait for its worker to exit before editing")?;
+        self.check_definition(&task)?;
+        self.check_relations(&task)?;
+        if task.attributes.model != previous.attributes.model {
+        }
+        let corrective = task.signature() != previous.signature() || (previous.stage == "replan" && !task.refinements.is_empty());
         if corrective {
             task.refinements.clear();
             if source != "replan" {
                 task.inherited.clear();
                 task.replanned = false;
             }
-            let name = task.short_id.clone().unwrap_or_else(|| task.id.clone());
             for dependent in self.dependents(&task.id) {
                 let other = &mut self.tasks[dependent];
+                require(other.active.is_none(), format!("Stop dependent task \"{}\" before changing its prerequisite", other.title))?;
                 if other.stage != "implementation" || other.attempts.iter().any(|a| a.revision == other.revision) {
                     let from = other.stage.clone();
                     other.reset_work();
                     other.record("reopened", source, json!({"causedBy":task.id}));
                     other.record_phase(&from, source);
-                    let id = other.id.clone();
-                    self.outbox.push(json!({"op":"note","task":id,"kind":"reopened","text":format!("Reopened because its prerequisite {name} changed")}));
                 }
             }
             task.reset_work();
         }
-        task.record(if corrective { "revised" } else if source == "rewired" { "rewired" } else { "updated" }, source, task.snapshot());
-        stamp(&mut task);
+        task.record(if corrective { "revised" } else { "updated" }, source, task.snapshot());
         task.record_phase(&previous.stage, source);
         self.tasks[index] = task;
-        Ok(())
-    }
-    pub fn schema(&self, path: &Path) -> Value {
-        let settings = self.settings(Some(path));
-        let limits = settings.limits;
-        let mut models: Vec<String> = crate::agents::enabled(&settings.agents, self.family).into_iter().filter(|(_, agent)| !agent.planner_only).map(|(id, _)| id).collect();
-        if let Some(worker) = settings.worker.clone().filter(|w| !models.contains(w)) {
-            models.push(worker);
+        for task in &self.tasks {
+            self.check_relations(task)?;
         }
-        json!({"attributes":{
-                "role":{"type":"enum","values":history::ROLES,"default":"worker","notes":self.task_schema(Some(path))["roleNotes"],"display":"primary"},
-                "needs":{"type":"set","values":self.config.capabilities,"label":"Capabilities","description":"What the worker must be able to run"},
-                "languages":{"type":"set","values":history::LANGUAGES,"display":"tags"},
-                "functions":{"type":"set","values":history::FUNCTIONS,"display":"tags"},
-                "priority":{"type":"integer","min":0,"max":3,"default":2,"display":"priority","description":"0 is the highest priority"},
-                "size":{"type":"enum","values":history::SIZES,"default":"small"},
-                "artifact":{"type":"enum","values":history::ARTIFACTS,"default":"none"},
-                "deploy":{"type":"boolean","label":"Deploy candidate on acceptance"},
-                "model":{"type":"enum","values":models,"nullable":true,"description":"Worker agent; empty uses the workspace default"},
-                "effort":{"type":"enum","values":["minimal","low","medium","high","xhigh"],"nullable":true}},
-            "limits":{"titleWords":limits.title_words,"words":limits.words,"criteria":limits.criteria},
-            "dependencyReasons":DEPENDENCY_REASONS,
-            "rules":[
-                {"when":{"size":"large"},"then":{"container":true},"message":"Large work must be a container with child tasks"},
-                {"when":{"container":true},"then":{"artifact":"none"},"message":"Containers produce no artifact; children do"},
-                {"when":{"deploy":true},"then":{"artifact":"candidate"},"message":"deploy requires artifact candidate"},
-                {"when":{"container":true},"then":{"model":null},"message":"Containers run no worker; set model on their children"}]})
+        Ok(())
     }
     fn settle_containers(&mut self) -> bool {
         let mut changed = false;
@@ -655,17 +853,9 @@ pub struct Engine {
     pub pending_deploy: Option<String>,
     pub notices: Vec<Value>,
     pub actor: Option<String>,
-    pub service: Service,
-    pub port: u16,
-    pub(crate) pushed: HashMap<String, String>,
-    pub(crate) announced: Option<(Value, std::time::Instant)>,
-    pub(crate) registered: HashSet<PathBuf>,
 }
 impl Engine {
     pub fn new(directory: PathBuf) -> Result<Self> {
-        Self::open(directory, None)
-    }
-    pub fn open(directory: PathBuf, service: Option<&str>) -> Result<Self> {
         let file = directory.join("state.json");
         let mut state: State = if file.exists() {
             let mut raw: Value = read(&file)?;
@@ -702,19 +892,11 @@ impl Engine {
             serde_json::from_value(raw).map_err(|e| format!("{e}; use after, or nothing"))?
         } else {
             let command = vec![std::env::current_exe()?.to_string_lossy().into(), "--external".into()];
-            let config = Config {
-                implementation: command.clone(),
-                review: command.clone(),
-                replan: command,
-                capabilities: default_capabilities(),
-                notify: Vec::new(),
-                tasks: default_tasks(),
-                planner: Vec::new(),
-                workspaces: BTreeMap::new(),
-                limits: BTreeMap::new(),
-            };
+            let config =
+                Config { implementation: command.clone(), review: command.clone(), replan: command, capabilities: default_capabilities(), notify: Vec::new(), planner: Vec::new(), workspaces: BTreeMap::new(), limits: BTreeMap::new() };
             State {
                 family: None,
+                batches: Default::default(),
                 schema_version: Some(history::SCHEMA_VERSION),
                 paused: false,
                 controls: Vec::new(),
@@ -726,12 +908,22 @@ impl Engine {
                 changes: BTreeMap::new(),
                 workspace_ids: BTreeMap::new(),
                 sessions: BTreeMap::new(),
-                outbox: Vec::new(),
-                cursor: 0,
-                tasks_migrated: true,
             }
         };
         require(!(state.schema_version > Some(history::SCHEMA_VERSION)), "State schema is newer than this coordinator")?;
+        if state.schema_version < Some(4) && directory.join("relationship-plan.json").exists() {
+            let plan: Value = read(&directory.join("relationship-plan.json"))?;
+            for decision in plan["tasks"].as_array().ok_or("Relationship plan requires tasks")? {
+                if let Some(task) = state.tasks.iter_mut().find(|t| decision["id"] == t.id) {
+                    let before = task.snapshot();
+                    let grouping = Input::parse(json!({"parent":decision.get("parent").cloned().unwrap_or(Value::Null),"standalone":decision.get("standalone").cloned().unwrap_or(json!(false))}))?;
+                    grouping.apply(task)?;
+                    task.dependencies = dependencies(&decision["dependencies"])?;
+                    task.after = serde_json::from_value(decision["after"].clone())?;
+                    task.record("relationships_classified", "relationship-plan.json", json!({"before":before,"after":task.snapshot()}));
+                }
+            }
+        }
         for task in &state.tasks {
             if task.dependencies.iter().all(|d| d.reason.is_some()) {
                 state.check_relations(task)?;
@@ -750,18 +942,21 @@ impl Engine {
             if task.legacy_evidence.to_string().contains("candidate") && task.attributes.artifact == Artifact::None {
                 task.attributes.artifact = Artifact::Candidate;
             }
+            let task = &state.tasks[index];
+            let invalid = !task.refinements.is_empty() || state.check_definition(task).is_err();
+            if !task.stopped && !task.blocked && task.stage != "done" && task.active.is_none() && invalid && task.stage != "replan" {
+                let task = &mut state.tasks[index];
+                let from = task.stage.clone();
+                task.stage = "replan".into();
+                task.blocked = false;
+                task.feedback = vec!["Legacy definition violates current limits; rewrite it with typed attributes and relations".into()];
+                task.record_phase(&from, "migration");
+            }
         }
+        state.assign_short_ids();
         state.schema_version = Some(history::SCHEMA_VERSION);
-        if let Some(url) = service {
-            state.config.tasks = url.to_owned();
-        }
         write(&file, &state)?;
-        let url = service.map(str::to_owned).or_else(|| std::env::var("AGENT_TASKS_URL").ok()).unwrap_or_else(|| state.config.tasks.clone());
-        let port = read(&directory.join("port.json")).unwrap_or(4242);
-        let mut engine =
-            Self { directory, state, pending_deploy: None, notices: Vec::new(), actor: None, service: Service::new(&url), port, pushed: HashMap::new(), announced: None, registered: HashSet::new() };
-        engine.connect()?;
-        Ok(engine)
+        Ok(Self { directory, state, pending_deploy: None, notices: Vec::new(), actor: None })
     }
     pub fn task(&self, id: &str) -> Result<usize> {
         self.state.index(id)
@@ -847,6 +1042,7 @@ impl Engine {
         value["definitionWords"] = json!(task.definition_words());
         value["waitingReason"] = json!(task.recorded_wait);
         value["strikes"] = json!(task.strikes());
+        value["analytics"] = metrics::lifecycle(task);
         let mut models: Vec<Value> = Vec::new();
         for attempt in task.attempts.iter().filter(|a| a.stage == "implementation") {
             let effective = attempt.evidence.configuration.as_ref().map(|c| &c["effective"]).filter(|e| e["model"].is_string());
@@ -859,63 +1055,35 @@ impl Engine {
         value["models"] = json!(models);
         Ok(value)
     }
-    fn actor_name(&self) -> String {
-        self.actor.clone().unwrap_or_else(|| "coordinator".into())
-    }
-    fn prepare(&mut self, mut input: Value, workspace_field: bool) -> Result<Value> {
-        let object = input.as_object_mut().ok_or("Task must be an object")?;
-        object.remove("reason");
-        for field in ["model", "effort"] {
-            if let Some(value) = object.remove(field).filter(|v| !v.is_null()) {
-                let attributes = object.entry("attributes").or_insert(json!({}));
-                require(attributes.is_object(), "attributes must be an object")?;
-                attributes[field] = value;
-            }
-        }
-        let texts = ["title", "outcome"].iter().filter_map(|f| object.get(*f).and_then(Value::as_str)).chain(object.get("acceptance").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str));
-        require(!texts.into_iter().any(history::coordination_prose), "Task ids, digests and AGENTS.md belong in relations and worker protocol, not task prose")?;
-        if workspace_field && let Some(cwd) = object.get("cwd").and_then(Value::as_str) {
-            let directory = self.state.owning_workspace(workspace(Path::new(cwd))?);
-            if !self.registered.contains(&directory) {
-                self.register_workspace(&directory)?;
-            }
-            input["workspace"] = json!(directory);
-        }
-        Ok(input)
-    }
-    fn settle(&mut self) -> Result<()> {
-        self.flush()?;
-        self.publish()
-    }
     pub fn create(&mut self, input: Value) -> Result<Value> {
-        self.settle()?;
-        let input = self.prepare(input, true)?;
-        let created = self.service.call("POST", "/api/tasks", Some(&input), &self.actor_name())?;
-        self.sync()?;
-        let id = created["id"].as_str().ok_or("Task service omitted the task id")?;
-        self.task_value(&self.state.tasks[self.task(id)?], false)
+        let id = self.change(|state| Ok(json!(state.insert(input, None)?)))?;
+        self.task_value(&self.state.tasks[self.task(id.as_str().unwrap())?], false)
     }
-    pub fn create_batch(&mut self, mut input: Value) -> Result<Value> {
-        self.settle()?;
-        let container = input.get("container").cloned();
-        if let Some(container) = container.filter(Value::is_object) {
-            input["container"] = self.prepare(container, true)?;
+    pub fn create_batch(&mut self, input: Value) -> Result<Value> {
+        let object = input.as_object().ok_or("Batch must be an object")?;
+        require(object.keys().all(|k| ["requestKey", "container", "children"].contains(&k.as_str())), "Unknown batch field")?;
+        let key = input["requestKey"].as_str().filter(|s| !s.trim().is_empty()).ok_or("requestKey is required")?.to_owned();
+        if let Some(receipt) = self.state.batches.get(&key) {
+            require(receipt["input"] == input, "Conflicting request replay")?;
+            return Ok(receipt["result"].clone());
         }
-        let children = input.get("children").and_then(Value::as_array).cloned();
-        if let Some(children) = children {
-            input["children"] = json!(children.into_iter().map(|child| if child.is_object() { self.prepare(child, false) } else { Ok(child) }).collect::<Result<Vec<_>>>()?);
-        }
-        let result = self.service.call("POST", "/api/tasks/batch", Some(&input), &self.actor_name())?;
-        self.sync()?;
-        Ok(result)
+        self.change(|state| {
+            let container = input["container"].clone();
+            let parsed = Input::parse(container.clone())?;
+            require(parsed.key.is_none() && parsed.supersedes.is_none(), "Batch container cannot replace existing tasks")?;
+            let id = state.insert(container, None)?;
+            require(state.get(&id).unwrap().container(), "Container must have no acceptance criteria")?;
+            let children = input["children"].as_array().ok_or("Children must be an array")?;
+            let mapping = state.insert_children(&id, children)?;
+            let result = json!({"container":id,"children":mapping});
+            state.batches.insert(key, json!({"input":input,"result":result}));
+            Ok(result)
+        })
     }
     pub fn edit(&mut self, id: &str, input: Value) -> Result<Value> {
-        self.task(id)?;
-        self.settle()?;
-        let input = self.prepare(input, true)?;
-        self.service.call("PATCH", &format!("/api/tasks/{}", Service::encode(id)), Some(&input), &self.actor_name())?;
-        self.sync()?;
-        self.task_value(&self.state.tasks[self.task(id)?], false)
+        let index = self.task(id)?;
+        self.change(|state| state.revise(index, Input::parse(input)?, "edit").map(|()| Value::Null))?;
+        self.task_value(&self.state.tasks[index], false)
     }
     pub fn request_replan(&mut self, id: &str, input: Value) -> Result<Value> {
         let index = self.task(id)?;
@@ -937,10 +1105,22 @@ impl Engine {
         self.task_value(&self.state.tasks[index], false)
     }
     pub fn remove(&mut self, id: &str) -> Result<()> {
-        self.task(id)?;
-        self.settle()?;
-        self.service.call("DELETE", &format!("/api/tasks/{}", Service::encode(id)), None, &self.actor_name())?;
-        self.sync()
+        let index = self.task(id)?;
+        let task = &self.state.tasks[index];
+        require(task.active.is_none(), "Task has an active worker")?;
+        let referenced = self.state.tasks.iter().any(|t| t.parent.as_deref() == Some(id) || t.dependencies.iter().map(|d| &d.target).chain(&t.after).any(|d| d == id));
+        require(!referenced, "Task has children or dependents; supersede it instead")?;
+        self.change(|state| {
+            let mut task = state.tasks.remove(index);
+            for other in &mut state.tasks {
+                other.conflicts.retain(|c| c != id);
+                other.related.retain(|c| c != id);
+            }
+            task.record(if task.stage == "done" { "archived" } else { "abandoned" }, "delete", Value::Null);
+            state.archived.push(task);
+            Ok(Value::Null)
+        })
+        .map(drop)
     }
     pub fn wipe(&mut self) -> Result<Value> {
         crate::sessions::stop_all(self);
@@ -976,21 +1156,14 @@ impl Engine {
                 errors.push(format!("{}: {error}", folder.display()));
             }
         }
-        let spaces: std::collections::BTreeSet<PathBuf> = self.state.config.workspaces.keys().cloned().chain(self.state.tasks.iter().chain(&self.state.archived).filter_map(|t| t.workspace.clone())).collect();
-        for path in &spaces {
-            if let Err(error) = self.service.call("POST", "/api/wipe", Some(&json!({"workspace":path})), "coordinator") {
-                errors.push(format!("Task service {}: {error}", path.display()));
-            }
-        }
-        self.registered.clear();
         let state = &self.state;
-        let deleted = json!({"tasks":state.tasks.len(),"archived":state.archived.len(),"workspaces":state.config.workspaces.len(),"stoppedWorkers":active.len()});
+        let deleted = json!({"tasks":state.tasks.len(),"archived":state.archived.len(),"workspaces":state.config.workspaces.len(),"batches":state.batches.len(),"stoppedWorkers":active.len()});
         let mut state = self.state.clone();
         state.tasks.clear();
         state.archived.clear();
         state.controls.clear();
+        state.batches.clear();
         state.changes.clear();
-        state.outbox.clear();
         state.config.workspaces.clear();
         state.config.limits.clear();
         state.sessions.clear();
@@ -1021,8 +1194,8 @@ impl Engine {
         self.change(|state| {
             state.config = config;
             Ok(Value::Null)
-        })?;
-        self.register_workspaces()
+        })
+        .map(drop)
     }
     pub fn control(&mut self, stop: bool, id: Option<&str>) -> Result<()> {
         if let Some(id) = id {
@@ -1142,7 +1315,7 @@ impl Engine {
             return self.return_conflicted(index, git);
         }
         let cwd = git.as_ref().map_or_else(|| task.workdir().to_path_buf(), |g| crate::git::map(task.workdir(), g));
-        let settings = json!({"scratch":true,"acceptance":task.acceptance,"requested":{"model":task.attributes.model,"effort":task.attributes.effort},"effective":{"worker":worker,"agent":agent,"family":self.state.family,"model":agent.model,"effort":agent.effort},"needs":task.attributes.needs,
+        let settings = json!({"scratch":true,"acceptance":task.acceptance,"requested":{"model":task.model,"effort":task.effort},"effective":{"worker":worker,"agent":agent,"family":self.state.family,"model":agent.model,"effort":agent.effort},"needs":task.attributes.needs,
             "registeredCommand":registered,"actualCommand":actual_command,"stage":stage,"request":"request.json","revision":task.revision,
             "workspaceId":task.workspace,"cwd":cwd,
             "coordinatorVersion":env!("CARGO_PKG_VERSION"),"coordinatorBuild":crate::web::deployment()["digest"]});
@@ -1171,12 +1344,7 @@ impl Engine {
         request["run_id"] = json!(attempt.id);
         write(&self.attempt_path(&attempt.id).join("request.json"), &request)?;
         let attempt_id = attempt.id.clone();
-        let task_id = task.id.clone();
-        let number = task.attempts.iter().filter(|a| a.stage == stage).count() + 1;
-        let started = format!("{} attempt {number} started · {} · {}", stage_label(&stage), agent.model, agent.effort());
-        self.service.lock(&task_id, lock_reason(&stage))?;
         self.change(|state| {
-            state.outbox.push(json!({"op":"note","task":task_id,"kind":"started","text":started}));
             let (workspace, mut attempt) = (state.tasks[index].workspace.clone(), attempt);
             for other in state.tasks.iter_mut().filter(|other| other.active.is_some() && other.workspace == workspace) {
                 attempt.evidence.project_overlapping_attempts.push(other.active.clone().unwrap());
@@ -1263,18 +1431,13 @@ impl Engine {
         }
         Ok(result)
     }
-    fn apply_plan(&self, state: &mut State, index: usize, plan: &Value, key: &str) -> Result<()> {
+    fn apply_plan(state: &mut State, index: usize, plan: &Value) -> Result<()> {
         let mut next = state.clone();
-        self.service.unlock(&next.tasks[index].id)?;
-        self.plan(&mut next, index, plan, key)?;
+        Self::plan(&mut next, index, plan)?;
         *state = next;
         Ok(())
     }
-    fn refresh(&self, state: &mut State, id: &str) -> Result<()> {
-        let value = self.service.task(id)?.ok_or_else(|| format!("Task service no longer has {id}"))?;
-        state.adopt(&value, "replan", Some("coordinator"))
-    }
-    fn plan(&self, state: &mut State, index: usize, plan: &Value, key: &str) -> Result<()> {
+    fn plan(state: &mut State, index: usize, plan: &Value) -> Result<()> {
         let task = state.tasks[index].clone();
         let children = plan["children"].as_array().cloned().unwrap_or_default();
         let failures = task.failures();
@@ -1301,8 +1464,7 @@ impl Engine {
             if let Some(links) = plan.get("dependencies") {
                 value["dependencies"] = links.clone();
             }
-            self.service.call("PATCH", &format!("/api/tasks/{}", Service::encode(&task.id)), Some(&value), "coordinator")?;
-            self.refresh(state, &task.id)?;
+            state.revise(index, Input::parse(value)?, "replan")?;
             require(state.tasks[index].stage != "replan", "Plan did not change the task definition")?;
             return inherit(state, &task.id);
         }
@@ -1310,7 +1472,7 @@ impl Engine {
         if let Some(links) = plan.get("dependencies") {
             value["dependencies"] = links.clone();
         }
-        value["id"] = json!(task.id);
+        state.revise(index, Input::parse(value)?, "replan")?;
         let mut definitions = Vec::new();
         for (index, child) in children.iter().enumerate() {
             let mut value = base(child, false, false);
@@ -1327,14 +1489,8 @@ impl Engine {
             value["dependencies"] = links;
             definitions.push(value);
         }
-        let result = self.service.call("POST", "/api/tasks/batch", Some(&json!({"requestKey":key,"container":value,"children":definitions})), "coordinator")?;
-        self.refresh(state, &task.id)?;
-        let created: Vec<String> = result["children"].as_object().into_iter().flat_map(|m| m.values()).filter_map(Value::as_str).map(str::to_owned).collect();
-        for id in &created {
-            self.refresh(state, id)?;
-            inherit(state, id)?;
-        }
-        Ok(())
+        let mapping = state.insert_children(&task.id, &definitions)?;
+        mapping.as_object().into_iter().flat_map(|m| m.values()).filter_map(Value::as_str).try_for_each(|id| inherit(state, id))
     }
     fn collect(&mut self, index: usize, exit: Value) -> Result<()> {
         let task = &self.state.tasks[index];
@@ -1342,7 +1498,6 @@ impl Engine {
             return Ok(());
         };
         let stopped = exit["stopped"] == true;
-        let key = format!("replan-{}", attempt.id);
         let directory = self.attempt_path(&attempt.id);
         let result = self.validate_result(task, attempt, &exit);
         let log = fs::read_to_string(directory.join("log.txt")).unwrap_or_default();
@@ -1373,7 +1528,6 @@ impl Engine {
         attempt.evidence.cpu_seconds = process::cpu_seconds(&directory);
         let mut deploy = false;
         let mut notice = None;
-        let mut notes: Vec<Value> = Vec::new();
         match (stopped, result) {
             (true, _) => attempt.error = Some("Stopped by user".into()),
             (false, Err(error)) => {
@@ -1409,15 +1563,11 @@ impl Engine {
                     task.feedback = serde_json::from_value(result["findings"].clone())?;
                     match result["status"].as_str().unwrap() {
                         "replanned" => {
-                            let id = task.id.clone();
-                            match self.apply_plan(&mut state, index, &result["plan"], &key) {
-                                Ok(()) => notes.push(json!({"op":"note","task":id,"kind":"replanned","text":format!("Replanned: {}", result["summary"].as_str().unwrap_or_default())})),
-                                Err(error) => {
-                                    let limits = state.limits(&state.tasks[index]);
-                                    let task = &mut state.tasks[index];
-                                    task.attempts.last_mut().unwrap().result.as_mut().unwrap()["planError"] = json!(error.to_string());
-                                    task.feedback = vec![history::clip(&error.to_string(), limits.finding_words)];
-                                }
+                            if let Err(error) = Self::apply_plan(&mut state, index, &result["plan"]) {
+                                let limits = state.limits(&state.tasks[index]);
+                                let task = &mut state.tasks[index];
+                                task.attempts.last_mut().unwrap().result.as_mut().unwrap()["planError"] = json!(error.to_string());
+                                task.feedback = vec![history::clip(&error.to_string(), limits.finding_words)];
                             }
                         }
                         "held" => {
@@ -1439,11 +1589,7 @@ impl Engine {
                                 && let Some(git) = git
                             {
                                 match crate::git::merge(&git, &format!("{name} {}", task.title)) {
-                                    Ok(commit) => {
-                                        let text = format!("Merged {} into {} at {}", git["branch"].as_str().unwrap_or_default(), git["main"].as_str().unwrap_or_default(), json!(commit).as_str().unwrap_or_default());
-                                        notes.push(json!({"op":"note","task":task.id,"kind":"merged","text":text}));
-                                        task.record("merged", "git", json!({"branch":git["branch"],"into":git["main"],"commit":commit}));
-                                    }
+                                    Ok(commit) => task.record("merged", "git", json!({"branch":git["branch"],"into":git["main"],"commit":commit})),
                                     Err(error) => {
                                         let main = git["main"].as_str().unwrap_or_default();
                                         task.stage = "implementation".into();
@@ -1475,16 +1621,7 @@ impl Engine {
         task.record_phase(&previous_stage, "attempt_collection");
         evidence::clean_scratch(&directory, task.attempts.last().unwrap());
         let task_id = task.id.clone();
-        let finished = attempt_note(task, task.attempts.last().unwrap());
-        let link = format!("http://127.0.0.1:{}/api/attempts/{}/log", self.port, task.attempts.last().unwrap().id);
-        state.outbox.push(json!({"op":"note","task":task_id,"kind":"finished","text":finished,"link":link}));
-        state.outbox.extend(notes);
-        if let Some(held) = notice.as_ref().filter(|n| n["event"] == "held") {
-            state.outbox.push(json!({"op":"note","task":task_id,"kind":"held","text":format!("Needs a decision: {}", held["reason"].as_str().unwrap_or_default())}));
-        }
-        state.outbox.push(json!({"op":"unlock","task":task_id}));
         self.commit(state)?;
-        let _ = self.flush();
         if deploy {
             self.pending_deploy = Some(task_id);
         }
@@ -1515,7 +1652,7 @@ impl Engine {
         self.launch(&id).or_else(|error| write(&exit, &json!({"error":error.to_string(),"ended":now()})))
     }
     pub fn tick(&mut self) -> Result<()> {
-        let mut outcome = self.sync();
+        let mut outcome = Ok(());
         for index in 0..self.state.tasks.len() {
             outcome = self.poll_attempt(index).and(outcome);
         }
@@ -1530,8 +1667,7 @@ impl Engine {
             outcome = if ready { self.start(index) } else { Ok(()) }.and(outcome);
         }
         self.sync_waiting()?;
-        outcome = self.flush().and(outcome);
-        self.publish().and(outcome)
+        outcome
     }
     pub fn sync_waiting(&mut self) -> Result<()> {
         let reasons: Vec<_> = self.state.tasks.iter().map(|task| self.state.waiting_reason(task)).collect();
