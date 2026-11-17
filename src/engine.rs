@@ -181,7 +181,7 @@ impl Task {
             .count()
     }
     pub(crate) fn worker_model(&self) -> Option<&str> {
-        self.attributes.model.as_deref().filter(|_| self.stage == "implementation")
+        self.attributes.model.as_deref().filter(|_| matches!(self.stage.as_str(), "implementation" | "merge"))
     }
     fn workdir(&self) -> &Path {
         Path::new(&self.cwd)
@@ -1506,7 +1506,7 @@ impl Engine {
             "languages":task.attributes.languages,"functions":task.attributes.functions,
             "dependencies":task.dependencies,"after":task.after},
             "worker":worker,"agent":agent,"family":self.state.family,"workerProtocol":protocol,"feedback":task.feedback,"dependencies":dependencies,"limits":self.state.limits(task).value(),"scratch":directory.join("scratch"),
-            "readOnly":stage != "implementation" || task.read_only()});
+            "readOnly":!matches!(stage, "implementation" | "merge") || task.read_only()});
         if stage == "review" {
             let implementation = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.stage == "implementation" && a.status() == Some("completed"));
             request["implementation"] = json!(implementation.map(|a| json!({"attemptId":a.id,"result":a.result,"artifact":a.evidence.configuration.as_ref().map(|c| &c["artifact"])})));
@@ -1599,7 +1599,7 @@ impl Engine {
         self.change(|state| {
             let task = &mut state.tasks[index];
             let from = task.stage.clone();
-            task.stage = "implementation".into();
+            task.stage = "merge".into();
             task.feedback = vec![format!("{main} changed since this branch was implemented and no longer merges into it cleanly. The next attempt starts with {main} merged into the branch; resolve the conflicts, commit, and make sure the work still meets every criterion")];
             task.record("merge_conflict", "git", json!({"branch":branch,"main":main,"stage":"review"}));
             task.record_phase(&from, "git");
@@ -1747,7 +1747,7 @@ impl Engine {
         let name = task.short_id.clone().unwrap_or_else(|| task.id.clone());
         let attempt = task.attempts.last_mut().unwrap();
         attempt.ended = exit["ended"].as_u64();
-        if attempt.stage == "implementation"
+        if matches!(attempt.stage.as_str(), "implementation" | "merge")
             && let Some(git) = attempt.evidence.git.as_mut()
         {
             match crate::git::finish(git, &name) {
@@ -1783,7 +1783,7 @@ impl Engine {
                     attempt.evidence.configuration.get_or_insert_with(|| json!({}))["artifact"] = json!(evidence::artifact(&directory, task.attributes.artifact));
                 }
                 if attempt.stage == "review" && status == "accepted" {
-                    let recorded = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.status() == Some("completed")).and_then(|a| a.evidence.configuration.as_ref()).map(|c| c["artifact"].clone());
+                    let recorded = task.attempts.iter().rev().find(|a| a.revision == task.revision && a.stage == "implementation" && a.status() == Some("completed")).and_then(|a| a.evidence.configuration.as_ref()).map(|c| c["artifact"].clone());
                     let path = recorded.as_ref().and_then(|a| a["path"].as_str()).map(PathBuf::from);
                     if path.as_deref().is_some_and(|p| evidence::digest(p).ok().as_ref() != recorded.as_ref().and_then(|a| a["digest"].as_str()).map(str::to_owned).as_ref()) {
                         result["status"] = json!("rejected");
@@ -1791,6 +1791,7 @@ impl Engine {
                     }
                 }
                 let attempt = task.attempts.last_mut().unwrap();
+                let attempt_stage = attempt.stage.clone();
                 attempt.result = Some(result.clone());
                 if current {
                     task.failure.clear();
@@ -1810,6 +1811,7 @@ impl Engine {
                             task.failure = result["summary"].as_str().unwrap().into();
                             notice = Some(json!({"event":"held","taskId":task.id,"title":task.title,"reason":task.failure}));
                         }
+                        "blocked" if attempt_stage == "merge" => task.stage = "implementation".into(),
                         "rejected" if task.strikes() >= history::STRIKES => task.stage = "replan".into(),
                         "rejected" => {
                             let failed: Vec<_> = result["criteria"].as_array().unwrap().iter().zip(&task.acceptance).filter(|(o, _)| *o == "failed").map(|(_, c)| format!("Failed criterion: {c}")).collect();
@@ -1827,7 +1829,7 @@ impl Engine {
                                     Ok(commit) => task.record("merged", "git", json!({"branch":git["branch"],"into":git["main"],"commit":commit})),
                                     Err(error) => {
                                         let main = git["main"].as_str().unwrap_or_default();
-                                        task.stage = "implementation".into();
+                                        task.stage = "merge".into();
                                         deploy = false;
                                         task.feedback = vec![history::clip(&format!("The branch could not merge into {main}: {error}. The next attempt starts with {main} merged into the branch; resolve the conflicts and commit"), finding_words)];
                                     }

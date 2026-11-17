@@ -44,7 +44,7 @@ pub fn prepare(workspace: &Path, cwd: &Path, name: &str, ancestors: &[String], s
     let branch = branch(name);
     let worktree = PathBuf::from(shown(workspace)).join("worktrees").join(name);
     if !worktree.join(".git").exists() {
-        if stage != "implementation" {
+        if !matches!(stage, "implementation" | "merge") {
             return Ok(None);
         }
         run(&repository, &["worktree", "prune"])?;
@@ -57,7 +57,7 @@ pub fn prepare(workspace: &Path, cwd: &Path, name: &str, ancestors: &[String], s
         }
     }
     let conflict = match stage {
-        "implementation" => run(&worktree, &["merge", "--no-edit", &main]).is_err(),
+        "implementation" | "merge" => run(&worktree, &["merge", "--no-edit", &main]).is_err(),
         "review" => {
             let failed = run(&worktree, &["merge", "--no-edit", &main]).is_err();
             if failed {

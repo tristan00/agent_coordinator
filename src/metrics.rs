@@ -12,7 +12,7 @@ pub fn lifecycle(task: &Task) -> Value {
         .find(|event| event.kind == "accepted" && event.revision == task.revision && event.evidence["currentRevision"] == true && event.evidence["ended"] == event.at)
         .filter(|_| task.stage == "done")
         .map(|event| event.at);
-    let execution = ["implementation", "review"].map(|stage| {
+    let execution = ["implementation", "review", "merge"].map(|stage| {
         let attempts = task.attempts.iter().filter(|attempt| attempt.stage == stage);
         let count = attempts.clone().count();
         let mut durations = attempts.filter_map(|attempt| attempt.ended?.checked_sub(attempt.evidence.launch.as_ref()?.started));

@@ -1609,7 +1609,7 @@ fn saved_lanes_become_roles_once() {
 }
 
 #[test]
-fn accepted_work_merges_its_branch_and_a_failed_merge_returns_the_task_to_implementation() {
+fn accepted_work_merges_its_branch_and_a_failed_merge_goes_to_the_merge_step() {
     let mut board = Board::new();
     let repository = board.temp.dir("workspace/game");
     let git = |args: &[&str]| crate::git::run(&repository, args).unwrap();
@@ -1637,7 +1637,7 @@ fn accepted_work_merges_its_branch_and_a_failed_merge_returns_the_task_to_implem
     fs::write(repository.join("a.txt"), "main\n").unwrap();
     git(&["commit", "-q", "-am", "Main moved"]);
     board.run(&second, outcome("accepted", &["passed"]));
-    assert_eq!(board.task(&second).stage, "implementation");
+    assert_eq!(board.task(&second).stage, "merge");
     assert_eq!(board.task(&second).feedback.len(), 1);
 }
 
@@ -1662,17 +1662,23 @@ fn stopped_tasks_and_fully_stopped_containers_leave_in_progress() {
 }
 
 #[test]
-fn a_review_that_cannot_merge_main_goes_back_to_implementation() {
+fn a_review_that_cannot_merge_main_goes_to_a_merge_step_then_back_to_review() {
     let mut board = Board::new();
     let id = board.add("Conflicted");
     board.run(&id, outcome("completed", &["passed"]));
-    assert_eq!(board.task(&id).stage, "review");
-    let index = board.engine.task(&id).unwrap();
-    board.engine.return_conflicted(index, &json!({"main":"main","branch":"task/R1-1","conflict":true})).unwrap();
+    let conflict = |board: &mut Board| {
+        let index = board.engine.task(&id).unwrap();
+        board.engine.return_conflicted(index, &json!({"main":"main","branch":"task/R1-1","conflict":true})).unwrap();
+    };
+    conflict(&mut board);
     let task = board.task(&id);
-    assert_eq!((task.stage.as_str(), task.status()), ("implementation", "In progress"));
-    assert_eq!(task.feedback.len(), 1);
+    assert_eq!((task.stage.as_str(), task.status(), task.feedback.len()), ("merge", "In progress", 1));
     assert!(board.kinds(&id).contains(&"merge_conflict".to_owned()));
+    board.run(&id, outcome("completed", &["passed"]));
+    assert_eq!((board.task(&id).stage.as_str(), board.task(&id).failed_attempts()), ("review", 0));
+    conflict(&mut board);
+    board.run(&id, outcome("blocked", &["blocked"]));
+    assert_eq!((board.task(&id).stage.as_str(), board.task(&id).failed_attempts()), ("implementation", 0));
 }
 
 #[test]
