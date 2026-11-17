@@ -123,8 +123,8 @@ pub fn create(engine: &mut Engine, input: Value, root: &Path) -> Result<Value> {
         let mut state = engine.state.clone();
         require(!state.config.workspaces.contains_key(&path), "Workspace already configured")?;
         state.config.workspaces.insert(path.clone(), settings.clone());
-        state.short_name(&path);
         engine.commit(state)?;
+        engine.register_workspace(&path)?;
         Ok(json!({"workspace":path,"settings":settings}))
     })();
     if result.is_err() {

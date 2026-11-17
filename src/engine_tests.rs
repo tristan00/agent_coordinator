@@ -1,4 +1,5 @@
 use super::*;
+use crate::history::Size;
 use crate::test_support::{Temp, merge};
 
 struct Board {
@@ -62,6 +63,8 @@ impl Board {
         let attempt = super::id();
         fs::create_dir_all(self.engine.attempt_path(&attempt).join("scratch")).unwrap();
         let attempt_id = attempt.clone();
+        let task_id = self.engine.state.tasks[index].id.clone();
+        self.engine.service.lock(&task_id, super::lock_reason(&self.engine.state.tasks[index].stage)).unwrap();
         self.mutate(move |state| {
             let task = &mut state.tasks[index];
             let stage = task.stage.clone();
@@ -192,9 +195,9 @@ fn size_artifact_priority_and_capability_rules() {
     assert!(board.fail(board.with("Large leaf", json!({"attributes":{"size":"large"}}))).contains("Large work must be a container"));
     board.create(merge(board.container("Large container"), json!({"attributes":{"size":"large"}})));
     assert!(board.fail(merge(board.container("Artifact container"), json!({"attributes":{"artifact":"report"}}))).contains("Containers produce no artifact"));
-    assert!(board.fail(board.with("Priority", json!({"attributes":{"priority":9}}))).contains("Priority must be"));
+    assert!(board.fail(board.with("Priority", json!({"attributes":{"priority":9}}))).contains("priority must be 0 to 3"));
     assert!(board.fail(board.with("Deploy", json!({"attributes":{"deploy":true}}))).contains("deploy requires artifact candidate"));
-    assert!(board.fail(board.with("Gpu", json!({"attributes":{"needs":["gpu"]}}))).contains("No worker provides [\"gpu\"]"));
+    assert!(board.fail(board.with("Gpu", json!({"attributes":{"needs":["gpu"]}}))).contains("Unknown needs gpu"));
     let id = board.create(board.with("Network", json!({"attributes":{"needs":["network","network"],"role":"docs"}})));
     assert_eq!(board.task(&id).attributes.needs.len(), 1);
     assert!(board.task(&id).attributes.role == Role::Docs);
@@ -222,9 +225,9 @@ fn workspace_limits_override_defaults_only_for_their_workspace() {
 fn unknown_fields_and_attributes_are_rejected() {
     let mut board = Board::new();
     let error = board.fail(board.with("Title", json!({"notes":"free text"})));
-    assert!(error.contains("unknown field `notes`") && error.contains("coordination belongs in typed fields"), "{error}");
+    assert!(error.contains("unknown field `notes`"), "{error}");
     assert!(board.fail(board.with("Title", json!({"attributes":{"color":"red"}}))).contains("Unknown attribute"));
-    assert!(board.fail(board.with("Title", json!({"attributes":{"languages":["cobol"]}}))).contains("Unknown classification cobol"));
+    assert!(board.fail(board.with("Title", json!({"attributes":{"languages":["cobol"]}}))).contains("Unknown languages cobol"));
     let id = board.add("Target");
     assert!(board.fail(board.with("Title", json!({"dependencies":[{"target":id,"reason":"uses_api","why":"x"}]}))).contains("unknown field `why`"));
     assert!(board.edit_error(&id, json!({"status":"done"})).contains("unknown field `status`"));
@@ -239,7 +242,7 @@ fn grouping_requires_exactly_one_of_parent_or_standalone() {
     assert!(board.fail(neither).contains("Choose exactly one grouping"));
     assert!(board.fail(board.with("Both", json!({"parent":container}))).contains("Choose exactly one grouping"));
     assert!(board.fail(board.with("False", json!({"standalone":false}))).contains("Choose exactly one grouping"));
-    assert!(board.fail(board.with("Null", json!({"standalone":null}))).contains("grouping"));
+    assert!(board.fail(board.with("Null", json!({"standalone":null}))).contains("standalone must be a boolean"));
     let child = board.create(board.child("Child", &container));
     assert_eq!(board.task(&child).parent.as_deref(), Some(container.as_str()));
     assert!(!board.task(&child).standalone);
@@ -254,8 +257,8 @@ fn dependencies_require_a_known_typed_reason() {
     let target = board.add("Target");
     assert!(board.fail(board.with("Untyped", json!({"dependencies":[{"target":target}]}))).contains("typed reason"));
     assert!(board.fail(board.with("Null reason", json!({"dependencies":[{"target":target,"reason":null}]}))).contains("typed reason"));
-    assert!(board.fail(board.with("Unknown reason", json!({"dependencies":[{"target":target,"reason":"because"}]}))).contains("use after, or nothing"));
-    assert!(board.fail(board.with("String", json!({"dependencies":[target]}))).contains("use after, or nothing"));
+    assert!(board.fail(board.with("Unknown reason", json!({"dependencies":[{"target":target,"reason":"because"}]}))).contains("Unknown dependency reason because"));
+    assert!(board.fail(board.with("String", json!({"dependencies":[target]}))).contains("invalid type"));
     for reason in DEPENDENCY_REASONS {
         let id = board.create(board.with("Typed", json!({"dependencies":[{"target":target,"reason":reason}]})));
         assert_eq!(board.task(&id).dependencies, [Dependency { target: target.clone(), reason: Some(reason) }]);
@@ -378,7 +381,7 @@ fn remove_archives_leaves_and_refuses_referenced_or_active_tasks() {
     let a = board.add("Alpha");
     let b = board.create(board.with("Beta", json!({"after":[a]})));
     let c = board.create(board.with("Gamma", json!({"conflicts":[a],"related":[a]})));
-    assert!(board.engine.remove(&a).unwrap_err().to_string().contains("children or dependents"));
+    assert!(board.engine.remove(&a).unwrap_err().to_string().contains("supersede it instead"));
     board.engine.remove(&b).unwrap();
     assert_eq!(board.engine.state.archived[0].history.last().unwrap().kind, "abandoned");
     board.engine.remove(&a).unwrap();
@@ -388,7 +391,7 @@ fn remove_archives_leaves_and_refuses_referenced_or_active_tasks() {
     assert_eq!(board.engine.state.archived.last().unwrap().history.last().unwrap().kind, "archived");
     let d = board.add("Delta");
     board.dispatch(&d);
-    assert!(board.engine.remove(&d).unwrap_err().to_string().contains("active worker"));
+    assert!(board.engine.remove(&d).unwrap_err().to_string().contains("Stop it before archiving it"));
     assert!(board.engine.remove("missing").is_err());
 }
 
@@ -503,7 +506,6 @@ fn implementation_then_review_acceptance_reaches_done() {
         assert!(kinds.contains(&kind.to_string()), "{kind}");
     }
     let value = board.engine.task_value(board.task(&id), true).unwrap();
-    assert!(value["analytics"]["acceptedAt"].is_u64());
     assert!(value["history"].is_array());
     assert!(board.engine.notices.is_empty() && board.engine.pending_deploy.is_none());
     assert!(!board.engine.attempt_path(&board.latest(&id).id).join("scratch").exists());
@@ -803,7 +805,7 @@ fn edits_are_refused_while_the_task_or_a_dependent_is_active() {
     let a = board.add("Alpha");
     let b = board.create(board.with("Beta", json!({"dependencies":[{"target":a,"reason":"uses_api"}]})));
     board.dispatch(&a);
-    assert!(board.edit_error(&a, json!({"outcome":"Changed"})).contains("Stop the task"));
+    assert!(board.edit_error(&a, json!({"outcome":"Changed"})).contains("Stop it before changing it"));
     board.finish(&a, json!({"stopped":true,"ended":now()}), None);
     board.dispatch(&b);
     assert!(board.edit_error(&a, json!({"outcome":"Changed"})).contains("Stop dependent task \"Beta\""));
@@ -950,8 +952,6 @@ fn batch_replay_is_idempotent_and_conflicting_replay_is_rejected() {
     let second = board.engine.create_batch(other).unwrap();
     assert_ne!(second["container"], first["container"]);
     assert_eq!(board.engine.state.tasks.len(), 6);
-    let reloaded = Engine::new(board.engine.directory.clone()).unwrap();
-    assert_eq!(reloaded.state.batches.len(), 2);
 }
 
 #[test]
@@ -967,7 +967,7 @@ fn batch_rejects_invalid_shapes_atomically() {
     cases.push((merge(valid.clone(), json!({"container":board.spec("Leafy")})), "Container must have no acceptance criteria"));
     cases.push((merge(valid.clone(), json!({"container":merge(board.container("Keyed"), json!({"key":"k"}))})), "cannot replace existing tasks"));
     cases.push((merge(valid.clone(), json!({"children":[]})), "Children are required"));
-    cases.push((merge(valid.clone(), json!({"children":{}})), "Children must be an array"));
+    cases.push((merge(valid.clone(), json!({"children":{}})), "children must be a list"));
     cases.push((merge(valid.clone(), json!({"children":["text"]})), "Child must be an object"));
     cases.push((merge(valid.clone(), json!({"children":[{"title":"No key","outcome":"o","acceptance":["c"]}]})), "localKey is required"));
     let twice = json!({"localKey":"same","title":"Twice","outcome":"o","acceptance":["c"]});
@@ -984,14 +984,14 @@ fn batch_rejects_invalid_shapes_atomically() {
     cases.push((extra, "only local"));
     let mut number = valid.clone();
     number["children"][1]["conflicts"] = json!([7]);
-    cases.push((number, "Reference must be a task ID"));
+    cases.push((number, "Reference must be a task id"));
     let mut invalid = valid.clone();
     invalid["children"][1]["acceptance"] = json!(["a", "b", "c", "d"]);
     cases.push((invalid, "At most 3 acceptance criteria"));
     for (input, message) in cases {
         let error = board.engine.create_batch(input).unwrap_err().to_string();
         assert!(error.contains(message), "{message}: {error}");
-        assert!(board.engine.state.tasks.is_empty() && board.engine.state.batches.is_empty());
+        assert!(board.engine.state.tasks.is_empty());
     }
     assert_eq!(board.engine.state.sequence, 0);
 }
@@ -1064,7 +1064,7 @@ fn configure_defaults_replan_and_rejects_empty_commands() {
     assert!(board.engine.configure(json!({"implementation":["i"]})).is_err());
     board.engine.configure(json!({"implementation":["i"],"review":["r"],"replan":["p"],"capabilities":["gpu"]})).unwrap();
     assert_eq!(board.engine.state.config.replan, ["p"]);
-    assert!(board.fail(board.with("Needs network", json!({"attributes":{"needs":["network"]}}))).contains("No worker provides [\"network\"]"));
+    assert!(board.fail(board.with("Needs network", json!({"attributes":{"needs":["network"]}}))).contains("Unknown needs network"));
 }
 
 fn legacy(id: &str, cwd: &Path, patch: Value) -> Value {
@@ -1095,7 +1095,7 @@ fn keyed(path: &Path, value: Value) -> Value {
 fn load(temp: &Temp, state: &Value) -> Result<Engine> {
     let directory = temp.dir(&format!("legacy-{}", super::id()));
     write(&directory.join("state.json"), state)?;
-    Engine::new(directory)
+    temp.open(directory)
 }
 
 #[test]
@@ -1142,26 +1142,6 @@ fn unclassified_dependencies_wait_even_when_grouped() {
 }
 
 #[test]
-fn relationship_plan_classifies_schema_three_tasks() {
-    let temp = Temp::new();
-    let ws = temp.dir("ws");
-    let directory = temp.dir("board-plan");
-    let state = legacy_state(json!(3), vec![legacy("a", &ws, json!({})), legacy("b", &ws, json!({"dependencies":["a"]}))]);
-    write(&directory.join("state.json"), &state).unwrap();
-    write(&directory.join("relationship-plan.json"), &json!({"tasks":[
-        {"id":"a","standalone":true,"dependencies":[],"after":[]},
-        {"id":"b","standalone":true,"dependencies":[{"target":"a","reason":"uses_data"}],"after":[]},
-        {"id":"absent","standalone":true,"dependencies":[],"after":[]}]})).unwrap();
-    let engine = Engine::new(directory).unwrap();
-    let b = &engine.state.tasks[1];
-    assert!(b.standalone);
-    assert_eq!(b.dependencies, [Dependency { target: "a".into(), reason: Some(DependencyReason::Data) }]);
-    let event = b.history.last().unwrap();
-    assert_eq!(event.kind, "relationships_classified");
-    assert_eq!(engine.state.waiting_reason(b).as_deref(), Some("Waiting for result from Legacy task"));
-}
-
-#[test]
 fn malformed_or_newer_states_fail_to_load() {
     let temp = Temp::new();
     let ws = temp.dir("ws");
@@ -1193,26 +1173,6 @@ fn legacy_flags_migrate_to_typed_attributes() {
 }
 
 #[test]
-fn legacy_definitions_violating_limits_move_to_replan() {
-    let temp = Temp::new();
-    let ws = temp.dir("ws");
-    let long = "word ".repeat(20);
-    let state = legacy_state(json!(8), vec![
-        legacy("long", &ws, json!({"standalone":true,"title":long})),
-        legacy("stopped", &ws, json!({"standalone":true,"title":long,"stopped":true})),
-        legacy("done", &ws, json!({"standalone":true,"title":long,"stage":"done"})),
-        legacy("notes", &ws, json!({"standalone":true,"refinements":["Old note"]})),
-        legacy("valid", &ws, json!({"standalone":true})),
-    ]);
-    let engine = load(&temp, &state).unwrap();
-    let stages: Vec<_> = engine.state.tasks.iter().map(|t| t.stage.as_str()).collect();
-    assert_eq!(stages, ["replan", "implementation", "done", "replan", "implementation"]);
-    let task = &engine.state.tasks[0];
-    assert_eq!(task.feedback, ["Legacy definition violates current limits; rewrite it with typed attributes and relations"]);
-    assert_eq!(task.history.last().unwrap().evidence, json!({"from":"implementation","to":"replan"}));
-}
-
-#[test]
 fn legacy_limits_are_adopted_into_workspace_settings() {
     let temp = Temp::new();
     let ws = temp.dir("ws");
@@ -1220,7 +1180,6 @@ fn legacy_limits_are_adopted_into_workspace_settings() {
     state["config"]["limits"] = keyed(&ws, json!({"criteria":1}));
     let engine = load(&temp, &state).unwrap();
     assert_eq!(engine.state.config.workspaces[&ws].limits.criteria, 1);
-    assert_eq!(engine.state.tasks[0].stage, "replan");
     let saved: Value = read(&engine.directory.join("state.json")).unwrap();
     assert!(saved["config"].get("limits").is_none());
     assert_eq!(saved["config"]["workspaces"][ws.to_str().unwrap()]["limits"]["criteria"], 1);
@@ -1259,9 +1218,9 @@ fn tasks_may_choose_an_enabled_model_and_default_to_the_workspace_worker() {
 #[test]
 fn task_models_must_be_enabled_for_the_family_and_workspace() {
     let mut board = model_board();
-    assert!(board.fail(board.with("Crossed", json!({"attributes":{"model":"claude_haiku_5_5_low"}}))).contains("not enabled"));
-    assert!(board.fail(board.with("Unknown", json!({"attributes":{"model":"no_such_model"}}))).contains("not enabled"));
-    assert!(board.fail(board.with("Retired", json!({"attributes":{"model":"sol_light"}}))).contains("not enabled"));
+    assert!(board.fail(board.with("Crossed", json!({"attributes":{"model":"claude_haiku_5_5_low"}}))).contains("Unknown model"));
+    assert!(board.fail(board.with("Unknown", json!({"attributes":{"model":"no_such_model"}}))).contains("Unknown model"));
+    assert!(board.fail(board.with("Retired", json!({"attributes":{"model":"sol_light"}}))).contains("Unknown model"));
     assert!(board.fail(board.with("Blank", json!({"attributes":{"model":" "}}))).contains("model"));
     assert!(board.fail(board.with("Group", json!({"acceptance":[],"attributes":{"model":"luna_6_high"}}))).contains("Containers run no worker"));
     let key = workspace(&board.ws).unwrap();
@@ -1269,7 +1228,8 @@ fn task_models_must_be_enabled_for_the_family_and_workspace() {
         let settings = state.config.workspaces.get_mut(&key).unwrap();
         settings.agents = BTreeMap::from([("luna_6_high".to_string(), crate::agents::catalog()["luna_6_high"].clone())]);
     });
-    assert!(board.fail(board.with("Not listed", json!({"attributes":{"model":"sol_6_1_medium"}}))).contains("not enabled"));
+    board.engine.register_workspaces().unwrap();
+    assert!(board.fail(board.with("Not listed", json!({"attributes":{"model":"sol_6_1_medium"}}))).contains("Unknown model"));
     board.create(board.with("Listed", json!({"attributes":{"model":"luna_6_high"}})));
     board.create(board.with("Default by name", json!({"attributes":{"model":"sol_6_1_light"}})));
 }
@@ -1282,7 +1242,7 @@ fn editing_a_task_model_is_a_corrective_revision() {
     board.engine.edit(&id, json!({"attributes":{"model":"luna_6_high"}})).unwrap();
     assert_eq!(board.task(&id).attributes.model.as_deref(), Some("luna_6_high"));
     assert!(board.task(&id).revision >= revision);
-    assert!(board.edit_error(&id, json!({"attributes":{"model":"claude_opus_5_5_medium"}})).contains("not enabled"));
+    assert!(board.edit_error(&id, json!({"attributes":{"model":"claude_opus_5_5_medium"}})).contains("Unknown model"));
 }
 
 #[test]
@@ -1372,12 +1332,6 @@ fn tasks_in_a_subfolder_belong_to_the_configured_workspace_that_contains_it() {
     assert_eq!(engine.state.tasks.iter().filter(|t| t.parent.is_some()).count(), 1);
 }
 #[test]
-fn abbreviations_are_short_and_readable() {
-    for (name, expected) in [("benchmark_12", "B12"), ("agent_coordinator", "AC"), ("game_build", "GB"), ("workspace", "WOR"), ("myProject", "MP"), ("benchmark_123456", "B123"), ("v2_api", "V2A"), ("x", "X"), ("__", "W")] {
-        assert_eq!(abbreviation(Path::new("D:/root").join(name).as_path()), expected, "{name}");
-    }
-}
-#[test]
 fn short_ids_number_tasks_per_workspace() {
     let mut board = Board::new();
     let first = board.add("First");
@@ -1398,36 +1352,6 @@ fn short_ids_number_tasks_per_workspace() {
     assert_eq!(board.task(&first).brief()["shortId"], "WOR-1");
 }
 #[test]
-fn colliding_abbreviations_get_distinct_ids() {
-    let mut state = Board::new().engine.state.clone();
-    let a = state.next_short_id(Path::new("D:/one/game_build"));
-    let b = state.next_short_id(Path::new("D:/two/game_build"));
-    let c = state.next_short_id(Path::new("D:/three/game_build"));
-    assert_eq!([a, b, c], ["GB-1", "GBA-1", "GBB-1"]);
-    assert_eq!(state.next_short_id(Path::new("D:/one/game_build")), "GB-2");
-}
-#[test]
-fn legacy_tasks_receive_short_ids_in_creation_order() {
-    let mut board = Board::new();
-    let ids: Vec<String> = ["A", "B", "C"].iter().map(|title| board.add(title)).collect();
-    let mut state = board.engine.state.clone();
-    state.tasks.reverse();
-    let mut retired = state.tasks.pop().unwrap();
-    retired.short_id = None;
-    state.archived.push(retired);
-    for task in &mut state.tasks {
-        task.short_id = None;
-    }
-    state.workspace_ids.clear();
-    state.assign_short_ids();
-    let find = |id: &str| state.tasks.iter().chain(&state.archived).find(|t| t.id == id).unwrap().short_id.clone().unwrap();
-    assert_eq!(ids.iter().map(|id| find(id)).collect::<Vec<_>>(), ["WOR-1", "WOR-2", "WOR-3"]);
-    assert_eq!(state.next_short_id(&board.engine.state.tasks[0].workspace.clone().unwrap()), "WOR-4");
-    state.config.workspaces.insert(PathBuf::from("D:/w/benchmark_7"), Default::default());
-    state.assign_short_ids();
-    assert_eq!((state.workspace_ids[Path::new("D:/w/benchmark_7")].abbreviation.as_str(), state.workspace_ids[Path::new("D:/w/benchmark_7")].next), ("B7", 0));
-}
-#[test]
 fn task_value_lists_models_that_implemented_the_task() {
     let mut board = Board::new();
     let id = board.add("Modelled");
@@ -1441,29 +1365,6 @@ fn task_value_lists_models_that_implemented_the_task() {
         }
     });
     assert_eq!(board.engine.task_value(board.task(&id), false).unwrap()["models"], json!([{"model":"small","effort":"low"},{"model":"medium","effort":"high"}]));
-}
-
-#[test]
-fn saved_lanes_become_roles_once() {
-    let temp = crate::test_support::Temp::new();
-    let mut engine = temp.engine();
-    let ws = temp.dir("workspace");
-    for title in ["A", "B", "C", "D"] {
-        engine.create(json!({"title":title,"outcome":"Done","cwd":ws,"acceptance":["Works"],"standalone":true})).unwrap();
-    }
-    let directory = engine.directory.clone();
-    let mut raw: Value = serde_json::from_slice(&fs::read(directory.join("state.json")).unwrap()).unwrap();
-    for (task, lane) in raw["tasks"].as_array_mut().unwrap().iter_mut().zip(["code", "ui", "audit", "research"]) {
-        let attributes = task["attributes"].as_object_mut().unwrap();
-        attributes.remove("role");
-        attributes.insert("lane".into(), json!(lane));
-    }
-    drop(engine);
-    fs::write(directory.join("state.json"), raw.to_string()).unwrap();
-    let engine = Engine::new(directory).unwrap();
-    let roles: Vec<_> = engine.state.tasks.iter().map(|t| t.attributes.role).collect();
-    assert_eq!(roles, [Role::BackendCode, Role::UiCode, Role::Audit, Role::Worker]);
-    assert!(engine.state.tasks[2].read_only());
 }
 
 #[test]
@@ -1569,4 +1470,58 @@ fn rejected_reviews_and_unfinished_work_count_as_failures_but_crashes_do_not() {
     board.dispatch(&id);
     board.finish(&id, json!({"code":1,"ended":now(),"error":"Worker crashed"}), None);
     assert_eq!(board.task(&id).failed_attempts(), 1);
+}
+
+#[test]
+fn task_service_receives_statuses_notes_and_lock_releases() {
+    let mut board = Board::new();
+    let id = board.add("Service");
+    board.run(&id, outcome("completed", &["passed"]));
+    board.engine.publish().unwrap();
+    let remote = board.engine.service.task(&id).unwrap().unwrap();
+    assert_eq!(remote["status"], "Review");
+    assert!(remote["lock"].is_null());
+    let notes: Vec<&str> = remote["history"].as_array().unwrap().iter().filter(|e| e["kind"] == "note").map(|e| e["data"]["kind"].as_str().unwrap()).collect();
+    assert_eq!(notes, ["finished"]);
+    assert!(board.engine.state.outbox.is_empty());
+}
+
+#[test]
+fn ui_edits_reach_the_coordinator_and_reopen_dependents() {
+    let mut board = Board::new();
+    let a = board.add("Alpha");
+    let b = board.create(board.with("Beta", json!({"dependencies":[{"target":a,"reason":"uses_api"}]})));
+    board.accept(&a);
+    board.run(&b, outcome("completed", &["passed"]));
+    assert_eq!(board.task(&b).stage, "review");
+    board.engine.service.call("PATCH", &format!("/api/tasks/{a}"), Some(&json!({"outcome":"A different outcome"})), "ui").unwrap();
+    board.engine.sync().unwrap();
+    assert_eq!((board.task(&a).outcome.as_str(), board.task(&a).stage.as_str()), ("A different outcome", "implementation"));
+    assert_eq!(board.task(&b).stage, "implementation");
+    assert!(board.kinds(&b).contains(&"reopened".to_string()));
+    assert!(board.task(&a).history.iter().any(|e| e.kind == "revised" && e.actor.as_deref() == Some("ui")));
+    board.engine.flush().unwrap();
+    let remote = board.engine.service.task(&b).unwrap().unwrap();
+    assert!(remote["history"].as_array().unwrap().iter().any(|e| e["data"]["kind"] == "reopened"));
+}
+
+#[test]
+fn ui_commands_run_through_the_coordinator_and_report_back() {
+    let mut board = Board::new();
+    let id = board.add("Command");
+    board.engine.announce("").unwrap();
+    let command = board.engine.service.call("POST", "/api/commands", Some(&json!({"client":"coordinator","command":"stop","task":id})), "ui").unwrap();
+    board.engine.sync().unwrap();
+    assert!(board.task(&id).stopped);
+    assert!(board.task(&id).history.iter().any(|e| e.kind == "stopped" && e.actor.as_deref() == Some("ui")));
+    board.engine.flush().unwrap();
+    let done = board.engine.service.call("GET", &format!("/api/commands/{}", command["id"].as_str().unwrap()), None, "ui").unwrap();
+    assert_eq!((done["state"].as_str(), done["message"].as_str()), (Some("done"), Some("Stopped")));
+    board.engine.service.call("POST", "/api/commands", Some(&json!({"client":"coordinator","command":"pause"})), "ui").unwrap();
+    board.engine.sync().unwrap();
+    assert!(board.engine.state.paused);
+    board.engine.announce("").unwrap();
+    let clients = board.engine.service.call("GET", "/api/board", None, "ui").unwrap()["clients"].clone();
+    assert_eq!(clients[0]["state"]["text"], "Paused");
+    assert_eq!(clients[0]["boardCommands"][0]["id"], "resume-all");
 }

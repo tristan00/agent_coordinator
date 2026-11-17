@@ -52,8 +52,6 @@ pub const ROUTES: &[Route] = &[
     route("POST", "/api/workspaces", "", "Create a workspace with the default prompts; field path, optional settings", None, false),
     route("GET", "/api/workspaces/defaults", "", "Default prompts and settings", None, false),
     route("GET", "/api/state", "", "The whole board", None, false),
-    route("GET", "/api/analytics", "", "Analytics report", None, false),
-    route("POST", "/api/analytics", "", "Analytics report for a query", None, false),
     route("PUT", "/api/config", "", "Replace the coordinator configuration", None, false),
     route("POST", "/api/stop", "", "Pause all work", None, false),
     route("POST", "/api/resume", "", "Resume all work", None, false),

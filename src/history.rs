@@ -203,23 +203,12 @@ pub struct Attributes {
     pub deploy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 impl Attributes {
-    pub const FIELDS: [&'static str; 9] = ["role", "needs", "languages", "functions", "priority", "size", "artifact", "deploy", "model"];
     pub fn priority(&self) -> u8 {
         self.priority.unwrap_or(2)
-    }
-    pub fn validate(&self) -> Result<()> {
-        crate::require(self.languages.iter().all(|v| LANGUAGES.contains(&v.as_str())) && self.functions.iter().all(|v| FUNCTIONS.contains(&v.as_str())), "Unknown classification")?;
-        crate::require(self.priority.is_none_or(|p| p <= 3), "Priority must be 0 (highest) to 3")?;
-        crate::require(!(self.deploy && self.artifact != Artifact::Candidate), "deploy requires artifact candidate")?;
-        crate::require(self.model.as_deref().is_none_or(|m| !m.trim().is_empty()), "model must name an enabled agent")
-    }
-}
-pub fn effort(value: &str) -> Result<&str> {
-    match value {
-        "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(value),
-        _ => Err("Effort must be minimal, low, medium, high, or xhigh".into()),
     }
 }
 #[derive(Clone, Serialize, Deserialize)]

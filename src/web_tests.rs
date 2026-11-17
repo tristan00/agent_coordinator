@@ -169,7 +169,6 @@ fn get_routes_serve_updates_tasks_and_analytics() {
     assert_eq!(task["status"], "To do");
     assert!(site.get("/api/tasks/missing").unwrap().is_none());
     assert!(site.get("/api/nothing").unwrap().is_none());
-    assert_eq!(site.get("/api/analytics").unwrap().unwrap()["groups"]["all"]["tasks"], 1);
     assert!(site.get("/api/deployment/requests/bad id").is_err());
 }
 
