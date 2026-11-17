@@ -16,5 +16,5 @@
     "findingWords": 45
   },
   "evaluator": "claude_opus_5_5_medium",
-  "planAttempts": 3
+  "planAttempts": 2
 }

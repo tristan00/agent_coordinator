@@ -69,7 +69,7 @@ impl WorkspaceSettings {
         self.kickoff.unwrap_or(true)
     }
     pub fn plan_attempts(&self) -> u64 {
-        self.plan_attempts.unwrap_or(3)
+        self.plan_attempts.unwrap_or(2)
     }
     pub fn evaluator_agent(&self, family: Option<crate::agents::Family>) -> Result<Option<crate::agents::Agent>> {
         self.evaluator.as_deref().map(|id| crate::agents::resolve(&self.agents, id, family)).transpose()

@@ -383,7 +383,7 @@ fn proposed_tasks_are_evaluated_after_each_planner_turn_and_kick_backs_wake_the_
     tick(&mut engine).unwrap();
     assert_eq!(engine.state.sessions[&id].requests.len(), 2);
     let wake = wake_text(&engine, &id, 2);
-    assert!(wake.contains("kicked these proposed tasks back") && wake.contains("A 20 min run proves no more") && wake.contains("2 of 3 submissions left"));
+    assert!(wake.contains("kicked these proposed tasks back") && wake.contains("A 20 min run proves no more") && wake.contains("1 of 2 submissions left"));
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
     tick(&mut engine).unwrap();
@@ -415,4 +415,39 @@ fn a_failed_evaluation_is_recorded_and_not_retried_until_the_planner_acts() {
     assert_eq!(session.evaluations.len(), 1);
     assert!(session.evaluations[0].error.as_deref().is_some_and(|e| e.contains("no result event")));
     assert_eq!(session.requests.len(), 1);
+}
+
+#[test]
+fn dependents_wait_for_evaluation_and_a_rejection_does_not_wake_the_planner() {
+    let temp = Temp::new();
+    let (mut engine, source) = setup(&temp, "echo planned");
+    enable_evaluator(&mut engine, &source);
+    let case = source.join("case");
+    let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"Build it"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = Some(format!("planner:{id}"));
+    let base = engine.create(json!({"title":"Base","outcome":"It works","cwd":case,"acceptance":["A check passes"],"standalone":true})).unwrap()["id"].as_str().unwrap().to_owned();
+    let dependent = engine.create(json!({"title":"Dependent","outcome":"It works","cwd":case,"acceptance":["A check passes"],"standalone":true,"dependencies":[{"target":base,"reason":"uses_api"}]})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = None;
+    let index = engine.task(&base).unwrap();
+    engine.change(|state| {
+        let revision = state.tasks[index].revision;
+        for _ in 0..2 {
+            state.tasks[index].plan_reviews.push(crate::engine::PlanReview { at: 0, revision, accepted: false, findings: vec!["Too costly".into()] });
+        }
+        Ok(Value::Null)
+    }).unwrap();
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    let submitted: Vec<String> = engine.state.sessions[&id].evaluations[0].submitted.iter().map(|s| s.task.clone()).collect();
+    assert_eq!(submitted, [base.clone()]);
+    let prompt = read::<Value>(&engine.state.sessions[&id].evaluations[0].run.join("request.json")).unwrap()["prompt"].as_str().unwrap().to_owned();
+    assert!(prompt.contains("Dependent [Proposed]"));
+    finish_evaluation_run(&engine, &id, json!([{"task":base,"accept":false,"findings":["Still too costly"]}]));
+    for _ in 0..4 {
+        tick(&mut engine).unwrap();
+    }
+    assert!(engine.task(&base).is_err() && engine.task(&dependent).is_err());
+    let session = &engine.state.sessions[&id];
+    assert_eq!((session.requests.len(), session.evaluations.len()), (1, 1));
 }

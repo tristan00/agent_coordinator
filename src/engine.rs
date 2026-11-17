@@ -185,7 +185,6 @@ impl Task {
             "done" => "Done",
             _ if self.stopped && self.active.is_none() => "Stopped",
             "proposed" => "Proposed",
-            "rejected" => "Rejected",
             "review" => "Review",
             _ if self.blocked && self.active.is_none() => "Blocked",
             _ if self.active.is_some() || !self.attempts.is_empty() || self.stage == "replan" => "In progress",
@@ -524,27 +523,34 @@ impl State {
     pub(crate) fn get(&self, id: &str) -> Option<&Task> {
         self.tasks.iter().find(|task| task.id == id)
     }
-    fn holds_rejected(&self, id: &str) -> bool {
-        self.get(id).is_some_and(|task| task.stage == "rejected" || (task.container() && self.children(id).any(|child| self.holds_rejected(&child.id))))
+    fn holds_proposed(&self, id: &str) -> bool {
+        self.get(id).is_some_and(|task| task.stage == "proposed" || (task.container() && self.children(id).any(|child| self.holds_proposed(&child.id))))
     }
-    fn block_on_rejected(&mut self) {
-        let blocked: Vec<(usize, String)> = (0..self.tasks.len())
-            .filter_map(|index| {
-                let task = &self.tasks[index];
-                if task.container() || task.blocked || task.active.is_some() || matches!(task.stage.as_str(), "done" | "rejected") {
-                    return None;
+    pub fn awaiting_plan(&self, task: &Task) -> bool {
+        std::iter::once(task).chain(self.ancestors(task)).flat_map(|owner| owner.dependencies.iter().map(|d| &d.target).chain(&owner.after)).any(|id| self.holds_proposed(id))
+    }
+    fn reject(&mut self, id: &str) {
+        let mut pending = vec![(id.to_owned(), "plan_rejected")];
+        while let Some((id, kind)) = pending.pop() {
+            let Ok(index) = self.index(&id) else { continue };
+            let mut task = self.tasks.remove(index);
+            for other in &mut self.tasks {
+                if other.dependencies.iter().any(|d| d.target == id) && (other.stage == "proposed" || other.container()) {
+                    pending.push((other.id.clone(), "dropped_with_prerequisite"));
                 }
-                let inherited = self.ancestors(task).into_iter().flat_map(|a| a.dependencies.iter().map(|d| d.target.clone()));
-                let target = task.dependencies.iter().map(|d| d.target.clone()).chain(inherited).find(|id| self.holds_rejected(id))?;
-                let name = self.get(&target).map(|t| format!("{} {}", t.short_id.as_deref().unwrap_or(&t.id), t.title)).unwrap_or(target);
-                Some((index, format!("Depends on {name}, which the plan evaluator rejected for good; change this task so it no longer needs that work, or delete it")))
-            })
-            .collect();
-        for (index, reason) in blocked {
-            let task = &mut self.tasks[index];
-            task.blocked = true;
-            task.failure = reason.clone();
-            task.record("plan_dependency_rejected", "evaluation", json!({"reason":reason}));
+                other.dependencies.retain(|d| d.target != id);
+                other.after.retain(|a| a != &id);
+                other.conflicts.retain(|c| c != &id);
+                other.related.retain(|c| c != &id);
+            }
+            if let Some(parent) = task.parent.clone().filter(|parent| self.children(parent).next().is_none()) {
+                pending.push((parent, "dropped_with_prerequisite"));
+            }
+            let from = task.stage.clone();
+            task.stage = "rejected".into();
+            task.record(kind, "evaluation", json!({}));
+            task.record_phase(&from, "evaluation");
+            self.archived.push(task);
         }
     }
     pub fn children<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a Task> {
@@ -670,7 +676,7 @@ impl State {
                 return Some(format!("Waiting for result from {}", other.title));
             }
         }
-        if let Some(other) = task.after.iter().filter_map(|id| self.get(id)).find(|o| o.active.is_some() || (!matches!(o.stage.as_str(), "done" | "rejected") && !o.stopped && !o.blocked)) {
+        if let Some(other) = task.after.iter().filter_map(|id| self.get(id)).find(|o| o.active.is_some() || (o.stage != "done" && !o.stopped && !o.blocked)) {
             return Some(format!("Waiting for {} to settle", other.title));
         }
         for other in self.tasks.iter().filter(|o| o.active.is_some() && o.id != task.id) {
@@ -684,7 +690,7 @@ impl State {
         self.queued(task) && self.waiting_reason(task).is_none() && self.settings(task.workspace.as_deref()).kickoff()
     }
     fn queued(&self, task: &Task) -> bool {
-        !self.paused && task.active.is_none() && !task.stopped && !task.blocked && !matches!(task.stage.as_str(), "done" | "proposed" | "rejected")
+        !self.paused && task.active.is_none() && !task.stopped && !task.blocked && !matches!(task.stage.as_str(), "done" | "proposed")
     }
     fn dependents(&self, id: &str) -> Vec<usize> {
         let mut found: Vec<usize> = Vec::new();
@@ -831,7 +837,6 @@ impl State {
             return Ok(());
         }
         require(previous.active.is_none(), "Stop the task and wait for its worker to exit before editing")?;
-        require(previous.stage != "rejected", "The plan evaluator rejected this task for good; delete it and plan different work")?;
         self.check_definition(&task)?;
         self.check_relations(&task)?;
         if task.attributes.model != previous.attributes.model {
@@ -847,9 +852,6 @@ impl State {
                 let evaluated = self.settings(self.tasks[dependent].workspace.as_deref()).evaluator.is_some();
                 let other = &mut self.tasks[dependent];
                 require(other.active.is_none(), format!("Stop dependent task \"{}\" before changing its prerequisite", other.title))?;
-                if other.stage == "rejected" {
-                    continue;
-                }
                 let evaluated = evaluated && !other.container();
                 if evaluated || other.stage != "implementation" || other.attempts.iter().any(|a| a.revision == other.revision) {
                     let from = other.stage.clone();
@@ -1068,24 +1070,28 @@ impl Engine {
     }
     pub fn review_plan(&mut self, verdicts: &[(String, u64, bool, Vec<String>)], attempts: u64) -> Result<()> {
         self.change(|state| {
+            let mut rejected = Vec::new();
             for (id, revision, accepted, findings) in verdicts {
                 let Ok(index) = state.index(id) else { continue };
+                let waiting = state.awaiting_plan(&state.tasks[index]);
                 let task = &mut state.tasks[index];
-                if task.stage != "proposed" || task.revision != *revision || task.active.is_some() {
+                if task.stage != "proposed" || task.revision != *revision || task.active.is_some() || waiting {
                     continue;
                 }
                 task.plan_reviews.push(PlanReview { at: now(), revision: *revision, accepted: *accepted, findings: findings.clone() });
-                let stage = if *accepted { "implementation" } else if task.kickbacks() as u64 >= attempts { "rejected" } else { "proposed" };
-                let kind = match stage {
-                    "implementation" => "plan_accepted",
-                    "rejected" => "plan_rejected",
-                    _ => "plan_kicked_back",
-                };
-                task.record(kind, "evaluation", json!({"findings":findings}));
-                task.stage = stage.into();
-                task.record_phase("proposed", "evaluation");
+                if *accepted {
+                    task.record("plan_accepted", "evaluation", json!({}));
+                    task.stage = "implementation".into();
+                    task.record_phase("proposed", "evaluation");
+                } else if task.kickbacks() as u64 >= attempts {
+                    rejected.push(id.clone());
+                } else {
+                    task.record("plan_kicked_back", "evaluation", json!({"findings":findings}));
+                }
             }
-            state.block_on_rejected();
+            for id in rejected {
+                state.reject(&id);
+            }
             Ok(Value::Null)
         })
         .map(drop)
@@ -1183,7 +1189,7 @@ impl Engine {
         self.change(|state| {
             let limits = state.limits(&state.tasks[index]);
             let task = &mut state.tasks[index];
-            require(task.active.is_none() && !matches!(task.stage.as_str(), "done" | "rejected") && !task.container(), "Only idle, unfinished, non-container tasks that the plan evaluator has not rejected can be replanned")?;
+            require(task.active.is_none() && task.stage != "done" && !task.container(), "Only idle, unfinished, non-container tasks can be replanned")?;
             let from = task.stage.clone();
             task.stage = "replan".into();
             task.blocked = false;

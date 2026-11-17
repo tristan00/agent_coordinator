@@ -79,7 +79,7 @@ fn session<'a>(engine: &'a Engine, id: &str) -> Result<&'a Session> {
 }
 
 pub fn can_still_run(task: &Task) -> bool {
-    !task.container() && (task.active.is_some() || !(task.stage == "done" || task.stage == "rejected" || task.stopped || task.blocked))
+    !task.container() && (task.active.is_some() || !(task.stage == "done" || task.stopped || task.blocked))
 }
 
 pub fn needs_decision(task: &Task) -> bool {
@@ -87,9 +87,7 @@ pub fn needs_decision(task: &Task) -> bool {
 }
 
 fn decision_key(task: &Task) -> String {
-    let rejected = task.history.iter().filter(|e| e.kind == "plan_dependency_rejected").count();
-    let suffix = if rejected > 0 { format!(":{rejected}") } else { String::new() };
-    format!("{}:{}{suffix}", task.id, task.attempts.len())
+    format!("{}:{}", task.id, task.attempts.len())
 }
 
 fn finished_key(task: &Task, actor: &str) -> Option<String> {
@@ -109,7 +107,7 @@ fn hours(seconds: f64) -> String {
 fn board(scoped: &[&Task], since: u64, live: &dyn Fn(&Task) -> Option<f64>) -> String {
     let now = now();
     let work: Vec<&&Task> = scoped.iter().filter(|t| !t.container()).collect();
-    let counts: Vec<String> = [("Proposed", "proposed"), ("To do", "to do"), ("In progress", "in progress"), ("Review", "in review"), ("Blocked", "blocked"), ("Stopped", "stopped"), ("Rejected", "rejected"), ("Done", "done")]
+    let counts: Vec<String> = [("Proposed", "proposed"), ("To do", "to do"), ("In progress", "in progress"), ("Review", "in review"), ("Blocked", "blocked"), ("Stopped", "stopped"), ("Done", "done")]
         .into_iter()
         .map(|(status, words)| format!("{} {words}", work.iter().filter(|t| t.status() == status).count()))
         .collect();
@@ -151,14 +149,13 @@ fn wake_prompt(finished: &[&Task], blocked: &[&Task], heavy: &[(&Task, f64)], re
     let line = |t: &Task, detail: &str| format!("- {} (GET $COORDINATOR_URL/api/tasks/{}): {detail}", label(t), t.id);
     let result = |t: &Task| t.attempts.iter().rev().find(|a| a.stage == "review" && a.status() == Some("accepted")).and_then(|a| a.result.as_ref()?["summary"].as_str().map(str::to_owned)).unwrap_or_else(|| "accepted".into());
     let mut parts = Vec::new();
-    let (rejected, returned): (Vec<&Task>, Vec<&Task>) = reviewed.iter().partition(|t| t.stage == "rejected");
-    if !returned.is_empty() {
-        let list: Vec<String> = returned.iter().map(|t| line(t, &format!("{} ({} of {attempts} submissions left)", evaluation_findings(t), attempts.saturating_sub(t.kickbacks() as u64)))).collect();
-        parts.push(format!("The plan evaluator kicked these proposed tasks back:\n{}\n\nRevise each so it resolves every finding, or delete it. A task sent back unchanged uses another submission, and one kicked back {attempts} times is rejected for good.", list.join("\n")));
-    }
-    if !rejected.is_empty() {
-        let list: Vec<String> = rejected.iter().map(|t| line(t, &evaluation_findings(t))).collect();
-        parts.push(format!("The plan evaluator rejected these tasks for good after {attempts} submissions:\n{}\n\nThey cannot be edited or resubmitted. Delete them, and plan different work for anything that depended on them.", list.join("\n")));
+    if !reviewed.is_empty() {
+        let list: Vec<String> = reviewed.iter().map(|t| line(t, &format!("{} ({} of {attempts} submissions left)", evaluation_findings(t), attempts.saturating_sub(t.kickbacks() as u64)))).collect();
+        parts.push(format!("The plan evaluator kicked these proposed tasks back:
+{}
+
+Revise each so it resolves every finding, or delete it. A task sent back unchanged uses another submission.", list.join("
+")));
     }
     if !finished.is_empty() {
         let list: Vec<String> = finished.iter().map(|t| line(t, &result(t))).collect();
@@ -235,7 +232,7 @@ fn prompt(session: &Session, text: &str, first: bool, instructions: &str, minute
     }
     let w = clean(&session.workspace);
     let root = clean(session.root.as_deref().unwrap_or(&session.workspace));
-    let evaluation = attempts.map(|n| format!(" Every task you create or change starts as proposed. A plan evaluator checks proposed tasks against the request before workers can take them and resumes you with its findings; a task it kicks back {n} times is rejected for good.")).unwrap_or_default();
+    let evaluation = attempts.map(|n| format!(" Every task you create or change starts as proposed. A plan evaluator checks proposed tasks against the request before workers can take them and resumes you with its findings; a task it kicks back {n} times is removed from the plan, together with the proposed tasks that depend on it. Proposed tasks are evaluated only once every task they depend on has been accepted.")).unwrap_or_default();
     format!(
         "You plan the request in {w}, inside the workspace {root}. Create tasks through the coordinator at $COORDINATOR_URL; AGENTS.md lists its endpoints. When your tasks are in place, end your turn.{evaluation} The coordinator brings you results every {minutes} minutes, decisions as they come up, and a final check when nothing more can run.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}"
     )
@@ -351,7 +348,7 @@ fn evaluation_prompt(engine: &Engine, session: &Session, pending: &[&Task], inst
         .collect();
     let proposals: Vec<Value> = pending.iter().map(|t| proposal(engine, t, attempts)).collect();
     Ok(format!(
-        "You evaluate the proposed tasks for the request in {}, inside the workspace {}. Read whatever you need, but change nothing: no edits, commits or coordinator writes. Workers can only take a task once you accept it.\n\nEvaluator instructions:\n{instructions}\n\nRequest:\n{}\n\nTasks already on the board:\n{}\n\nProposed tasks:\n{}\n\nGive one verdict per proposed task, using its task id: accept it, or kick it back with findings the planner can act on. A task kicked back {attempts} times is rejected for good.",
+        "You evaluate the proposed tasks for the request in {}, inside the workspace {}. Read whatever you need, but change nothing: no edits, commits or coordinator writes. Workers can only take a task once you accept it.\n\nEvaluator instructions:\n{instructions}\n\nRequest:\n{}\n\nTasks already on the board:\n{}\n\nProposed tasks:\n{}\n\nGive one verdict per proposed task, using its task id: accept it, or kick it back with findings the planner can act on. A task kicked back {attempts} times is removed from the plan. Only tasks whose prerequisites are already accepted are listed as proposed here; proposed tasks that wait on them appear on the board.",
         clean(&session.workspace),
         clean(session.root.as_deref().unwrap_or(&session.workspace)),
         requests.join("\n\nFollow-up request:\n"),
@@ -438,7 +435,7 @@ fn evaluate(engine: &mut Engine, session: &Session) -> Result<bool> {
         .state
         .tasks
         .iter()
-        .filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && t.stage == "proposed" && !t.stopped && !t.blocked && t.active.is_none())
+        .filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && t.stage == "proposed" && !t.stopped && !t.blocked && t.active.is_none() && !engine.state.awaiting_plan(t))
         .filter(|t| t.plan_reviews.last().is_none_or(|r| r.revision != t.revision || r.at < since))
         .map(|t| Submitted { task: t.id.clone(), revision: t.revision })
         .collect();
@@ -490,7 +487,7 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
         let scoped: Vec<&Task> = engine.state.tasks.iter().filter(|t| engine.state.in_scope(t, Some(&session.workspace))).collect();
         let reviewed: Vec<(String, &Task)> = scoped
             .iter()
-            .filter(|t| matches!(t.stage.as_str(), "proposed" | "rejected") && t.plan_reviews.last().is_some_and(|r| !r.accepted))
+            .filter(|t| t.stage == "proposed" && t.plan_reviews.last().is_some_and(|r| !r.accepted))
             .map(|t| (format!("plan:{}:{}", t.id, t.plan_reviews.len()), *t))
             .filter(|(k, _)| !session.notified.contains(k))
             .collect();
