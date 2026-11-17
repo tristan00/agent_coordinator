@@ -638,6 +638,13 @@ impl State {
     pub fn settings(&self, key: Option<&Path>) -> history::WorkspaceSettings {
         key.and_then(|key| self.config.workspaces.get(&self.owning_workspace(key.to_path_buf()))).cloned().unwrap_or_default()
     }
+    pub fn session_of<'a>(&'a self, task: &'a Task) -> Option<&'a str> {
+        std::iter::once(task).chain(self.ancestors(task)).find_map(|owner| owner.history.iter().find(|e| e.kind == "created")?.actor.as_deref()?.strip_prefix("planner:"))
+    }
+    fn from_earlier_session(&self, task: &Task) -> bool {
+        let Some(own) = self.session_of(task).and_then(|id| self.sessions.get(id)) else { return false };
+        self.sessions.values().any(|s| s.workspace == own.workspace && s.created > own.created)
+    }
     pub fn in_scope(&self, task: &Task, key: Option<&Path>) -> bool {
         key.is_none_or(|key| {
             task.workspace.as_deref() == Some(self.owning_workspace(key.to_path_buf()).as_path()) && workspace(Path::new(&task.cwd)).is_ok_and(|cwd| cwd.starts_with(key))
@@ -726,6 +733,9 @@ impl State {
     fn waiting_reason(&self, task: &Task) -> Option<String> {
         if !self.queued(task) {
             return None;
+        }
+        if self.from_earlier_session(task) {
+            return Some("From an earlier session in this folder".into());
         }
         for owner in std::iter::once(task).chain(self.ancestors(task)) {
             if owner.parent.is_none() && !owner.standalone {

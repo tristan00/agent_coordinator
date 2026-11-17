@@ -76,6 +76,7 @@ fn the_session_stays_open_while_tasks_can_still_run_and_follow_ups_resume_it() {
     let (mut engine, source) = setup(&temp, &format!(r"mkdir {w}\submission & echo v> {w}\submission\v.txt"));
     let case = source.join("case");
     let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = Some(format!("planner:{id}"));
     engine.create(json!({"title":"Pending work","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
@@ -93,11 +94,45 @@ fn the_session_stays_open_while_tasks_can_still_run_and_follow_ups_resume_it() {
 }
 
 #[test]
+fn a_new_session_in_the_same_folder_owns_only_its_tasks_and_earlier_ones_stop_dispatching() {
+    let temp = Temp::new();
+    let (mut engine, source) = setup(&temp, "exit 0");
+    let case = source.join("case");
+    let first = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = Some(format!("planner:{first}"));
+    let old = engine.create(json!({"title":"Old work","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = None;
+    engine.change(|state| {
+        state.sessions.get_mut(&first).unwrap().status = "finished".into();
+        Ok(Value::Null)
+    }).unwrap();
+    engine.sync_waiting().unwrap();
+    assert_eq!(engine.state.get(&old).unwrap().recorded_wait, None);
+    let second = create(&mut engine, json!({"workspace":source,"directory":case,"request":"Second"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = Some(format!("planner:{second}"));
+    let new = engine.create(json!({"title":"New work","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = None;
+    engine.sync_waiting().unwrap();
+    assert_eq!(engine.state.get(&old).unwrap().recorded_wait.as_deref(), Some("From an earlier session in this folder"));
+    assert_eq!(engine.state.get(&new).unwrap().recorded_wait, None);
+    assert_eq!(view(&engine, &second).unwrap()["tasks"], json!([new]));
+    assert_eq!(view(&engine, &first).unwrap()["tasks"], json!([old]));
+    engine.control(true, Some(&new)).unwrap();
+    run_planner(&engine, &second);
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    assert_eq!(engine.state.sessions[&second].status, "finished");
+    assert_eq!(engine.state.get(&old).unwrap().stage, "implementation");
+    assert!(engine.state.get(&old).unwrap().active.is_none());
+}
+
+#[test]
 fn an_idle_planner_is_resumed_once_with_tasks_that_need_a_decision() {
     let temp = Temp::new();
     let (mut engine, source) = setup(&temp, "exit 0");
     let case = source.join("case");
     let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"First"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = Some(format!("planner:{id}"));
     engine.create(json!({"title":"Needs a call","outcome":"Done","cwd":case,"acceptance":["Works"],"standalone":true})).unwrap();
     engine.change(|state| {
         let task = &mut state.tasks[0];

@@ -78,6 +78,10 @@ fn session<'a>(engine: &'a Engine, id: &str) -> Result<&'a Session> {
     engine.state.sessions.get(id).ok_or_else(|| format!("Unknown session {id}").into())
 }
 
+fn owned(engine: &Engine, session: &Session, task: &Task) -> bool {
+    engine.state.in_scope(task, Some(&session.workspace)) && engine.state.session_of(task) == Some(session.id.as_str())
+}
+
 pub fn can_still_run(task: &Task) -> bool {
     !task.container() && (task.active.is_some() || !(task.stage == "done" || task.stage == "rejected" || task.stopped || task.blocked))
 }
@@ -270,7 +274,7 @@ pub fn stop(engine: &mut Engine, id: &str) -> Result<Value> {
     if let Some(evaluation) = session.evaluations.last().filter(|e| e.ended.is_none()) {
         fs::write(evaluation.run.join("stop"), b"")?;
     }
-    let tasks: Vec<String> = engine.state.tasks.iter().filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && can_still_run(t) && !t.stopped).map(|t| t.id.clone()).collect();
+    let tasks: Vec<String> = engine.state.tasks.iter().filter(|t| owned(engine, &session, t) && can_still_run(t) && !t.stopped).map(|t| t.id.clone()).collect();
     for task in tasks {
         engine.control(true, Some(&task))?;
     }
@@ -287,7 +291,7 @@ pub fn stop(engine: &mut Engine, id: &str) -> Result<Value> {
 
 pub fn view(engine: &Engine, id: &str) -> Result<Value> {
     let s = session(engine, id)?;
-    let tasks: Vec<&str> = engine.state.tasks.iter().filter(|t| engine.state.in_scope(t, Some(&s.workspace))).map(|t| t.id.as_str()).collect();
+    let tasks: Vec<&str> = engine.state.tasks.iter().filter(|t| owned(engine, s, t)).map(|t| t.id.as_str()).collect();
     let mut value = serde_json::to_value(s)?;
     value["tasks"] = json!(tasks);
     value["agent"] = json!(engine.state.settings(Some(&s.workspace)).agent("planner", engine.state.family).ok());
@@ -340,7 +344,7 @@ fn evaluation_prompt(engine: &Engine, session: &Session, pending: &[&Task], inst
         .state
         .tasks
         .iter()
-        .filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && !t.container() && !pending.iter().any(|p| p.id == t.id))
+        .filter(|t| owned(engine, &session, t) && !t.container() && !pending.iter().any(|p| p.id == t.id))
         .map(|t| {
             let summary = t.attempts.iter().rev().find_map(|a| a.result.as_ref()?["summary"].as_str()).map(|s| format!(" Latest result: {s}")).unwrap_or_default();
             format!("- {} [{}]: {} Criteria: {}{summary}", label(t), t.status(), t.outcome, t.acceptance.join("; "))
@@ -435,7 +439,7 @@ fn evaluate(engine: &mut Engine, session: &Session) -> Result<bool> {
         .state
         .tasks
         .iter()
-        .filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && t.stage == "proposed" && !t.stopped && !t.blocked && t.active.is_none() && !engine.state.awaiting_plan(t))
+        .filter(|t| owned(engine, &session, t) && t.stage == "proposed" && !t.stopped && !t.blocked && t.active.is_none() && !engine.state.awaiting_plan(t))
         .filter(|t| t.plan_reviews.last().is_none_or(|r| r.revision != t.revision || r.at < since))
         .map(|t| Submitted { task: t.id.clone(), revision: t.revision })
         .collect();
@@ -484,7 +488,7 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
         let attempts = engine.state.settings(Some(&session.workspace)).plan_attempts();
         let minutes = engine.state.settings(Some(&session.workspace)).wake_minutes();
         let actor = format!("planner:{id}");
-        let scoped: Vec<&Task> = engine.state.tasks.iter().filter(|t| engine.state.in_scope(t, Some(&session.workspace))).collect();
+        let scoped: Vec<&Task> = engine.state.tasks.iter().filter(|t| owned(engine, &session, t)).collect();
         let reviewed: Vec<(String, &Task)> = scoped
             .iter()
             .filter(|t| t.stage == "proposed" && t.plan_reviews.last().is_some_and(|r| !r.accepted))
