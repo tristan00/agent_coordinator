@@ -1266,7 +1266,7 @@ fn evaluated_board() -> Board {
 
 fn verdict(board: &mut Board, id: &str, accepted: bool) {
     let revision = board.task(id).revision;
-    board.engine.review_plan(&[(id.to_owned(), revision, accepted, if accepted { vec![] } else { vec!["The check costs far more than it proves".into()] })], 3).unwrap();
+    board.engine.review_plan(&[(id.to_owned(), revision, accepted, if accepted { vec![] } else { vec!["The check costs far more than it proves".into()] })], 2).unwrap();
 }
 
 #[test]
@@ -1287,7 +1287,7 @@ fn planner_tasks_wait_as_proposed_until_the_evaluator_accepts_them() {
 }
 
 #[test]
-fn kicked_back_tasks_stay_proposed_and_leave_the_board_after_the_last_attempt() {
+fn a_second_kick_back_rejects_the_task_and_it_stays_rejected_on_the_board() {
     let mut board = evaluated_board();
     let id = board.add("Soak test");
     verdict(&mut board, &id, false);
@@ -1295,17 +1295,23 @@ fn kicked_back_tasks_stay_proposed_and_leave_the_board_after_the_last_attempt() 
     board.engine.edit(&id, json!({"acceptance":["A 60 s scripted run passes"]})).unwrap();
     assert_eq!(board.task(&id).stage, "proposed");
     verdict(&mut board, &id, false);
+    let task = board.task(&id);
+    assert_eq!((task.stage.as_str(), task.status()), ("rejected", "Rejected"));
+    assert_eq!(task.plan_reviews.last().unwrap().findings, ["The check costs far more than it proves"]);
+    assert!(task.history.iter().any(|e| e.kind == "plan_rejected"));
+    assert!(!board.engine.state.dispatchable(board.task(&id)));
+    assert!(board.engine.edit(&id, json!({"outcome":"Something else"})).unwrap_err().to_string().contains("rejected"));
+    assert!(board.engine.request_replan(&id, json!({})).is_err());
+    assert!(board.engine.remove(&id).unwrap_err().to_string().contains("stays on the board"));
+    board.engine.control(true, Some(&id)).unwrap();
+    assert_eq!(board.engine.task_value(board.task(&id), false).unwrap()["status"], "Rejected");
     let revision = board.task(&id).revision;
-    board.engine.review_plan(&[(id.clone(), revision, false, vec!["Still too costly".into()])], 3).unwrap();
-    assert!(board.engine.task(&id).is_err());
-    let archived = board.engine.state.archived.iter().find(|t| t.id == id).unwrap();
-    assert_eq!(archived.stage, "rejected");
-    assert!(archived.history.iter().any(|e| e.kind == "plan_rejected"));
-    assert!(board.engine.edit(&id, json!({"outcome":"Something else"})).is_err());
+    board.engine.review_plan(&[(id.clone(), revision, true, vec![])], 2).unwrap();
+    assert_eq!(board.task(&id).stage, "rejected");
 }
 
 #[test]
-fn proposed_tasks_wait_for_proposed_prerequisites_and_leave_with_a_rejected_one() {
+fn proposed_tasks_wait_for_their_prerequisites_and_stay_behind_a_rejected_one() {
     let mut board = evaluated_board();
     let base = board.add("Base");
     let dependent = board.create(board.with("Dependent", json!({"dependencies":[{"target":base,"reason":"uses_api"}]})));
@@ -1314,25 +1320,31 @@ fn proposed_tasks_wait_for_proposed_prerequisites_and_leave_with_a_rejected_one(
     let container = board.create(board.container("Group"));
     let child = board.create(board.child("Child", &container));
     let downstream = board.create(board.with("Downstream", json!({"dependencies":[{"target":container,"reason":"uses_api"}]})));
+    let free = board.add("Free");
     let state = &board.engine.state;
-    assert!(!state.awaiting_plan(board.task(&base)));
+    assert!(!state.awaiting_plan(board.task(&base)) && !state.awaiting_plan(board.task(&free)));
     assert!([&dependent, &later, &ordered, &downstream].iter().all(|id| state.awaiting_plan(board.task(id))));
     verdict(&mut board, &dependent, true);
     assert_eq!((board.task(&dependent).stage.as_str(), board.task(&dependent).plan_reviews.len()), ("proposed", 0));
-    for _ in 0..3 {
+    for _ in 0..2 {
         verdict(&mut board, &base, false);
         verdict(&mut board, &child, false);
     }
-    for id in [&base, &dependent, &later, &child, &container, &downstream] {
-        assert!(board.engine.task(id).is_err(), "{id} should have left the board");
+    assert_eq!((board.task(&base).stage.as_str(), board.task(&child).stage.as_str()), ("rejected", "rejected"));
+    assert_eq!(board.task(&base).rejection.as_ref().unwrap().findings, ["The check costs far more than it proves"]);
+    for (id, prerequisite, relation) in [(&dependent, &base, "dependency"), (&later, &dependent, "dependency"), (&ordered, &base, "runs after"), (&downstream, &child, "dependency")] {
+        let task = board.task(id);
+        let rejection = task.rejection.as_ref().unwrap();
+        assert_eq!((task.stage.as_str(), task.status()), ("rejected", "Rejected"), "{}", task.title);
+        assert_eq!((rejection.prerequisite.as_deref(), rejection.relation.as_deref()), (Some(prerequisite.as_str()), Some(relation)), "{}", task.title);
+        assert!(rejection.prerequisite_name.as_deref().is_some_and(|n| n.contains(&board.task(prerequisite).title)));
+        assert!(rejection.findings.is_empty() && task.plan_reviews.is_empty());
     }
-    let dropped = board.engine.state.archived.iter().find(|t| t.id == later).unwrap();
-    assert!(dropped.history.iter().any(|e| e.kind == "dropped_with_prerequisite"));
-    let kept = board.task(&ordered);
-    assert!(kept.after.is_empty() && kept.stage == "proposed" && !kept.blocked);
-    assert!(!board.engine.state.awaiting_plan(board.task(&ordered)));
-    verdict(&mut board, &ordered, true);
-    assert_eq!(board.task(&ordered).stage, "implementation");
+    assert_eq!(board.task(&free).stage, "proposed");
+    assert!(board.engine.task(&container).is_ok());
+    board.engine.actor = Some("planner:session".into());
+    let late = board.create(board.with("Late", json!({"dependencies":[{"target":base,"reason":"uses_api"}]})));
+    assert_eq!(board.task(&late).stage, "rejected");
 }
 
 #[test]

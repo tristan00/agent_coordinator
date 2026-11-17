@@ -79,7 +79,7 @@ fn session<'a>(engine: &'a Engine, id: &str) -> Result<&'a Session> {
 }
 
 pub fn can_still_run(task: &Task) -> bool {
-    !task.container() && (task.active.is_some() || !(task.stage == "done" || task.stopped || task.blocked))
+    !task.container() && (task.active.is_some() || !(task.stage == "done" || task.stage == "rejected" || task.stopped || task.blocked))
 }
 
 pub fn needs_decision(task: &Task) -> bool {
@@ -107,7 +107,7 @@ fn hours(seconds: f64) -> String {
 fn board(scoped: &[&Task], since: u64, live: &dyn Fn(&Task) -> Option<f64>) -> String {
     let now = now();
     let work: Vec<&&Task> = scoped.iter().filter(|t| !t.container()).collect();
-    let counts: Vec<String> = [("Proposed", "proposed"), ("To do", "to do"), ("In progress", "in progress"), ("Review", "in review"), ("Blocked", "blocked"), ("Stopped", "stopped"), ("Done", "done")]
+    let counts: Vec<String> = [("Proposed", "proposed"), ("To do", "to do"), ("In progress", "in progress"), ("Review", "in review"), ("Blocked", "blocked"), ("Stopped", "stopped"), ("Rejected", "rejected"), ("Done", "done")]
         .into_iter()
         .map(|(status, words)| format!("{} {words}", work.iter().filter(|t| t.status() == status).count()))
         .collect();
@@ -232,7 +232,7 @@ fn prompt(session: &Session, text: &str, first: bool, instructions: &str, minute
     }
     let w = clean(&session.workspace);
     let root = clean(session.root.as_deref().unwrap_or(&session.workspace));
-    let evaluation = attempts.map(|n| format!(" Every task you create or change starts as proposed. A plan evaluator checks proposed tasks against the request before workers can take them and resumes you with its findings; a task it kicks back {n} times is removed from the plan, together with the proposed tasks that depend on it. Proposed tasks are evaluated only once every task they depend on has been accepted.")).unwrap_or_default();
+    let evaluation = attempts.map(|n| format!(" Every task you create or change starts as proposed. A plan evaluator checks proposed tasks against the request before workers can take them and resumes you with its findings; a task it kicks back {n} times is rejected and never runs. Proposed tasks are evaluated only once every task they depend on has been accepted.")).unwrap_or_default();
     format!(
         "You plan the request in {w}, inside the workspace {root}. Create tasks through the coordinator at $COORDINATOR_URL; AGENTS.md lists its endpoints. When your tasks are in place, end your turn.{evaluation} The coordinator brings you results every {minutes} minutes, decisions as they come up, and a final check when nothing more can run.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}"
     )
@@ -348,7 +348,7 @@ fn evaluation_prompt(engine: &Engine, session: &Session, pending: &[&Task], inst
         .collect();
     let proposals: Vec<Value> = pending.iter().map(|t| proposal(engine, t, attempts)).collect();
     Ok(format!(
-        "You evaluate the proposed tasks for the request in {}, inside the workspace {}. Read whatever you need, but change nothing: no edits, commits or coordinator writes. Workers can only take a task once you accept it.\n\nEvaluator instructions:\n{instructions}\n\nRequest:\n{}\n\nTasks already on the board:\n{}\n\nProposed tasks:\n{}\n\nGive one verdict per proposed task, using its task id: accept it, or kick it back with findings the planner can act on. A task kicked back {attempts} times is removed from the plan. Only tasks whose prerequisites are already accepted are listed as proposed here; proposed tasks that wait on them appear on the board.",
+        "You evaluate the proposed tasks for the request in {}, inside the workspace {}. Read whatever you need, but change nothing: no edits, commits or coordinator writes. Workers can only take a task once you accept it.\n\nEvaluator instructions:\n{instructions}\n\nRequest:\n{}\n\nTasks already on the board:\n{}\n\nProposed tasks:\n{}\n\nGive one verdict per proposed task, using its task id: accept it, or kick it back with findings the planner can act on. A task kicked back {attempts} times is rejected and never runs. Only tasks whose prerequisites are already accepted are listed as proposed here; proposed tasks that wait on them appear on the board.",
         clean(&session.workspace),
         clean(session.root.as_deref().unwrap_or(&session.workspace)),
         requests.join("\n\nFollow-up request:\n"),
@@ -496,7 +496,7 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
         }
         let finished: Vec<(String, &Task)> = scoped.iter().filter_map(|t| finished_key(t, &actor).filter(|k| !session.notified.contains(k)).map(|k| (k, *t))).collect();
         let blocked: Vec<(String, &Task)> = scoped.iter().filter(|t| needs_decision(t)).map(|t| (decision_key(t), *t)).filter(|(k, _)| !session.notified.contains(k)).collect();
-        let idle = !scoped.iter().any(|t| can_still_run(t));
+        let idle = !scoped.iter().any(|t| can_still_run(t) && !engine.state.held_by_rejection(t));
         let halted = scoped.iter().any(|t| !t.container() && engine.state.halted(t));
         let since = request.planner_ended.unwrap_or(request.started);
         let due = now().saturating_sub(since) >= minutes.saturating_mul(60_000);

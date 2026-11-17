@@ -431,7 +431,7 @@ fn dependents_wait_for_evaluation_and_a_rejection_does_not_wake_the_planner() {
     let index = engine.task(&base).unwrap();
     engine.change(|state| {
         let revision = state.tasks[index].revision;
-        for _ in 0..2 {
+        for _ in 0..1 {
             state.tasks[index].plan_reviews.push(crate::engine::PlanReview { at: 0, revision, accepted: false, findings: vec!["Too costly".into()] });
         }
         Ok(Value::Null)
@@ -447,7 +447,10 @@ fn dependents_wait_for_evaluation_and_a_rejection_does_not_wake_the_planner() {
     for _ in 0..4 {
         tick(&mut engine).unwrap();
     }
-    assert!(engine.task(&base).is_err() && engine.task(&dependent).is_err());
+    assert_eq!(engine.state.tasks[engine.task(&base).unwrap()].stage, "rejected");
+    let held = &engine.state.tasks[engine.task(&dependent).unwrap()];
+    assert_eq!((held.stage.as_str(), held.rejection.as_ref().and_then(|r| r.prerequisite.as_deref())), ("rejected", Some(base.as_str())));
     let session = &engine.state.sessions[&id];
     assert_eq!((session.requests.len(), session.evaluations.len()), (1, 1));
+    assert_eq!(session.status, "finished");
 }

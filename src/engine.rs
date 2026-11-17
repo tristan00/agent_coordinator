@@ -83,6 +83,18 @@ pub struct PlanReview {
     pub findings: Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
+pub struct Rejection {
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prerequisite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
+    #[serde(default, rename = "prerequisiteName", skip_serializing_if = "Option::is_none")]
+    pub prerequisite_name: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     #[serde(default, rename = "shortId", skip_serializing_if = "Option::is_none")]
@@ -142,6 +154,8 @@ pub struct Task {
     pub retry_at: u64,
     #[serde(default, rename = "planReviews", skip_serializing_if = "Vec::is_empty")]
     pub plan_reviews: Vec<PlanReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<Rejection>,
 }
 impl Task {
     pub fn kickbacks(&self) -> usize {
@@ -183,6 +197,7 @@ impl Task {
     pub fn status(&self) -> &'static str {
         match self.stage.as_str() {
             "done" => "Done",
+            "rejected" => "Rejected",
             _ if self.stopped && self.active.is_none() => "Stopped",
             "proposed" => "Proposed",
             "review" => "Review",
@@ -229,7 +244,7 @@ impl Task {
         let tokens: u64 = self.attempts.iter().filter_map(|a| a.evidence.usage.as_ref()?.tokens()).sum();
         json!({"id":self.id,"shortId":self.short_id,"key":self.key,"title":self.title,"workspace":self.workspace,"parent":self.parent,"stage":self.stage,"status":self.status(),"container":self.container(),
             "active":self.active.is_some(),"stopped":self.stopped,"blocked":self.blocked,"revision":self.revision,"waitingReason":self.recorded_wait,"strikes":self.strikes(),
-            "feedback":self.feedback,"failure":self.failure,"attempts":self.attempts.len(),"tokens":tokens,"latest":latest,"planReviews":self.plan_reviews})
+            "feedback":self.feedback,"failure":self.failure,"attempts":self.attempts.len(),"tokens":tokens,"latest":latest,"planReviews":self.plan_reviews,"rejection":self.rejection})
     }
     fn failures(&self) -> BTreeMap<String, usize> {
         let mut failures = self.inherited.clone();
@@ -523,41 +538,54 @@ impl State {
     pub(crate) fn get(&self, id: &str) -> Option<&Task> {
         self.tasks.iter().find(|task| task.id == id)
     }
-    fn holds_proposed(&self, id: &str) -> bool {
-        self.get(id).is_some_and(|task| task.stage == "proposed" || (task.container() && self.children(id).any(|child| self.holds_proposed(&child.id))))
+    fn prerequisites<'a>(&'a self, task: &'a Task) -> impl Iterator<Item = &'a Task> {
+        std::iter::once(task).chain(self.ancestors(task)).flat_map(|owner| owner.dependencies.iter().map(|d| &d.target).chain(&owner.after)).filter_map(|id| self.get(id))
+    }
+    fn holds(&self, task: &Task, stages: &[&str]) -> bool {
+        stages.contains(&task.stage.as_str()) || (task.container() && self.children(&task.id).any(|child| self.holds(child, stages)))
     }
     pub fn awaiting_plan(&self, task: &Task) -> bool {
-        std::iter::once(task).chain(self.ancestors(task)).flat_map(|owner| owner.dependencies.iter().map(|d| &d.target).chain(&owner.after)).any(|id| self.holds_proposed(id))
+        self.prerequisites(task).any(|other| self.holds(other, &["proposed", "rejected"]))
     }
-    fn reject(&mut self, id: &str) {
-        let mut pending = vec![(id.to_owned(), "plan_rejected")];
-        while let Some((id, kind)) = pending.pop() {
-            let Ok(index) = self.index(&id) else { continue };
-            let mut task = self.tasks.remove(index);
-            for other in &mut self.tasks {
-                if other.dependencies.iter().any(|d| d.target == id) && (other.stage == "proposed" || other.container()) {
-                    pending.push((other.id.clone(), "dropped_with_prerequisite"));
+    fn rejected_by(&self, task: &Task) -> Option<(String, &'static str)> {
+        let own = task.dependencies.iter().map(|d| (&d.target, "dependency")).chain(task.after.iter().map(|id| (id, "runs after")));
+        let inherited = self.ancestors(task).into_iter().flat_map(|a| a.dependencies.iter().map(|d| (&d.target, "container dependency")).chain(a.after.iter().map(|id| (id, "container runs after"))));
+        own.chain(inherited).find_map(|(id, relation)| {
+            let other = self.get(id)?;
+            if other.stage == "rejected" {
+                return Some((other.id.clone(), relation));
+            }
+            let child = self.children(&other.id).find(|child| self.holds(child, &["rejected"]))?;
+            Some((child.id.clone(), relation))
+        })
+    }
+    fn cascade_rejections(&mut self) {
+        loop {
+            let next = (0..self.tasks.len()).find_map(|index| {
+                let task = &self.tasks[index];
+                if task.container() || task.active.is_some() || matches!(task.stage.as_str(), "done" | "rejected") {
+                    return None;
                 }
-                other.dependencies.retain(|d| d.target != id);
-                other.after.retain(|a| a != &id);
-                other.conflicts.retain(|c| c != &id);
-                other.related.retain(|c| c != &id);
-            }
-            if let Some(parent) = task.parent.clone().filter(|parent| self.children(parent).next().is_none()) {
-                pending.push((parent, "dropped_with_prerequisite"));
-            }
+                self.rejected_by(task).map(|found| (index, found))
+            });
+            let Some((index, (prerequisite, relation))) = next else { break };
+            let name = self.get(&prerequisite).map(|t| format!("{} {}", t.short_id.as_deref().unwrap_or_default(), t.title).trim().to_owned());
+            let task = &mut self.tasks[index];
             let from = task.stage.clone();
+            task.rejection = Some(Rejection { at: now(), findings: Vec::new(), prerequisite: Some(prerequisite.clone()), relation: Some(relation.into()), prerequisite_name: name });
             task.stage = "rejected".into();
-            task.record(kind, "evaluation", json!({}));
+            task.record("plan_rejected", "evaluation", json!({"prerequisite":prerequisite,"relation":relation}));
             task.record_phase(&from, "evaluation");
-            self.archived.push(task);
         }
+    }
+    pub fn held_by_rejection(&self, task: &Task) -> bool {
+        self.prerequisites(task).any(|other| self.holds(other, &["rejected"]) || self.held_by_rejection(other))
     }
     pub fn children<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a Task> {
         self.tasks.iter().filter(move |task| task.parent.as_deref() == Some(id))
     }
     pub fn halted(&self, task: &Task) -> bool {
-        if task.stage == "done" {
+        if task.stage == "done" || task.stage == "rejected" {
             return false;
         }
         if !task.container() {
@@ -690,7 +718,7 @@ impl State {
         self.queued(task) && self.waiting_reason(task).is_none() && self.settings(task.workspace.as_deref()).kickoff()
     }
     fn queued(&self, task: &Task) -> bool {
-        !self.paused && task.active.is_none() && !task.stopped && !task.blocked && !matches!(task.stage.as_str(), "done" | "proposed")
+        !self.paused && task.active.is_none() && !task.stopped && !task.blocked && !matches!(task.stage.as_str(), "done" | "proposed" | "rejected")
     }
     fn dependents(&self, id: &str) -> Vec<usize> {
         let mut found: Vec<usize> = Vec::new();
@@ -837,6 +865,7 @@ impl State {
             return Ok(());
         }
         require(previous.active.is_none(), "Stop the task and wait for its worker to exit before editing")?;
+        require(previous.stage != "rejected", "The plan evaluator rejected this task; it cannot be changed")?;
         self.check_definition(&task)?;
         self.check_relations(&task)?;
         if task.attributes.model != previous.attributes.model {
@@ -852,6 +881,9 @@ impl State {
                 let evaluated = self.settings(self.tasks[dependent].workspace.as_deref()).evaluator.is_some();
                 let other = &mut self.tasks[dependent];
                 require(other.active.is_none(), format!("Stop dependent task \"{}\" before changing its prerequisite", other.title))?;
+                if other.stage == "rejected" {
+                    continue;
+                }
                 let evaluated = evaluated && !other.container();
                 if evaluated || other.stage != "implementation" || other.attempts.iter().any(|a| a.revision == other.revision) {
                     let from = other.stage.clone();
@@ -1021,6 +1053,7 @@ impl Engine {
     pub(crate) fn commit(&mut self, mut state: State) -> Result<()> {
         state.schema_version = Some(history::SCHEMA_VERSION);
         self.propose(&mut state);
+        state.cascade_rejections();
         let next = self.state.sequence + 1;
         if let Some(actor) = &self.actor {
             let known: HashMap<&str, usize> = self.state.tasks.iter().chain(&self.state.archived).map(|t| (t.id.as_str(), t.history.len())).collect();
@@ -1070,7 +1103,6 @@ impl Engine {
     }
     pub fn review_plan(&mut self, verdicts: &[(String, u64, bool, Vec<String>)], attempts: u64) -> Result<()> {
         self.change(|state| {
-            let mut rejected = Vec::new();
             for (id, revision, accepted, findings) in verdicts {
                 let Ok(index) = state.index(id) else { continue };
                 let waiting = state.awaiting_plan(&state.tasks[index]);
@@ -1079,19 +1111,20 @@ impl Engine {
                     continue;
                 }
                 task.plan_reviews.push(PlanReview { at: now(), revision: *revision, accepted: *accepted, findings: findings.clone() });
-                if *accepted {
-                    task.record("plan_accepted", "evaluation", json!({}));
-                    task.stage = "implementation".into();
-                    task.record_phase("proposed", "evaluation");
-                } else if task.kickbacks() as u64 >= attempts {
-                    rejected.push(id.clone());
-                } else {
-                    task.record("plan_kicked_back", "evaluation", json!({"findings":findings}));
+                let stage = if *accepted { "implementation" } else if task.kickbacks() as u64 >= attempts { "rejected" } else { "proposed" };
+                let kind = match stage {
+                    "implementation" => "plan_accepted",
+                    "rejected" => "plan_rejected",
+                    _ => "plan_kicked_back",
+                };
+                task.record(kind, "evaluation", json!({"findings":findings}));
+                if stage == "rejected" {
+                    task.rejection = Some(Rejection { at: now(), findings: findings.clone(), prerequisite: None, relation: None, prerequisite_name: None });
                 }
+                task.stage = stage.into();
+                task.record_phase("proposed", "evaluation");
             }
-            for id in rejected {
-                state.reject(&id);
-            }
+            state.cascade_rejections();
             Ok(Value::Null)
         })
         .map(drop)
@@ -1189,7 +1222,7 @@ impl Engine {
         self.change(|state| {
             let limits = state.limits(&state.tasks[index]);
             let task = &mut state.tasks[index];
-            require(task.active.is_none() && task.stage != "done" && !task.container(), "Only idle, unfinished, non-container tasks can be replanned")?;
+            require(task.active.is_none() && !matches!(task.stage.as_str(), "done" | "rejected") && !task.container(), "Only idle, unfinished, non-container tasks the plan evaluator has not rejected can be replanned")?;
             let from = task.stage.clone();
             task.stage = "replan".into();
             task.blocked = false;
@@ -1207,6 +1240,7 @@ impl Engine {
         let index = self.task(id)?;
         let task = &self.state.tasks[index];
         require(task.active.is_none(), "Task has an active worker")?;
+        require(task.stage != "rejected", "The plan evaluator rejected this task; it stays on the board")?;
         let referenced = self.state.tasks.iter().any(|t| t.parent.as_deref() == Some(id) || t.dependencies.iter().map(|d| &d.target).chain(&t.after).any(|d| d == id));
         require(!referenced, "Task has children or dependents; supersede it instead")?;
         self.change(|state| {
