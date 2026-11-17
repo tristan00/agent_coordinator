@@ -181,7 +181,7 @@ fn repository(directory: &Path) -> Result<()> {
 
 pub fn message(engine: &mut Engine, id: &str, input: Value) -> Result<Value> {
     let text = input["request"].as_str().filter(|text| !text.trim().is_empty()).ok_or("request text is required")?.to_owned();
-    require(session(engine, id)?.status == "waiting", "The session is still working on its current request")?;
+    require(session(engine, id)?.status == "finished", "The session is still working on its current request")?;
     start(engine, id, text, "follow-up")?;
     view(engine, id)
 }
@@ -338,7 +338,7 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
         }
         engine.change(|state| {
             let s = state.sessions.get_mut(&id).ok_or("Unknown session")?;
-            s.status = "waiting".into();
+            s.status = "finished".into();
             s.requests.last_mut().ok_or("Missing request")?.ended = Some(now());
             Ok(Value::Null)
         })?;

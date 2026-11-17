@@ -933,6 +933,9 @@ impl Engine {
             state.config.replan = state.config.implementation.clone();
         }
         state.family = crate::agents::family(state.family);
+        for session in state.sessions.values_mut().filter(|s| s.status == "waiting") {
+            session.status = "finished".into();
+        }
         state.config.adopt_legacy_limits()?;
         for index in 0..state.tasks.len() {
             let task = &mut state.tasks[index];

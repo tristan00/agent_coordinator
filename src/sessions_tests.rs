@@ -62,8 +62,8 @@ fn a_session_works_in_its_own_repository_and_waits_when_done() {
     assert_eq!(engine.state.sessions[&id].status, "running");
     tick(&mut engine).unwrap();
     let session = &engine.state.sessions[&id];
-    assert!(session.status == "waiting" && session.requests[0].ended.is_some());
-    assert_eq!(view(&engine, &id).unwrap()["status"], "waiting");
+    assert!(session.status == "finished" && session.requests[0].ended.is_some());
+    assert_eq!(view(&engine, &id).unwrap()["status"], "finished");
     assert_eq!(fs::read_to_string(case.join("app.txt")).unwrap().trim(), "built");
     let launched = fs::read_to_string(case.join("cwd.txt")).unwrap();
     assert_eq!(PathBuf::from(launched.trim().trim_start_matches(r"\\?\")).file_name(), source.file_name());
@@ -85,7 +85,7 @@ fn the_session_stays_open_while_tasks_can_still_run_and_follow_ups_resume_it() {
     let task = engine.state.tasks[0].id.clone();
     engine.control(true, Some(&task)).unwrap();
     tick(&mut engine).unwrap();
-    assert_eq!(engine.state.sessions[&id].status, "waiting");
+    assert_eq!(engine.state.sessions[&id].status, "finished");
     message(&mut engine, &id, json!({"request":"Second"})).unwrap();
     let second: Value = read(&engine.state.sessions[&id].requests[1].run.join("request.json")).unwrap();
     assert!(second["prompt"].as_str().unwrap().contains("Second"));
@@ -117,7 +117,7 @@ fn an_idle_planner_is_resumed_once_with_tasks_that_need_a_decision() {
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
     tick(&mut engine).unwrap();
-    assert_eq!((engine.state.sessions[&id].status.as_str(), engine.state.sessions[&id].requests.len()), ("waiting", 2));
+    assert_eq!((engine.state.sessions[&id].status.as_str(), engine.state.sessions[&id].requests.len()), ("finished", 2));
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn finished_planner_tasks_are_collected_until_the_timer_or_the_final_check() {
     run_planner(&engine, &id);
     tick(&mut engine).unwrap();
     tick(&mut engine).unwrap();
-    assert_eq!((engine.state.sessions[&id].status.as_str(), engine.state.sessions[&id].requests.len()), ("waiting", 4));
+    assert_eq!((engine.state.sessions[&id].status.as_str(), engine.state.sessions[&id].requests.len()), ("finished", 4));
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn work_you_stopped_does_not_trigger_the_final_check() {
     finish_task(&mut engine, "Done one", "Works");
     engine.control(true, Some(&halted)).unwrap();
     tick(&mut engine).unwrap();
-    assert_eq!((engine.state.sessions[&id].status.as_str(), engine.state.sessions[&id].requests.len()), ("waiting", 1));
+    assert_eq!((engine.state.sessions[&id].status.as_str(), engine.state.sessions[&id].requests.len()), ("finished", 1));
 }
 
 #[test]
@@ -319,4 +319,15 @@ fn a_task_using_a_lot_of_compute_wakes_the_planner_once() {
     tick(&mut engine).unwrap();
     tick(&mut engine).unwrap();
     assert_eq!(engine.state.sessions[&id].requests.len(), 2);
+}
+
+#[test]
+fn sessions_saved_as_waiting_load_as_finished() {
+    let temp = crate::test_support::Temp::new();
+    let directory = temp.dir("board-finished");
+    let mut state: Value = serde_json::to_value(&temp.engine().state).unwrap();
+    state["sessions"] = json!({"s1":{"id":"s1","workspace":temp.dir("ws"),"status":"waiting","requests":[],"created":1},"s2":{"id":"s2","workspace":temp.dir("ws"),"status":"stopped","requests":[],"created":1}});
+    crate::write(&directory.join("state.json"), &state).unwrap();
+    let engine = Engine::new(directory).unwrap();
+    assert_eq!((engine.state.sessions["s1"].status.as_str(), engine.state.sessions["s2"].status.as_str()), ("finished", "stopped"));
 }
