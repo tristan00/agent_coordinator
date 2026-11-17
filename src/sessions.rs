@@ -28,6 +28,29 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_error: Option<String>,
     pub created: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evaluations: Vec<Evaluation>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Submitted {
+    pub task: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Evaluation {
+    pub run: PathBuf,
+    pub started: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<u64>,
+    pub submitted: Vec<Submitted>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verdicts: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -56,7 +79,7 @@ fn session<'a>(engine: &'a Engine, id: &str) -> Result<&'a Session> {
 }
 
 pub fn can_still_run(task: &Task) -> bool {
-    !task.container() && (task.active.is_some() || !(task.stage == "done" || task.stopped || task.blocked))
+    !task.container() && (task.active.is_some() || !(task.stage == "done" || task.stage == "rejected" || task.stopped || task.blocked))
 }
 
 pub fn needs_decision(task: &Task) -> bool {
@@ -64,7 +87,9 @@ pub fn needs_decision(task: &Task) -> bool {
 }
 
 fn decision_key(task: &Task) -> String {
-    format!("{}:{}", task.id, task.attempts.len())
+    let rejected = task.history.iter().filter(|e| e.kind == "plan_dependency_rejected").count();
+    let suffix = if rejected > 0 { format!(":{rejected}") } else { String::new() };
+    format!("{}:{}{suffix}", task.id, task.attempts.len())
 }
 
 fn finished_key(task: &Task, actor: &str) -> Option<String> {
@@ -84,7 +109,7 @@ fn hours(seconds: f64) -> String {
 fn board(scoped: &[&Task], since: u64, live: &dyn Fn(&Task) -> Option<f64>) -> String {
     let now = now();
     let work: Vec<&&Task> = scoped.iter().filter(|t| !t.container()).collect();
-    let counts: Vec<String> = [("To do", "to do"), ("In progress", "in progress"), ("Review", "in review"), ("Blocked", "blocked"), ("Stopped", "stopped"), ("Done", "done")]
+    let counts: Vec<String> = [("Proposed", "proposed"), ("To do", "to do"), ("In progress", "in progress"), ("Review", "in review"), ("Blocked", "blocked"), ("Stopped", "stopped"), ("Rejected", "rejected"), ("Done", "done")]
         .into_iter()
         .map(|(status, words)| format!("{} {words}", work.iter().filter(|t| t.status() == status).count()))
         .collect();
@@ -117,14 +142,28 @@ fn board(scoped: &[&Task], since: u64, live: &dyn Fn(&Task) -> Option<f64>) -> S
     lines.join("\n")
 }
 
-fn wake_prompt(finished: &[&Task], blocked: &[&Task], heavy: &[(&Task, f64)], board: String, idle: bool, minutes: u64) -> String {
+fn evaluation_findings(task: &Task) -> String {
+    task.plan_reviews.last().map(|r| r.findings.join(" ")).unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wake_prompt(finished: &[&Task], blocked: &[&Task], heavy: &[(&Task, f64)], reviewed: &[&Task], attempts: u64, board: String, idle: bool, minutes: u64) -> String {
     let line = |t: &Task, detail: &str| format!("- {} (GET $COORDINATOR_URL/api/tasks/{}): {detail}", label(t), t.id);
     let result = |t: &Task| t.attempts.iter().rev().find(|a| a.stage == "review" && a.status() == Some("accepted")).and_then(|a| a.result.as_ref()?["summary"].as_str().map(str::to_owned)).unwrap_or_else(|| "accepted".into());
     let mut parts = Vec::new();
+    let (rejected, returned): (Vec<&Task>, Vec<&Task>) = reviewed.iter().partition(|t| t.stage == "rejected");
+    if !returned.is_empty() {
+        let list: Vec<String> = returned.iter().map(|t| line(t, &format!("{} ({} of {attempts} submissions left)", evaluation_findings(t), attempts.saturating_sub(t.kickbacks() as u64)))).collect();
+        parts.push(format!("The plan evaluator kicked these proposed tasks back:\n{}\n\nRevise each so it resolves every finding, or delete it. A task sent back unchanged uses another submission, and one kicked back {attempts} times is rejected for good.", list.join("\n")));
+    }
+    if !rejected.is_empty() {
+        let list: Vec<String> = rejected.iter().map(|t| line(t, &evaluation_findings(t))).collect();
+        parts.push(format!("The plan evaluator rejected these tasks for good after {attempts} submissions:\n{}\n\nThey cannot be edited or resubmitted. Delete them, and plan different work for anything that depended on them.", list.join("\n")));
+    }
     if !finished.is_empty() {
         let list: Vec<String> = finished.iter().map(|t| line(t, &result(t))).collect();
         parts.push(format!("These tasks finished since your last turn:\n{}\n\nCompare what they produced with your target and change, add or remove tasks where the plan no longer leads to it.", list.join("\n")));
-    } else if blocked.is_empty() && heavy.is_empty() {
+    } else if blocked.is_empty() && heavy.is_empty() && reviewed.is_empty() {
         parts.push("Nothing has finished since your last turn. Check that the work in progress still leads to your target.".to_owned());
     }
     if !blocked.is_empty() {
@@ -158,7 +197,7 @@ pub fn create(engine: &mut Engine, input: Value) -> Result<Value> {
     require(!engine.state.sessions.values().any(|s| s.workspace == directory && s.status == "running"), "A session is already running in this directory")?;
     repository(&directory)?;
     let id = id();
-    let session = Session { id: id.clone(), workspace: directory.clone(), root: Some(source.clone()), status: "running".into(), requests: Vec::new(), conversation: None, notified: BTreeSet::new(), wake_error: None, created: now() };
+    let session = Session { id: id.clone(), workspace: directory.clone(), root: Some(source.clone()), status: "running".into(), requests: Vec::new(), conversation: None, notified: BTreeSet::new(), wake_error: None, created: now(), evaluations: Vec::new() };
     engine.change(|state| {
         state.sessions.insert(id.clone(), session);
         Ok(Value::Null)
@@ -186,15 +225,19 @@ pub fn message(engine: &mut Engine, id: &str, input: Value) -> Result<Value> {
     view(engine, id)
 }
 
-fn prompt(session: &Session, text: &str, first: bool, instructions: &str, minutes: u64) -> String {
+fn clean(path: &Path) -> String {
+    path.to_string_lossy().trim_start_matches(r"\\?\").to_owned()
+}
+
+fn prompt(session: &Session, text: &str, first: bool, instructions: &str, minutes: u64, attempts: Option<u64>) -> String {
     if !first {
         return format!("New request in the same folder:\n\n{text}");
     }
-    let clean = |path: &Path| path.to_string_lossy().trim_start_matches(r"\\?\").to_owned();
     let w = clean(&session.workspace);
     let root = clean(session.root.as_deref().unwrap_or(&session.workspace));
+    let evaluation = attempts.map(|n| format!(" Every task you create or change starts as proposed. A plan evaluator checks proposed tasks against the request before workers can take them and resumes you with its findings; a task it kicks back {n} times is rejected for good.")).unwrap_or_default();
     format!(
-        "You plan the request in {w}, inside the workspace {root}. Create tasks through the coordinator at $COORDINATOR_URL; AGENTS.md lists its endpoints. When your tasks are in place, end your turn. The coordinator brings you results every {minutes} minutes, decisions as they come up, and a final check when nothing more can run.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}"
+        "You plan the request in {w}, inside the workspace {root}. Create tasks through the coordinator at $COORDINATOR_URL; AGENTS.md lists its endpoints. When your tasks are in place, end your turn.{evaluation} The coordinator brings you results every {minutes} minutes, decisions as they come up, and a final check when nothing more can run.\n\nPlanner instructions:\n{instructions}\n\nRequest:\n{text}"
     )
 }
 
@@ -206,7 +249,8 @@ fn start(engine: &mut Engine, id: &str, text: String, kind: &str) -> Result<()> 
     let run = engine.directory.join("sessions").join(id).join((session.requests.len() + 1).to_string());
     fs::create_dir_all(&run)?;
     let port: u16 = read(&engine.directory.join("port.json")).unwrap_or(4242);
-    let text_prompt = if kind == "wake" { text.clone() } else { prompt(&session, &text, session.requests.is_empty(), &instructions, settings.wake_minutes()) };
+    let attempts = settings.evaluator.is_some().then(|| settings.plan_attempts());
+    let text_prompt = if kind == "wake" { text.clone() } else { prompt(&session, &text, session.requests.is_empty(), &instructions, settings.wake_minutes(), attempts) };
     write(&run.join("request.json"), &json!({"session":id,"workspace":session.workspace,"root":session.root.as_ref().unwrap_or(&session.workspace),"prompt":text_prompt,"agent":agent,
         "conversation":session.conversation,"command":engine.state.config.planner,"url":format!("http://127.0.0.1:{port}/s/{id}")}))?;
     write(&run.join("launch-intent.json"), &json!({"at":now()}))?;
@@ -225,6 +269,9 @@ pub fn stop(engine: &mut Engine, id: &str) -> Result<Value> {
     let session = session(engine, id)?.clone();
     if let Some(request) = session.requests.last().filter(|r| r.planner_ended.is_none()) {
         fs::write(request.run.join("stop"), b"")?;
+    }
+    if let Some(evaluation) = session.evaluations.last().filter(|e| e.ended.is_none()) {
+        fs::write(evaluation.run.join("stop"), b"")?;
     }
     let tasks: Vec<String> = engine.state.tasks.iter().filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && can_still_run(t) && !t.stopped).map(|t| t.id.clone()).collect();
     for task in tasks {
@@ -267,13 +314,149 @@ pub fn list(engine: &Engine) -> Result<Value> {
     Ok(json!(engine.state.sessions.keys().map(|id| view(engine, id)).collect::<Result<Vec<_>>>()?))
 }
 
-fn planner_finished(request: &Request) -> Option<Value> {
-    if let Ok(exit) = read::<Value>(&request.run.join("exit.json")) {
+fn exited(run: &Path, since: u64) -> Option<Value> {
+    if let Ok(exit) = read::<Value>(&run.join("exit.json")) {
         return Some(exit);
     }
-    let started = request.run.join("run.json").exists();
-    let stale = now().saturating_sub(request.started) > 60_000;
-    (lock(&request.run.join("lock")).is_ok() && (started || stale)).then(|| json!({"code":-1,"error":"Planner process ended without recording an exit"}))
+    let started = run.join("run.json").exists();
+    let stale = now().saturating_sub(since) > 60_000;
+    (lock(&run.join("lock")).is_ok() && (started || stale)).then(|| json!({"code":-1,"error":"Planner process ended without recording an exit"}))
+}
+
+fn planner_finished(request: &Request) -> Option<Value> {
+    exited(&request.run, request.started)
+}
+
+const VERDICTS: &str = r#"{"type":"object","properties":{"verdicts":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"accept":{"type":"boolean"},"findings":{"type":"array","items":{"type":"string"}}},"required":["task","accept","findings"],"additionalProperties":false}}},"required":["verdicts"],"additionalProperties":false}"#;
+
+fn proposal(engine: &Engine, task: &Task, attempts: u64) -> Value {
+    let name = |id: &str| engine.state.get(id).map(label).unwrap_or_else(|| id.to_owned());
+    json!({"task":task.id,"shortId":task.short_id,"title":task.title,"outcome":task.outcome,"acceptance":task.acceptance,"attributes":task.attributes,
+        "container":task.parent.as_deref().map(name),"dependencies":task.dependencies.iter().map(|d| json!({"on":name(&d.target),"reason":d.reason})).collect::<Vec<_>>(),
+        "after":task.after.iter().map(|id| name(id)).collect::<Vec<_>>(),"submission":task.kickbacks() + 1,"submissionsAllowed":attempts,
+        "earlierFindings":task.plan_reviews.iter().filter(|r| !r.accepted).map(|r| &r.findings).collect::<Vec<_>>()})
+}
+
+fn evaluation_prompt(engine: &Engine, session: &Session, pending: &[&Task], instructions: &str, attempts: u64) -> Result<String> {
+    let requests: Vec<&str> = session.requests.iter().filter(|r| r.kind != "wake").map(|r| r.text.as_str()).collect();
+    let others: Vec<String> = engine
+        .state
+        .tasks
+        .iter()
+        .filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && !t.container() && !pending.iter().any(|p| p.id == t.id))
+        .map(|t| {
+            let summary = t.attempts.iter().rev().find_map(|a| a.result.as_ref()?["summary"].as_str()).map(|s| format!(" Latest result: {s}")).unwrap_or_default();
+            format!("- {} [{}]: {} Criteria: {}{summary}", label(t), t.status(), t.outcome, t.acceptance.join("; "))
+        })
+        .collect();
+    let proposals: Vec<Value> = pending.iter().map(|t| proposal(engine, t, attempts)).collect();
+    Ok(format!(
+        "You evaluate the proposed tasks for the request in {}, inside the workspace {}. Read whatever you need, but change nothing: no edits, commits or coordinator writes. Workers can only take a task once you accept it.\n\nEvaluator instructions:\n{instructions}\n\nRequest:\n{}\n\nTasks already on the board:\n{}\n\nProposed tasks:\n{}\n\nGive one verdict per proposed task, using its task id: accept it, or kick it back with findings the planner can act on. A task kicked back {attempts} times is rejected for good.",
+        clean(&session.workspace),
+        clean(session.root.as_deref().unwrap_or(&session.workspace)),
+        requests.join("\n\nFollow-up request:\n"),
+        if others.is_empty() { "None.".to_owned() } else { others.join("\n") },
+        serde_json::to_string_pretty(&proposals)?
+    ))
+}
+
+fn start_evaluation(engine: &mut Engine, id: &str, pending: &[Submitted]) -> Result<()> {
+    let session = session(engine, id)?.clone();
+    let settings = engine.state.settings(Some(&session.workspace));
+    let agent = settings.evaluator_agent(engine.state.family)?.ok_or("No evaluator configured")?;
+    let instructions = crate::workspace_prompts::evaluator(&crate::workspace_prompts::root(), &settings)?;
+    let tasks: Vec<&Task> = pending.iter().filter_map(|p| engine.state.get(&p.task)).collect();
+    let text = evaluation_prompt(engine, &session, &tasks, &instructions, settings.plan_attempts())?;
+    let run = engine.directory.join("sessions").join(id).join(format!("evaluation-{}", session.evaluations.len() + 1));
+    fs::create_dir_all(&run)?;
+    let port: u16 = read(&engine.directory.join("port.json")).unwrap_or(4242);
+    write(&run.join("request.json"), &json!({"session":format!("{id}-evaluation-{}", session.evaluations.len() + 1),"workspace":session.workspace,"root":session.root.as_ref().unwrap_or(&session.workspace),"prompt":text,"agent":agent,
+        "conversation":null,"command":[],"url":format!("http://127.0.0.1:{port}"),"schema":serde_json::from_str::<Value>(VERDICTS)?,"schemaFile":run.join("schema.json"),"outputFile":run.join("output.json")}))?;
+    write(&run.join("schema.json"), &serde_json::from_str::<Value>(VERDICTS)?)?;
+    let evaluation = Evaluation { run: run.clone(), started: now(), ended: None, submitted: pending.to_vec(), verdicts: Vec::new(), usage: None, error: None };
+    engine.change(|state| {
+        state.sessions.get_mut(id).ok_or("Unknown session")?.evaluations.push(evaluation);
+        Ok(Value::Null)
+    })?;
+    command(std::env::current_exe()?.to_str().ok_or("Invalid executable path")?).arg("--planner").arg(&run).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    Ok(())
+}
+
+fn finish_evaluation(engine: &mut Engine, id: &str, exit: &Value) -> Result<()> {
+    let session = session(engine, id)?.clone();
+    let evaluation = session.evaluations.last().ok_or("Missing evaluation")?.clone();
+    let settings = engine.state.settings(Some(&session.workspace));
+    let limits = settings.limits.clone();
+    let output = read::<Value>(&evaluation.run.join("output.json")).map_err(|error| error.to_string());
+    let mut verdicts = Vec::new();
+    let mut error = exit["error"].as_str().map(str::to_owned);
+    match &output {
+        Ok(output) => {
+            for verdict in output["verdicts"].as_array().into_iter().flatten() {
+                let named = verdict["task"].as_str().unwrap_or_default();
+                let Some(submitted) = evaluation.submitted.iter().find(|s| s.task == named || engine.state.get(&s.task).is_some_and(|t| t.short_id.as_deref() == Some(named))) else { continue };
+                let accepted = verdict["accept"].as_bool().unwrap_or(false);
+                let mut findings: Vec<String> = verdict["findings"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|f| !f.trim().is_empty()).take(limits.findings).map(|f| crate::history::clip(f, limits.finding_words)).collect();
+                if !accepted && findings.is_empty() {
+                    findings.push("The evaluator kicked this task back without a reason".into());
+                }
+                verdicts.push((submitted.task.clone(), submitted.revision, accepted, findings));
+            }
+        }
+        Err(message) => error = error.or_else(|| Some(format!("Evaluator produced no verdicts: {message}"))),
+    }
+    engine.review_plan(&verdicts, settings.plan_attempts())?;
+    if error.is_none() && verdicts.len() < evaluation.submitted.len() {
+        error = Some(format!("Evaluator returned {} of {} verdicts", verdicts.len(), evaluation.submitted.len()));
+    }
+    let recorded: Vec<Value> = verdicts.iter().map(|(task, revision, accepted, findings)| json!({"task":task,"revision":revision,"accepted":accepted,"findings":findings})).collect();
+    engine.change(|state| {
+        let s = state.sessions.get_mut(id).ok_or("Unknown session")?;
+        let e = s.evaluations.last_mut().ok_or("Missing evaluation")?;
+        e.ended = Some(now());
+        e.verdicts = recorded;
+        e.usage = exit.get("usage").cloned();
+        e.error = error;
+        Ok(Value::Null)
+    })
+    .map(drop)
+}
+
+fn evaluate(engine: &mut Engine, session: &Session) -> Result<bool> {
+    let settings = engine.state.settings(Some(&session.workspace));
+    if settings.evaluator.is_none() {
+        return Ok(false);
+    }
+    if let Some(evaluation) = session.evaluations.last().filter(|e| e.ended.is_none()) {
+        if let Some(exit) = exited(&evaluation.run, evaluation.started) {
+            finish_evaluation(engine, &session.id, &exit)?;
+        }
+        return Ok(true);
+    }
+    let since = session.requests.last().and_then(|r| r.planner_ended).unwrap_or(0);
+    let pending: Vec<Submitted> = engine
+        .state
+        .tasks
+        .iter()
+        .filter(|t| engine.state.in_scope(t, Some(&session.workspace)) && t.stage == "proposed" && !t.stopped && !t.blocked && t.active.is_none())
+        .filter(|t| t.plan_reviews.last().is_none_or(|r| r.revision != t.revision || r.at < since))
+        .map(|t| Submitted { task: t.id.clone(), revision: t.revision })
+        .collect();
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    let retried = session.evaluations.last().is_some_and(|e| e.started > since && e.submitted == pending);
+    if retried {
+        return Ok(false);
+    }
+    if let Err(error) = start_evaluation(engine, &session.id, &pending) {
+        engine.change(|state| {
+            state.sessions.get_mut(&session.id).ok_or("Unknown session")?.wake_error = Some(format!("Plan evaluation could not start: {error}"));
+            Ok(Value::Null)
+        })?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 pub fn tick(engine: &mut Engine) -> Result<()> {
@@ -297,9 +480,23 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
             })?;
             continue;
         }
+        if evaluate(engine, &session)? {
+            continue;
+        }
+        let quiet = !engine.state.settings(Some(&session.workspace)).kickoff();
+        let attempts = engine.state.settings(Some(&session.workspace)).plan_attempts();
         let minutes = engine.state.settings(Some(&session.workspace)).wake_minutes();
         let actor = format!("planner:{id}");
         let scoped: Vec<&Task> = engine.state.tasks.iter().filter(|t| engine.state.in_scope(t, Some(&session.workspace))).collect();
+        let reviewed: Vec<(String, &Task)> = scoped
+            .iter()
+            .filter(|t| matches!(t.stage.as_str(), "proposed" | "rejected") && t.plan_reviews.last().is_some_and(|r| !r.accepted))
+            .map(|t| (format!("plan:{}:{}", t.id, t.plan_reviews.len()), *t))
+            .filter(|(k, _)| !session.notified.contains(k))
+            .collect();
+        if quiet && reviewed.is_empty() {
+            continue;
+        }
         let finished: Vec<(String, &Task)> = scoped.iter().filter_map(|t| finished_key(t, &actor).filter(|k| !session.notified.contains(k)).map(|k| (k, *t))).collect();
         let blocked: Vec<(String, &Task)> = scoped.iter().filter(|t| needs_decision(t)).map(|t| (decision_key(t), *t)).filter(|(k, _)| !session.notified.contains(k)).collect();
         let idle = !scoped.iter().any(|t| can_still_run(t));
@@ -314,10 +511,20 @@ pub fn tick(engine: &mut Engine) -> Result<()> {
             .filter_map(|t| Some((format!("cpu:{}", t.active.as_ref()?), *t, live(t)?)))
             .filter(|(k, _, c)| *c >= alert && !session.notified.contains(k))
             .collect();
-        if !blocked.is_empty() || !heavy.is_empty() || (idle && !finished.is_empty() && !halted) || (!idle && due) {
+        if !reviewed.is_empty() || (!quiet && (!blocked.is_empty() || !heavy.is_empty() || (idle && !finished.is_empty() && !halted) || (!idle && due))) {
             let summary = board(&scoped, since, &live);
-            let text = wake_prompt(&finished.iter().map(|(_, t)| *t).collect::<Vec<_>>(), &blocked.iter().map(|(_, t)| *t).collect::<Vec<_>>(), &heavy.iter().map(|(_, t, c)| (*t, *c)).collect::<Vec<_>>(), summary, idle, minutes);
-            let keys: Vec<String> = finished.into_iter().chain(blocked).map(|(k, _)| k).chain(heavy.into_iter().map(|(k, _, _)| k)).collect();
+            let (finished, blocked, heavy) = if quiet { (Vec::new(), Vec::new(), Vec::new()) } else { (finished, blocked, heavy) };
+            let text = wake_prompt(
+                &finished.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
+                &blocked.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
+                &heavy.iter().map(|(_, t, c)| (*t, *c)).collect::<Vec<_>>(),
+                &reviewed.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
+                attempts,
+                summary,
+                idle,
+                minutes,
+            );
+            let keys: Vec<String> = finished.into_iter().chain(blocked).chain(reviewed).map(|(k, _)| k).chain(heavy.into_iter().map(|(k, _, _)| k)).collect();
             match start(engine, &id, text, "wake") {
                 Ok(()) => engine.change(|state| {
                     let s = state.sessions.get_mut(&id).ok_or("Unknown session")?;
@@ -351,6 +558,9 @@ pub fn stop_all(engine: &Engine) {
         if let Some(request) = session.requests.last() {
             let _ = fs::write(request.run.join("stop"), b"");
         }
+        if let Some(evaluation) = session.evaluations.last().filter(|e| e.ended.is_none()) {
+            let _ = fs::write(evaluation.run.join("stop"), b"");
+        }
     }
 }
 
@@ -374,6 +584,10 @@ fn arguments(request: &Value, agent: &Agent) -> Result<(Vec<String>, Option<Stri
             if !effort.is_empty() {
                 argv.extend(["--effort".into(), effort]);
             }
+            if request["schema"].is_object() {
+                argv.extend(["--json-schema".into(), request["schema"].to_string(), "--no-session-persistence".into(), "--disallowedTools".into(), "Edit".into(), "Write".into(), "NotebookEdit".into()]);
+                return Ok((argv, None));
+            }
             let id = conversation.clone().unwrap_or_else(|| uuid(request["session"].as_str().unwrap_or_default()));
             argv.extend([if conversation.is_some() { "--resume" } else { "--session-id" }.to_owned(), id.clone()]);
             Ok((argv, Some(id)))
@@ -386,6 +600,11 @@ fn arguments(request: &Value, agent: &Agent) -> Result<(Vec<String>, Option<Stri
             }
             argv.extend(["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "--model", &agent.model, "-c"].map(str::to_owned));
             argv.push(format!("model_reasoning_effort=\"{effort}\""));
+            if request["schema"].is_object() {
+                for (flag, field) in [("--output-schema", "schemaFile"), ("--output-last-message", "outputFile")] {
+                    argv.extend([flag.to_owned(), request[field].as_str().ok_or(format!("Missing {field}"))?.to_owned()]);
+                }
+            }
             argv.extend(conversation.clone());
             argv.push("-".into());
             Ok((argv, conversation))
@@ -517,7 +736,14 @@ pub fn run(directory: &Path) -> Result<()> {
     job.drain()?;
     let _ = recorder.join();
     let (used, thread) = usage(&directory.join("events.jsonl"));
-    write(&directory.join("exit.json"), &json!({"code":status.code(),"stopped":stopped,"conversation":thread.or(conversation),"usage":used,"ended":now()}))
+    let mut error = Value::Null;
+    if request["schema"].is_object() && agent.harness == Harness::ClaudeCode {
+        match fs::read_to_string(directory.join("events.jsonl")).map_err(Into::into).and_then(|events| crate::adapters::claude_result(&events)) {
+            Ok((output, _, _)) => write(&directory.join("output.json"), &output)?,
+            Err(failure) => error = json!(failure.to_string()),
+        }
+    }
+    write(&directory.join("exit.json"), &json!({"code":status.code(),"stopped":stopped,"conversation":thread.or(conversation),"usage":used,"ended":now(),"error":error}))
 }
 
 #[cfg(test)]

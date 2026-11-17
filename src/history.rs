@@ -57,8 +57,23 @@ pub struct WorkspaceSettings {
     pub escalation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalate_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kickoff: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_attempts: Option<u64>,
 }
 impl WorkspaceSettings {
+    pub fn kickoff(&self) -> bool {
+        self.kickoff.unwrap_or(true)
+    }
+    pub fn plan_attempts(&self) -> u64 {
+        self.plan_attempts.unwrap_or(3)
+    }
+    pub fn evaluator_agent(&self, family: Option<crate::agents::Family>) -> Result<Option<crate::agents::Agent>> {
+        self.evaluator.as_deref().map(|id| crate::agents::resolve(&self.agents, id, family)).transpose()
+    }
     pub fn wake_minutes(&self) -> u64 {
         self.planner_wake_minutes.unwrap_or(30)
     }
@@ -70,7 +85,8 @@ impl WorkspaceSettings {
         crate::require(self.wake_minutes() > 0, "plannerWakeMinutes must be at least 1")?;
         crate::require(self.compute_alert_seconds() > 0.0, "computeAlertCpuMinutes must be at least 1")?;
         crate::require(self.escalate_after.is_none_or(|n| n > 0), "escalateAfter must be at least 1")?;
-        for id in self.reviewer.iter().chain(&self.escalation) {
+        crate::require(self.plan_attempts() > 0, "planAttempts must be at least 1")?;
+        for id in self.reviewer.iter().chain(&self.escalation).chain(&self.evaluator) {
             crate::agents::resolve(&self.agents, id, family)?;
         }
         crate::require(!self.agent("planner", family)?.worker_only, format!("Agent {} can only be a worker", self.planner.as_deref().unwrap_or_default()))?;

@@ -1241,6 +1241,140 @@ fn model_board() -> Board {
 }
 
 #[test]
+fn workspaces_without_kickoff_never_dispatch_tasks() {
+    let mut board = model_board();
+    let id = board.add("Ready task");
+    assert!(board.engine.state.dispatchable(board.task(&id)));
+    let key = workspace(&board.ws).unwrap();
+    board.mutate(move |state| state.config.workspaces.get_mut(&key).unwrap().kickoff = Some(false));
+    assert!(!board.engine.state.dispatchable(board.task(&id)));
+    assert!(board.engine.state.waiting_reason(board.task(&id)).is_none());
+    let saved: Value = read(&board.engine.directory.join("state.json")).unwrap();
+    assert_eq!(saved["config"]["workspaces"][workspace(&board.ws).unwrap().to_str().unwrap()]["kickoff"], false);
+}
+
+fn evaluated_board() -> Board {
+    let mut board = Board::new();
+    let key = workspace(&board.ws).unwrap();
+    board.mutate(move |state| {
+        let settings: history::WorkspaceSettings = serde_json::from_value(json!({"planner":"sol_6_1_medium","worker":"sol_6_1_light","evaluator":"sol_6_1_medium"})).unwrap();
+        state.config.workspaces.insert(key, settings);
+    });
+    board.engine.actor = Some("planner:session".into());
+    board
+}
+
+fn verdict(board: &mut Board, id: &str, accepted: bool) {
+    let revision = board.task(id).revision;
+    board.engine.review_plan(&[(id.to_owned(), revision, accepted, if accepted { vec![] } else { vec!["The check costs far more than it proves".into()] })], 3).unwrap();
+}
+
+#[test]
+fn planner_tasks_wait_as_proposed_until_the_evaluator_accepts_them() {
+    let mut board = evaluated_board();
+    let planned = board.add("Planned task");
+    assert_eq!((board.task(&planned).stage.as_str(), board.task(&planned).status()), ("proposed", "Proposed"));
+    assert!(!board.engine.state.dispatchable(board.task(&planned)));
+    board.engine.actor = Some("ui".into());
+    let manual = board.add("Manual task");
+    assert_eq!(board.task(&manual).stage, "implementation");
+    let container = board.create(board.container("Group"));
+    assert_eq!(board.task(&container).stage, "implementation");
+    verdict(&mut board, &planned, true);
+    assert_eq!(board.task(&planned).stage, "implementation");
+    assert!(board.engine.state.dispatchable(board.task(&planned)));
+    assert!(board.task(&planned).history.iter().any(|e| e.kind == "plan_accepted"));
+}
+
+#[test]
+fn kicked_back_tasks_stay_proposed_and_are_rejected_for_good_after_the_last_attempt() {
+    let mut board = evaluated_board();
+    let id = board.add("Soak test");
+    verdict(&mut board, &id, false);
+    assert_eq!((board.task(&id).stage.as_str(), board.task(&id).kickbacks()), ("proposed", 1));
+    board.engine.edit(&id, json!({"acceptance":["A 60 s scripted run passes"]})).unwrap();
+    assert_eq!(board.task(&id).stage, "proposed");
+    verdict(&mut board, &id, false);
+    verdict(&mut board, &id, false);
+    assert_eq!((board.task(&id).stage.as_str(), board.task(&id).status()), ("rejected", "Rejected"));
+    assert!(!board.engine.state.dispatchable(board.task(&id)));
+    assert!(board.engine.edit(&id, json!({"outcome":"Something else"})).unwrap_err().to_string().contains("rejected"));
+    assert!(board.engine.request_replan(&id, json!({})).is_err());
+    let stale = board.task(&id).revision - 1;
+    board.engine.review_plan(&[(id.clone(), stale, true, vec![])], 3).unwrap();
+    assert_eq!(board.task(&id).stage, "rejected");
+}
+
+#[test]
+fn work_that_depends_on_a_rejected_task_is_blocked_for_the_planner_to_decide() {
+    let mut board = evaluated_board();
+    let base = board.add("Base");
+    let dependent = board.create(board.with("Dependent", json!({"dependencies":[{"target":base,"reason":"uses_api"}]})));
+    let ordered = board.create(board.with("Ordered", json!({"after":[base]})));
+    let container = board.create(board.container("Group"));
+    let child = board.create(board.child("Child", &container));
+    let downstream = board.create(board.with("Downstream", json!({"dependencies":[{"target":container,"reason":"uses_api"}]})));
+    for id in [&dependent, &ordered, &downstream] {
+        verdict(&mut board, id, true);
+    }
+    for _ in 0..3 {
+        verdict(&mut board, &base, false);
+        verdict(&mut board, &child, false);
+    }
+    assert_eq!(board.task(&base).stage, "rejected");
+    let blocked = board.task(&dependent);
+    assert!(blocked.blocked && blocked.failure.contains("rejected for good") && blocked.failure.contains("Base"));
+    assert!(crate::sessions::needs_decision(board.task(&dependent)));
+    assert!(board.task(&downstream).blocked);
+    assert!(!board.task(&ordered).blocked);
+    assert!(board.engine.state.waiting_reason(board.task(&ordered)).is_none());
+    assert!(board.engine.remove(&base).is_err());
+    board.engine.edit(&dependent, json!({"dependencies":[]})).unwrap();
+    let fixed = board.task(&dependent);
+    assert!(!fixed.blocked && fixed.stage == "proposed");
+    board.engine.edit(&ordered, json!({"after":[]})).unwrap();
+    board.engine.remove(&base).unwrap();
+}
+
+#[test]
+fn changing_a_kicked_back_task_sends_its_accepted_dependents_back_for_evaluation() {
+    let mut board = evaluated_board();
+    let base = board.add("Base");
+    let dependent = board.create(board.with("Dependent", json!({"dependencies":[{"target":base,"reason":"uses_api"}]})));
+    let rejected = board.create(board.with("Rejected dependent", json!({"dependencies":[{"target":base,"reason":"uses_api"}]})));
+    verdict(&mut board, &dependent, true);
+    for _ in 0..3 {
+        verdict(&mut board, &rejected, false);
+    }
+    verdict(&mut board, &base, false);
+    assert_eq!(board.task(&dependent).stage, "implementation");
+    let before = board.task(&dependent).revision;
+    board.engine.edit(&base, json!({"outcome":"A narrower base"})).unwrap();
+    let reopened = board.task(&dependent);
+    assert_eq!((reopened.stage.as_str(), reopened.kickbacks()), ("proposed", 0));
+    assert!(reopened.revision > before && reopened.history.iter().any(|e| e.kind == "reopened"));
+    assert_eq!(board.task(&rejected).stage, "rejected");
+}
+
+#[test]
+fn replanned_tasks_return_to_proposed_but_ordinary_progress_does_not() {
+    let mut board = evaluated_board();
+    let id = board.add("Too big");
+    verdict(&mut board, &id, true);
+    board.engine.actor = None;
+    let index = board.engine.task(&id).unwrap();
+    let plan = json!({"title":"Smaller","outcome":"A smaller outcome holds","acceptance":["A smaller criterion holds"],"role":"backend-code","needs":[],"size":"small"});
+    let mut state = board.engine.state.clone();
+    Engine::apply_plan(&mut state, index, &plan).unwrap();
+    board.engine.commit(state).unwrap();
+    assert_eq!(board.task(&id).stage, "proposed");
+    verdict(&mut board, &id, true);
+    let attempt = board.dispatch(&id);
+    assert!(!attempt.is_empty());
+    assert_eq!(board.task(&id).stage, "implementation");
+}
+
+#[test]
 fn tasks_may_choose_an_enabled_model_and_default_to_the_workspace_worker() {
     let mut board = model_board();
     let chosen = board.create(board.with("Rename helper", json!({"attributes":{"model":"sol_6_1_medium"}})));

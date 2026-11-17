@@ -14,5 +14,7 @@
     "summaryWords": 60,
     "findings": 3,
     "findingWords": 45
-  }
+  },
+  "evaluator": "claude_opus_5_5_medium",
+  "planAttempts": 3
 }

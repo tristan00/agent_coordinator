@@ -331,3 +331,88 @@ fn sessions_saved_as_waiting_load_as_finished() {
     let engine = Engine::new(directory).unwrap();
     assert_eq!((engine.state.sessions["s1"].status.as_str(), engine.state.sessions["s2"].status.as_str()), ("finished", "stopped"));
 }
+
+fn enable_evaluator(engine: &mut Engine, source: &Path) {
+    let key = workspace(source).unwrap();
+    let text = fs::read_to_string(crate::workspace_prompts::root().join("evaluator.txt")).unwrap();
+    let document: crate::workspace_prompts::Document = serde_json::from_value(json!({"candidate":"evaluator.txt","sha256":format!("{:x}", Sha256::digest(text.replace("\r\n", "\n").as_bytes())),"default":true})).unwrap();
+    engine.change(move |state| {
+        let settings = state.config.workspaces.get_mut(&key).unwrap();
+        settings.evaluator = Some("sol_6_1_medium".into());
+        settings.prompts.as_mut().unwrap().roles.insert("evaluator".into(), document);
+        Ok(Value::Null)
+    }).unwrap();
+}
+
+fn finish_evaluation_run(engine: &Engine, id: &str, verdicts: Value) {
+    let run = engine.state.sessions[id].evaluations.last().unwrap().run.clone();
+    write(&run.join("output.json"), &json!({"verdicts":verdicts})).unwrap();
+    write(&run.join("exit.json"), &json!({"code":0})).unwrap();
+}
+
+#[test]
+fn proposed_tasks_are_evaluated_after_each_planner_turn_and_kick_backs_wake_the_planner() {
+    let temp = Temp::new();
+    let (mut engine, source) = setup(&temp, "echo planned");
+    enable_evaluator(&mut engine, &source);
+    let case = source.join("case");
+    let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"Build the sandbox"})).unwrap()["id"].as_str().unwrap().to_owned();
+    assert!(wake_text(&engine, &id, 1).contains("starts as proposed"));
+    engine.actor = Some(format!("planner:{id}"));
+    let spec = |title: &str| json!({"title":title,"outcome":"It works","cwd":case,"acceptance":["A short check passes"],"standalone":true});
+    let good = engine.create(spec("Route graph")).unwrap()["id"].as_str().unwrap().to_owned();
+    let costly = engine.create(spec("Twenty minute soak")).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = None;
+    tick(&mut engine).unwrap();
+    assert!(engine.state.sessions[&id].evaluations.is_empty());
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    let evaluation = engine.state.sessions[&id].evaluations[0].clone();
+    assert_eq!(evaluation.submitted.len(), 2);
+    let request: Value = read(&evaluation.run.join("request.json")).unwrap();
+    let prompt = request["prompt"].as_str().unwrap();
+    assert!(prompt.contains("Build the sandbox") && prompt.contains("Twenty minute soak") && prompt.contains("Proposed tasks"));
+    assert!(request["schema"].is_object() && request["conversation"].is_null());
+    let short = engine.state.tasks[engine.task(&good).unwrap()].short_id.clone().unwrap();
+    finish_evaluation_run(&engine, &id, json!([{"task":short,"accept":true,"findings":[]},{"task":costly,"accept":false,"findings":["A 20 min run proves no more than a 60 s one"]}]));
+    tick(&mut engine).unwrap();
+    assert_eq!(engine.state.tasks[engine.task(&good).unwrap()].stage, "implementation");
+    assert_eq!(engine.state.tasks[engine.task(&costly).unwrap()].stage, "proposed");
+    assert!(engine.state.sessions[&id].evaluations[0].ended.is_some());
+    tick(&mut engine).unwrap();
+    assert_eq!(engine.state.sessions[&id].requests.len(), 2);
+    let wake = wake_text(&engine, &id, 2);
+    assert!(wake.contains("kicked these proposed tasks back") && wake.contains("A 20 min run proves no more") && wake.contains("2 of 3 submissions left"));
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    let second = engine.state.sessions[&id].evaluations.last().unwrap();
+    assert_eq!(engine.state.sessions[&id].evaluations.len(), 2);
+    assert_eq!(second.submitted.iter().map(|s| s.task.as_str()).collect::<Vec<_>>(), [costly.as_str()]);
+}
+
+#[test]
+fn a_failed_evaluation_is_recorded_and_not_retried_until_the_planner_acts() {
+    let temp = Temp::new();
+    let (mut engine, source) = setup(&temp, "echo planned");
+    enable_evaluator(&mut engine, &source);
+    let case = source.join("case");
+    let id = create(&mut engine, json!({"workspace":source,"directory":case,"request":"Build it"})).unwrap()["id"].as_str().unwrap().to_owned();
+    engine.actor = Some(format!("planner:{id}"));
+    engine.create(json!({"title":"Task","outcome":"It works","cwd":case,"acceptance":["A check passes"],"standalone":true})).unwrap();
+    engine.actor = None;
+    run_planner(&engine, &id);
+    tick(&mut engine).unwrap();
+    tick(&mut engine).unwrap();
+    let run = engine.state.sessions[&id].evaluations[0].run.clone();
+    write(&run.join("exit.json"), &json!({"code":1,"error":"Claude produced no result event"})).unwrap();
+    tick(&mut engine).unwrap();
+    for _ in 0..3 {
+        tick(&mut engine).unwrap();
+    }
+    let session = &engine.state.sessions[&id];
+    assert_eq!(session.evaluations.len(), 1);
+    assert!(session.evaluations[0].error.as_deref().is_some_and(|e| e.contains("no result event")));
+    assert_eq!(session.requests.len(), 1);
+}

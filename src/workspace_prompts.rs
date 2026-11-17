@@ -14,7 +14,11 @@ pub fn kinds() -> Vec<&'static str> {
         .into_iter()
         .chain(crate::history::ROLES.into_iter().filter(|role| *role != "worker"))
         .chain(STAGE_KINDS.map(|(_, kind)| kind))
+        .chain(["evaluator"])
         .collect()
+}
+pub fn evaluator(root: &Path, settings: &WorkspaceSettings) -> Result<String> {
+    Ok(selected(root, settings, "evaluator")?.1)
 }
 /// Every kind a workspace must select besides the planner and worker_protocol prompts.
 pub fn role_kinds() -> Vec<&'static str> {
@@ -37,7 +41,7 @@ pub struct Selection {
     pub roles: BTreeMap<String, Document>,
 }
 pub fn root() -> PathBuf {
-    Path::new(option_env!("COORDINATOR_SOURCE_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"))).join("prompts")
+    std::env::var_os("COORDINATOR_PROMPTS").map(PathBuf::from).unwrap_or_else(|| Path::new(option_env!("COORDINATOR_SOURCE_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"))).join("prompts"))
 }
 fn default_file(kind: &str) -> String {
     match kind {
