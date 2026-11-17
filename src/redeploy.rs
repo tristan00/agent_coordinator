@@ -6,12 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 pub fn frontend_digest() -> String {
-    let mut hash = Sha256::new();
-    for asset in [include_bytes!("../web/index.html").as_slice(), include_bytes!("../web/app.js").as_slice(), include_bytes!("../web/style.css").as_slice()] {
-        hash.update((asset.len() as u64).to_le_bytes());
-        hash.update(asset);
-    }
-    format!("sha256:{:x}", hash.finalize())
+    "separate".into()
 }
 pub fn event(directory: &Path) -> Value {
     read(&directory.join("redeployment.json")).unwrap_or(Value::Null)
@@ -129,43 +124,20 @@ pub fn build_source(source: &Path, cache: &Path) -> Result<Value> {
     fs::create_dir_all(cache)?;
     let _guard = lock(&cache.join("build.lock"))?;
     let started = Instant::now();
-    let frontend_files = files(source, &["frontend/package.json", "frontend/pnpm-lock.yaml", "frontend/index.html", "frontend/vite.config.js"], &["frontend/src"])?;
-    let frontend_sha = hash_files(source, &frontend_files)?;
-    let ui = cache.join(format!("frontend-{frontend_sha}"));
-    let snapshot = cache.join("source");
-    let rebuilt = !ui.join("complete").exists();
-    if rebuilt {
-        let pnpm = std::env::var("COORDINATOR_PNPM").unwrap_or_else(|_| if cfg!(windows) { "pnpm.cmd" } else { "pnpm" }.into());
-        sync_files(&source.join("frontend"), &ui, &frontend_files)?;
-        run(command(&pnpm).arg("--dir").arg(&ui).args(["install", "--frozen-lockfile", "--prefer-offline", "--reporter", "append-only"]), "Frontend install failed; install pnpm or set COORDINATOR_PNPM")?;
-        run(command(&pnpm).arg("--dir").arg(&ui).args(["exec", "vite", "build"]), "Frontend build failed")?;
-        fs::write(ui.join("complete"), &frontend_sha)?;
-    }
-    let frontend_ms = started.elapsed().as_millis();
-    let assets = files(&ui.join("dist"), &["index.html", "app.js", "style.css"], &[])?;
-    sync_files(&ui.join("dist"), &snapshot.join("web"), &assets)?;
-    let mut asset_hash = Sha256::new();
-    for name in ["index.html", "app.js", "style.css"] {
-        let bytes = fs::read(snapshot.join("web").join(name))?;
-        asset_hash.update((bytes.len() as u64).to_le_bytes());
-        asset_hash.update(bytes);
-    }
-    let frontend = format!("sha256:{:x}", asset_hash.finalize());
     let rust_files = files(source, &["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "scripts/recording.rs"], &["src"])?;
-    let all: Vec<PathBuf> = rust_files.iter().chain(&frontend_files).cloned().collect();
-    let source_sha = hash_files(source, &all)?;
+    let source_sha = hash_files(source, &rust_files)?;
+    let snapshot = cache.join("source");
     sync_files(source, &snapshot, &rust_files)?;
     let expected: Vec<PathBuf> = rust_files.iter().map(|file| snapshot.join(file.strip_prefix(source).unwrap())).collect();
     for stale in files(&snapshot, &[], &["src"])?.into_iter().filter(|file| !expected.contains(file)) {
         fs::remove_file(stale)?;
     }
     let target = cache.join("target");
-    run(command("cargo").current_dir(&snapshot).env("COORDINATOR_FRONTEND_SHA", &frontend_sha).env("COORDINATOR_SOURCE_SHA", &source_sha)
+    run(command("cargo").current_dir(&snapshot).env("COORDINATOR_SOURCE_SHA", &source_sha)
         .env("COORDINATOR_SOURCE_ROOT", shell_path(source)).env("CARGO_TARGET_DIR", &target).args(["build", "--locked", "--release", "--bin", "agent-coordinator"]), "Rust build failed")?;
-    require(hash_files(source, &frontend_files)? == frontend_sha && hash_files(source, &all)? == source_sha, "Source changed during build; retry")?;
+    require(hash_files(source, &rust_files)? == source_sha, "Source changed during build; retry")?;
     let candidate = target.join("release").join(if cfg!(windows) { "agent-coordinator.exe" } else { "agent-coordinator" });
-    Ok(json!({"mode":"source","candidate":candidate,"source":source_sha,"frontendSource":frontend_sha,"frontend":frontend,"frontendRebuilt":rebuilt,
-        "frontendMs":frontend_ms,"rustMs":started.elapsed().as_millis() - frontend_ms,"buildMs":started.elapsed().as_millis()}))
+    Ok(json!({"mode":"source","candidate":candidate,"source":source_sha,"frontendSource":null,"frontend":frontend_digest(),"buildMs":started.elapsed().as_millis()}))
 }
 fn shell_path(path: &Path) -> String {
     let path = path.to_string_lossy();

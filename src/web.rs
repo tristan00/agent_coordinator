@@ -24,6 +24,19 @@ pub fn deployment() -> &'static Value {
             "frontend":crate::redeploy::frontend_digest()})
     })
 }
+pub(crate) fn ui_version(directory: &Path) -> Option<String> {
+    let version = fs::read_to_string(directory.join("ui").join("current")).ok()?.trim().to_owned();
+    (!version.is_empty() && version.bytes().all(|b| b.is_ascii_hexdigit()) && directory.join("ui").join(&version).join("complete").is_file()).then_some(version)
+}
+pub(crate) fn ui_asset(directory: &Path, url: &str) -> Option<Option<(Vec<u8>, &'static str)>> {
+    let (name, mime) = match url {
+        "/" => ("index.html", "text/html; charset=utf-8"),
+        "/app.js" => ("app.js", "text/javascript"),
+        "/style.css" => ("style.css", "text/css"),
+        _ => return None,
+    };
+    Some(ui_version(directory).and_then(|version| fs::read(directory.join("ui").join(version).join(name)).ok()).map(|bytes| (bytes, mime)))
+}
 fn authorized(request: &Request, port: u16) -> bool {
     let local = format!("127.0.0.1:{port}");
     let localhost = format!("localhost:{port}");
@@ -115,17 +128,19 @@ fn handle(mut request: Request, engine: &mut Engine, port: u16, error: &str, shu
     let method = request.method().as_str().to_owned();
     let parts: Vec<_> = url.split('/').collect();
     if method == "GET" {
-        let asset = match url.as_str() {
-            "/" => Some((include_str!("../web/index.html"), "text/html; charset=utf-8")),
-            "/app.js" => Some((include_str!("../web/app.js"), "text/javascript")),
-            "/style.css" => Some((include_str!("../web/style.css"), "text/css")),
-            _ => None,
-        };
-        if let Some((body, mime)) = asset {
-            request.respond(
-                Response::from_string(body).with_header(header("Content-Type", mime)).with_header(header("Cache-Control", "no-cache")).with_header(header("Connection", "close")).with_header(header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'")),
-            )?;
-            return Ok(());
+        match ui_asset(&engine.directory, &url) {
+            Some(Some((body, mime))) => {
+                request.respond(
+                    Response::from_data(body).with_header(header("Content-Type", mime)).with_header(header("Cache-Control", "no-cache")).with_header(header("Connection", "close")).with_header(header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'")),
+                )?;
+                return Ok(());
+            }
+            Some(None) => {
+                let message = format!("The task UI is not installed in {}. Deploy it from the agent_tasks_ui repository with pnpm run deploy.", engine.directory.join("ui").display());
+                request.respond(Response::from_string(message).with_status_code(503).with_header(header("Content-Type", "text/plain; charset=utf-8")).with_header(header("Connection", "close")))?;
+                return Ok(());
+            }
+            None => {}
         }
         if let ["", "api", "attempts", id, "log"] = parts.as_slice()
             && engine.state.tasks.iter().chain(&engine.state.archived).any(|task| task.attempts.iter().any(|a| a.id == *id))
@@ -244,7 +259,7 @@ fn get(engine: &mut Engine, parts: &[&str], full: &str, error: &str) -> Result<O
         ["", "api", "task-schema"] => engine.state.task_schema(update_query(full)?.workspace.as_deref()),
         ["", "api", "analytics"] => crate::analytics::report(&engine.state, json!({}))?,
         ["", "api", "workspaces", "defaults"] => crate::workspace_prompts::defaults(&crate::workspace_prompts::root())?,
-        ["", "api", "deployment"] => json!({"live":deployment(),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
+        ["", "api", "deployment"] => json!({"live":deployment(),"ui":ui_version(&engine.directory).map(|v| format!("sha256:{v}")),"dataDirectory":engine.directory,"event":deployment_event(&engine.directory),"redeployment":crate::redeploy::event(&engine.directory)}),
         ["", "api", "deployment", "requests", id] => crate::redeploy::receipt(&engine.directory, id)?,
         ["", "api", "sessions"] => crate::sessions::list(engine)?,
         ["", "api", "sessions", id] => crate::sessions::view(engine, id)?,

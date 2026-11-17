@@ -268,3 +268,26 @@ fn planner_calls_are_attributed_and_their_rejections_and_transcript_are_recorded
     assert_eq!((rest["lines"].as_array().unwrap().len(), rest["next"].as_u64()), (0, Some(next)));
     assert!(site.get("/api/sessions/s1/requests/2/events").is_err());
 }
+
+#[test]
+fn the_task_ui_is_served_from_the_installed_version_only() {
+    let temp = Temp::new();
+    let data = temp.dir("data");
+    assert!(ui_asset(&data, "/api/state").is_none());
+    assert_eq!(ui_asset(&data, "/"), Some(None));
+    let version = "8646e5f74bb98c2eceeec7a9525788d3266167c154c650e6f01fd355d4fde462";
+    let installed = data.join("ui").join(version);
+    fs::create_dir_all(&installed).unwrap();
+    for (name, body) in [("index.html", "<html>"), ("app.js", "app"), ("style.css", "css")] {
+        fs::write(installed.join(name), body).unwrap();
+    }
+    fs::write(data.join("ui").join("current"), version).unwrap();
+    assert_eq!(ui_asset(&data, "/"), Some(None));
+    fs::write(installed.join("complete"), version).unwrap();
+    assert_eq!(ui_asset(&data, "/"), Some(Some((b"<html>".to_vec(), "text/html; charset=utf-8"))));
+    assert_eq!(ui_asset(&data, "/app.js"), Some(Some((b"app".to_vec(), "text/javascript"))));
+    assert_eq!(ui_asset(&data, "/style.css"), Some(Some((b"css".to_vec(), "text/css"))));
+    assert_eq!(ui_version(&data).as_deref(), Some(version));
+    fs::write(data.join("ui").join("current"), "..\\..\\elsewhere").unwrap();
+    assert_eq!(ui_asset(&data, "/"), Some(None));
+}
