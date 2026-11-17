@@ -1717,9 +1717,14 @@ fn rejected_reviews_and_unfinished_work_count_as_failures_but_crashes_do_not() {
 fn the_task_schema_covers_every_field_the_coordinator_accepts() {
     let board = Board::new();
     let schema = board.engine.state.task_schema(None);
-    let error = Input::parse(json!({"unknown_field":1})).err().unwrap().to_string();
-    let accepted: Vec<&str> = error.split('`').skip(3).step_by(2).collect();
-    assert!(accepted.contains(&"title") && accepted.contains(&"attributes"), "{error}");
+    let accepted = Input::FIELDS;
+    let error = Input::parse(json!({"title":"x","outcome":"y","cwd":"z","standalone":true,"zzz_unknown":1})).err().unwrap().to_string();
+    assert!(error.contains("zzz_unknown"), "{error}");
+    for field in accepted {
+        let parsed = serde_json::from_value::<Input>(json!({field: null}));
+        assert!(parsed.err().is_none_or(|e| !e.to_string().contains("unknown field")), "{field} is not an Input field");
+    }
+    assert!(serde_json::from_value::<Input>(json!({"zzz_unknown": null})).is_err());
     let properties = schema["task"]["properties"].as_object().unwrap();
     for field in &accepted {
         assert!(properties.contains_key(*field), "task schema misses {field}");
@@ -1749,4 +1754,42 @@ fn batch_request_keys_belong_to_their_workspace() {
     assert_ne!(first["container"], second["container"]);
     assert_eq!(board.engine.create_batch(body(&board.ws, "Here")).unwrap(), first);
     assert!(board.engine.create_batch(body(&board.ws, "Changed")).unwrap_err().to_string().contains("Conflicting request replay"));
+}
+
+#[test]
+fn a_single_task_reports_every_problem_at_once() {
+    let mut board = Board::new();
+    let long = vec!["word"; 200].join(" ");
+    let error = board.fail(board.with("Long", json!({"priority":1,"role":"test","outcome":long,"attributes":{"size":"large","needs":["gpu"],"colour":"red"}})));
+    for part in ["Unknown fields priority, role", "belong inside attributes", "Unknown attributes colour"] {
+        assert!(error.contains(part), "missing {part:?} in {error}");
+    }
+    let error = board.fail(board.with("Long", json!({"outcome":long,"acceptance":["a","b","c","d","e"],"attributes":{"size":"large","needs":["gpu"]}})));
+    for part in ["acceptance criteria", "Definition exceeds", "Large work must be a container", "No worker provides"] {
+        assert!(error.contains(part), "missing {part:?} in {error}");
+    }
+}
+
+#[test]
+fn a_batch_reports_every_problem_in_the_container_and_children_at_once() {
+    let mut board = Board::new();
+    let long = vec!["word"; 200].join(" ");
+    let batch = json!({"requestKey":"plan-all","container":{"title":"Group","outcome":long,"cwd":board.ws,"standalone":true,"priority":1},
+        "children":[
+            {"localKey":"ok","title":"Fine","outcome":"Done","acceptance":["It works"]},
+            {"localKey":"big","title":"Big","outcome":"Done","acceptance":["It works"],"attributes":{"size":"large"}},
+            {"localKey":"gpu","title":"Gpu","outcome":"Done","acceptance":["It works"],"attributes":{"needs":["gpu"]}},
+            {"localKey":"ok","title":"Again","outcome":"Done","acceptance":["It works"]},
+            {"title":"No key","outcome":"Done","acceptance":["It works"]}]});
+    let before = board.engine.state.tasks.len();
+    let error = board.engine.create_batch(batch).unwrap_err().to_string();
+    assert_eq!(board.engine.state.tasks.len(), before);
+    for part in ["problems in this batch", "container: Unknown fields priority", "child \"big\": Large work", "child \"gpu\": No worker provides", "child \"ok\": duplicate localKey", "child #5: Child localKey is required"] {
+        assert!(error.contains(part), "missing {part:?} in {error}");
+    }
+    assert!(!error.contains("child \"ok\": Child"), "{error}");
+    let cycle = json!({"requestKey":"plan-cycle","container":{"title":"Group","outcome":"Grouped","cwd":board.ws,"standalone":true},
+        "children":[{"localKey":"a","title":"A","outcome":"Done","acceptance":["x"],"after":[{"local":"b"}]},{"localKey":"b","title":"B","outcome":"Done","acceptance":["y"],"after":[{"local":"a"}]}]});
+    assert!(board.engine.create_batch(cycle).unwrap_err().to_string().contains("relations:"));
+    assert_eq!(board.engine.state.tasks.len(), before);
 }

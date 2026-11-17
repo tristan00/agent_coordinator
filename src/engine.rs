@@ -298,18 +298,46 @@ struct Input {
     attributes: Option<Value>,
 }
 impl Input {
+    pub(crate) const FIELDS: [&'static str; 15] = ["key", "title", "outcome", "cwd", "acceptance", "dependencies", "after", "parent", "standalone", "conflicts", "related", "supersedes", "model", "effort", "attributes"];
     fn parse(mut value: Value) -> Result<Self> {
         if let Some(object) = value.as_object_mut() {
             object.remove("reason");
         }
-        if let Some(value) = value.get("dependencies") {
-            dependencies(value)?;
+        let mut problems = Vec::new();
+        if let Some(object) = value.as_object() {
+            let unknown: Vec<&String> = object.keys().filter(|k| !Self::FIELDS.contains(&k.as_str())).collect();
+            let misplaced: Vec<&&String> = unknown.iter().filter(|k| Attributes::FIELDS.contains(&k.as_str())).collect();
+            if !unknown.is_empty() {
+                let hint = if misplaced.is_empty() { String::new() } else { format!("; {} belong inside attributes", misplaced.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")) };
+                let named: Vec<String> = unknown.iter().map(|k| format!("unknown field `{k}`")).collect();
+                problems.push(format!("Unknown fields {} ({}){hint}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, attributes; GET /api/task-schema lists every field", unknown.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", "), named.join(", ")));
+            }
+        }
+        if let Some(links) = value.get("dependencies")
+            && let Err(error) = dependencies(links)
+        {
+            problems.push(error.to_string());
         }
         if let Some(attributes) = value.get("attributes").and_then(Value::as_object) {
-            let unknown: Vec<_> = attributes.keys().filter(|k| !Attributes::FIELDS.contains(&k.as_str())).collect();
-            require(unknown.is_empty(), "Unknown attribute; use role, needs, languages, functions, priority, size, artifact or deploy")?;
+            let unknown: Vec<&str> = attributes.keys().map(String::as_str).filter(|k| !Attributes::FIELDS.contains(k)).collect();
+            if !unknown.is_empty() {
+                problems.push(format!("Unknown attributes {}; use {}", unknown.join(", "), Attributes::FIELDS.join(", ")));
+            }
+            if let Err(error) = serde_json::from_value::<Attributes>(Value::Object(attributes.clone())) {
+                problems.push(format!("attributes: {error}"));
+            }
         }
-        serde_json::from_value(value).map_err(|e| format!("{e}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, attributes").into())
+        if problems.is_empty() {
+            return serde_json::from_value(value).map_err(|e| format!("{e}; coordination belongs in typed fields: dependencies, after, parent, conflicts, related, supersedes, attributes").into());
+        }
+        let mut known = value.clone();
+        if let Some(object) = known.as_object_mut() {
+            object.retain(|k, _| Self::FIELDS.contains(&k.as_str()) && k != "dependencies" && k != "attributes");
+        }
+        if let Err(error) = serde_json::from_value::<Self>(known) {
+            problems.push(error.to_string());
+        }
+        Err(problems.join("; ").into())
     }
     fn grouping(&self) -> Result<()> {
         require(self.parent.as_ref().is_some_and(Option::is_some) ^ (self.standalone == Some(Some(true))), "Choose exactly one grouping: parent container or standalone true")?;
@@ -632,25 +660,41 @@ impl State {
         self.settings(key.as_deref()).limits
     }
     pub fn check_definition(&self, task: &Task) -> Result<()> {
+        let problems = self.definition_problems(task);
+        require(problems.is_empty(), problems.join("; "))
+    }
+    fn definition_problems(&self, task: &Task) -> Vec<String> {
         let limits = self.limits(task);
-        require(!(task.title.is_empty() || task.outcome.is_empty() || task.cwd.trim().is_empty()), "Title, outcome and cwd are required")?;
-        require(history::words(&task.title) <= limits.title_words, format!("Title exceeds {} words", limits.title_words))?;
-        require(task.acceptance.len() <= limits.criteria, format!("At most {} acceptance criteria; split the work into child tasks under a container", limits.criteria))?;
-        require(!task.acceptance.iter().any(|c| c.is_empty()), "Acceptance criteria must not be blank")?;
-        require(task.definition_words() <= limits.words, format!("Definition exceeds {} words; split the work into child tasks under a container", limits.words))?;
-        require(![&task.title, &task.outcome].into_iter().chain(&task.acceptance).any(|t| history::coordination_prose(t)), "Task ids, digests and AGENTS.md belong in relations and worker protocol, not task prose")?;
-        require(!(task.attributes.size == Size::Large && !task.container()), "Large work must be a container with child tasks")?;
-        require(!(task.container() && task.attributes.artifact != Artifact::None), "Containers produce no artifact; children do")?;
-        task.attributes.validate()?;
+        let mut problems = Vec::new();
+        let mut check = |ok: bool, message: String| {
+            if !ok {
+                problems.push(message);
+            }
+        };
+        check(!(task.title.is_empty() || task.outcome.is_empty() || task.cwd.trim().is_empty()), "Title, outcome and cwd are required".into());
+        check(history::words(&task.title) <= limits.title_words, format!("Title exceeds {} words", limits.title_words));
+        check(task.acceptance.len() <= limits.criteria, format!("At most {} acceptance criteria; split the work into child tasks under a container", limits.criteria));
+        check(!task.acceptance.iter().any(|c| c.is_empty()), "Acceptance criteria must not be blank".into());
+        check(task.definition_words() <= limits.words, format!("Definition exceeds {} words ({} used, over the limit); split the work into child tasks under a container", limits.words, task.definition_words()));
+        check(![&task.title, &task.outcome].into_iter().chain(&task.acceptance).any(|t| history::coordination_prose(t)), "Task ids, digests and AGENTS.md belong in relations and worker protocol, not task prose".into());
+        check(!(task.attributes.size == Size::Large && !task.container()), "Large work must be a container with child tasks".into());
+        check(!(task.container() && task.attributes.artifact != Artifact::None), "Containers produce no artifact; children do".into());
+        let mut outcome = |result: Result<()>| {
+            if let Err(error) = result {
+                problems.push(error.to_string());
+            }
+        };
+        outcome(task.attributes.validate());
         if let Some(model) = task.attributes.model.as_deref() {
-            require(!task.container(), "Containers run no worker; set model on their children")?;
+            outcome(require(!task.container(), "Containers run no worker; set model on their children"));
             let key = task.workspace.clone().or_else(|| workspace(Path::new(&task.cwd)).ok());
-            self.settings(key.as_deref()).task_agent(Some(model), self.family)?;
+            outcome(self.settings(key.as_deref()).task_agent(Some(model), self.family).map(drop));
         }
-        task.effort.as_deref().map(history::effort).transpose()?;
+        outcome(task.effort.as_deref().map(history::effort).transpose().map(drop));
         let missing: Vec<_> = task.attributes.needs.iter().filter(|need| !self.config.capabilities.contains(need)).collect();
-        require(missing.is_empty(), format!("No worker provides {}; choose a verification the workers can run", serde_json::to_string(&missing)?))?;
-        validate_workdir(task.workdir())
+        outcome(require(missing.is_empty(), format!("No worker provides {}; choose a verification the workers can run", serde_json::to_string(&missing).unwrap_or_default())));
+        outcome(validate_workdir(task.workdir()));
+        problems
     }
     fn check_relations(&self, task: &Task) -> Result<()> {
         require(!(task.parent.is_some() && task.standalone), "Choose exactly one grouping: parent container or standalone true")?;
@@ -795,6 +839,58 @@ impl State {
             self.check_relations(task)?;
         }
         Ok(id)
+    }
+    fn batch_problems(&self, input: &Value) -> Vec<String> {
+        let mut problems = Vec::new();
+        let container = input["container"].clone();
+        let mut state = self.clone();
+        let created = (|| -> Result<String> {
+            let parsed = Input::parse(container.clone())?;
+            require(parsed.key.is_none() && parsed.supersedes.is_none(), "Batch container cannot replace existing tasks")?;
+            let id = state.insert(container.clone(), None)?;
+            require(state.get(&id).is_some_and(Task::container), "Container must have no acceptance criteria")?;
+            Ok(id)
+        })();
+        let parent = match created {
+            Ok(id) => Some(id),
+            Err(error) => {
+                problems.push(format!("container: {error}"));
+                state = self.clone();
+                state.insert(json!({"title":"Batch container","outcome":"Groups the batch","cwd":container["cwd"],"standalone":true}), None).ok()
+            }
+        };
+        let Some(children) = input["children"].as_array() else {
+            problems.push("Children must be an array".into());
+            return problems;
+        };
+        if children.is_empty() {
+            problems.push("Children are required".into());
+        }
+        let mut keys = HashSet::new();
+        for (index, child) in children.iter().enumerate() {
+            let name = child["localKey"].as_str().map_or_else(|| format!("#{}", index + 1), |key| format!("\"{key}\""));
+            if child["localKey"].as_str().is_some_and(|key| !keys.insert(key)) {
+                problems.push(format!("child {name}: duplicate localKey; child local keys must be nonblank and unique"));
+                continue;
+            }
+            let Some(parent) = &parent else { continue };
+            let mut alone = child.clone();
+            if let Some(object) = alone.as_object_mut() {
+                for field in ["dependencies", "after", "conflicts", "related"] {
+                    object.remove(field);
+                }
+            }
+            if let Err(error) = state.clone().insert_children(parent, std::slice::from_ref(&alone)) {
+                problems.push(format!("child {name}: {error}"));
+            }
+        }
+        if problems.is_empty()
+            && let Some(parent) = &parent
+            && let Err(error) = state.clone().insert_children(parent, children)
+        {
+            problems.push(format!("relations: {error}"));
+        }
+        problems
     }
     fn insert_children(&mut self, parent: &str, children: &[Value]) -> Result<Value> {
         require(!children.is_empty(), "Children are required")?;
@@ -1192,7 +1288,8 @@ impl Engine {
     }
     pub fn create_batch(&mut self, input: Value) -> Result<Value> {
         let object = input.as_object().ok_or("Batch must be an object")?;
-        require(object.keys().all(|k| ["requestKey", "container", "children"].contains(&k.as_str())), "Unknown batch field")?;
+        let unknown: Vec<&str> = object.keys().map(String::as_str).filter(|k| !["requestKey", "container", "children"].contains(k)).collect();
+        require(unknown.is_empty(), format!("Unknown batch fields {}; a batch has requestKey, container and children", unknown.join(", ")))?;
         let request = input["requestKey"].as_str().filter(|s| !s.trim().is_empty()).ok_or("requestKey is required")?.to_owned();
         let scope = input["container"]["cwd"].as_str().and_then(|cwd| workspace(Path::new(cwd)).ok()).map(|cwd| self.state.owning_workspace(cwd));
         let key = scope.map_or_else(|| request.clone(), |scope| format!("{}|{request}", scope.display()));
@@ -1200,6 +1297,10 @@ impl Engine {
             require(receipt["input"] == input, "Conflicting request replay")?;
             return Ok(receipt["result"].clone());
         }
+        let problems = self.state.batch_problems(&input);
+        require(problems.is_empty(), format!("{} problem{} in this batch; fix them all and send it again:
+- {}", problems.len(), if problems.len() == 1 { "" } else { "s" }, problems.join("
+- ")))?;
         self.change(|state| {
             let container = input["container"].clone();
             let parsed = Input::parse(container.clone())?;
