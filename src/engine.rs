@@ -616,8 +616,7 @@ impl State {
         })
     }
     pub fn task_schema(&self, key: Option<&Path>) -> Value {
-        json!({"roles":history::ROLES,"roleNotes":{"worker":"Default when no other role fits","analytics":"Reports what data shows","backend-code":"Builds system logic and interfaces","ui-code":"Builds screens and controls","design":"Decides how the product looks and feels","optimization":"Makes things faster or cheaper","test":"Finds and reproduces failures","docs":"Writes how to install, run and use","data":"Fetches and prepares data, with sources","audit":"Read-only: inspects and reports","abstraction":"Finds the principles behind examples","playtest":"Plays it as its person would","research":"Finds what is known, with sources","art":"Makes what people see and hear","art-direction":"Sets the visual style everything follows","modelling":"Builds the shapes of things people see","technical-art":"Builds shaders, materials and lighting","animation":"Makes things move with life and weight","vfx":"Makes effects like smoke, splashes and weather"},"sizes":history::SIZES,"needs":history::NEEDS,"artifacts":history::ARTIFACTS,
-            "priority":"0 (highest) to 3; omitted means 2","dependencyReasons":DEPENDENCY_REASONS,"classifications":history::classification_schema(),"limits":self.settings(key).limits.value()})
+        crate::task_schema::describe(self, key)
     }
     pub fn models(&self, key: Option<&Path>) -> Value {
         let settings = self.settings(key);
@@ -1194,7 +1193,9 @@ impl Engine {
     pub fn create_batch(&mut self, input: Value) -> Result<Value> {
         let object = input.as_object().ok_or("Batch must be an object")?;
         require(object.keys().all(|k| ["requestKey", "container", "children"].contains(&k.as_str())), "Unknown batch field")?;
-        let key = input["requestKey"].as_str().filter(|s| !s.trim().is_empty()).ok_or("requestKey is required")?.to_owned();
+        let request = input["requestKey"].as_str().filter(|s| !s.trim().is_empty()).ok_or("requestKey is required")?.to_owned();
+        let scope = input["container"]["cwd"].as_str().and_then(|cwd| workspace(Path::new(cwd)).ok()).map(|cwd| self.state.owning_workspace(cwd));
+        let key = scope.map_or_else(|| request.clone(), |scope| format!("{}|{request}", scope.display()));
         if let Some(receipt) = self.state.batches.get(&key) {
             require(receipt["input"] == input, "Conflicting request replay")?;
             return Ok(receipt["result"].clone());

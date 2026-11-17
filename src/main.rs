@@ -11,6 +11,7 @@ mod metrics;
 mod process;
 mod redeploy;
 mod sessions;
+mod task_schema;
 mod telemetry;
 #[cfg(test)]
 mod test_support;

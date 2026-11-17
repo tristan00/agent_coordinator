@@ -1712,3 +1712,41 @@ fn rejected_reviews_and_unfinished_work_count_as_failures_but_crashes_do_not() {
     board.finish(&id, json!({"code":1,"ended":now(),"error":"Worker crashed"}), None);
     assert_eq!(board.task(&id).failed_attempts(), 1);
 }
+
+#[test]
+fn the_task_schema_covers_every_field_the_coordinator_accepts() {
+    let board = Board::new();
+    let schema = board.engine.state.task_schema(None);
+    let error = Input::parse(json!({"unknown_field":1})).err().unwrap().to_string();
+    let accepted: Vec<&str> = error.split('`').skip(3).step_by(2).collect();
+    assert!(accepted.contains(&"title") && accepted.contains(&"attributes"), "{error}");
+    let properties = schema["task"]["properties"].as_object().unwrap();
+    for field in &accepted {
+        assert!(properties.contains_key(*field), "task schema misses {field}");
+    }
+    let attributes = properties["attributes"]["properties"].as_object().unwrap();
+    for field in Attributes::FIELDS {
+        assert!(attributes.contains_key(field), "attributes schema misses {field}");
+    }
+    assert!(!properties.contains_key("priority") && !properties.contains_key("role") && !properties.contains_key("needs"));
+    assert_eq!(attributes["needs"]["items"]["enum"], json!(board.engine.state.config.capabilities));
+    assert_eq!(schema["needs"], json!(board.engine.state.config.capabilities));
+    assert_eq!(properties["acceptance"]["maxItems"], json!(board.engine.state.settings(None).limits.criteria));
+    let child = schema["batch"]["properties"]["children"]["items"]["properties"].as_object().unwrap();
+    assert!(child.contains_key("localKey") && !child.contains_key("parent") && !child.contains_key("supersedes"));
+    let rules = schema["rules"].as_array().unwrap().iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ");
+    let limits = board.engine.state.settings(None).limits;
+    assert!(rules.contains(&format!("at most {} words", limits.words)) && rules.contains("size large is only allowed on a container") && rules.contains("inside attributes"));
+}
+
+#[test]
+fn batch_request_keys_belong_to_their_workspace() {
+    let mut board = Board::new();
+    let other = board.temp.dir("other");
+    let body = |cwd: &PathBuf, title: &str| json!({"requestKey":"plan-1","container":{"title":title,"outcome":"Grouped","cwd":cwd,"standalone":true},"children":[{"localKey":"a","title":"Child","outcome":"Done","acceptance":["It works"]}]});
+    let first = board.engine.create_batch(body(&board.ws, "Here")).unwrap();
+    let second = board.engine.create_batch(body(&other, "There")).unwrap();
+    assert_ne!(first["container"], second["container"]);
+    assert_eq!(board.engine.create_batch(body(&board.ws, "Here")).unwrap(), first);
+    assert!(board.engine.create_batch(body(&board.ws, "Changed")).unwrap_err().to_string().contains("Conflicting request replay"));
+}
