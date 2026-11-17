@@ -152,3 +152,11 @@ fn reviews_use_the_review_model_and_implementation_escalates_after_a_failure() {
     assert_eq!(plain.stage_agent(None, "review", 5, family).unwrap().0, "claude_sonnet_5_5_medium");
     assert!(plain.task_agent(Some("claude_opus_5_5_medium"), family).is_err());
 }
+
+#[test]
+fn role_names_match_their_serialized_form() {
+    for (index, name) in ROLES.iter().enumerate() {
+        let role: Role = serde_json::from_value(json!(name)).unwrap();
+        assert_eq!((role as usize, role.name()), (index, *name));
+    }
+}
