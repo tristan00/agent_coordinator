@@ -1,6 +1,6 @@
 # Agent Coordinator
 
-A local service that turns a written request into a board of tasks and runs coding agents on them until the work is done. A planner agent breaks the request into tasks, an optional evaluator checks the plan, workers do each task on its own git branch, reviewers accept or send the work back, and accepted work is merged. Everything happens on your machine, in folders you choose.
+A local service that turns a written request into a board of tasks and runs coding agents on them until the work is done. A planner agent breaks the request into tasks, an evaluator checks the plan, workers do each task on its own git branch, reviewers accept or send the work back, and accepted work is merged. Everything happens on your machine, in folders you choose.
 
 The coordinator is written in Rust and runs agents through their own command-line harnesses: [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`) or the Codex CLI (`codex`). The board, task panel, planner transcript and analytics are in the companion web UI, [agent_tasks_ui](https://github.com/tristan00/agent_tasks_ui).
 
@@ -74,7 +74,7 @@ curl -X POST http://127.0.0.1:4242/api/sessions -H "Content-Type: application/js
 ## How a request becomes finished work
 
 1. **Plan.** `POST /api/sessions` starts a planner agent in the project folder with the request and the workspace's planner prompt. The planner creates tasks through the HTTP API, usually as a container with children (`POST /api/tasks/batch`), and ends its turn.
-2. **Evaluate (optional).** With an evaluator configured, new and changed tasks start as *proposed*. The evaluator reads the request, the board and each proposal, then accepts it or kicks it back with findings. A task kicked back `planAttempts` times is rejected, and so is every task that depends on it. A proposal is evaluated only once everything it depends on has been accepted.
+2. **Evaluate.** New and changed tasks start as *proposed*. The evaluator reads the request, the board and each proposal, then accepts it or kicks it back with findings. A task kicked back `planAttempts` times is rejected, and so is every task that depends on it. A proposal is evaluated only once everything it depends on has been accepted.
 3. **Implement.** The scheduler starts a worker for every task whose prerequisites are done, in priority order. Each worker runs in its own git worktree and branch, with the role prompt for its task and the coordinator's worker protocol, and returns a structured result: what it checked, each criterion it believes it met, and any blocker.
 4. **Review.** A reviewer, read-only, checks the work against every acceptance criterion and either accepts it or rejects it with findings.
 5. **Merge.** Accepted work is merged into the project's main branch. Work that can no longer merge cleanly goes to a merge step, then straight back to review.
@@ -127,7 +127,7 @@ Each role is filled by an agent id from the built-in catalog or from the workspa
 
 | Field | Meaning |
 |---|---|
-| `planner`, `worker`, `reviewer`, `escalation`, `evaluator` | Agent ids. Leave out `evaluator` to skip plan evaluation |
+| `planner`, `worker`, `reviewer`, `escalation`, `evaluator` | Agent ids for each role |
 | `escalateAfter` | Failed implementation attempts before the escalation model takes over |
 | `planAttempts` | Times a proposal can be kicked back before it is rejected |
 | `plannerWakeMinutes` | How often the planner is woken while work runs |
